@@ -4,6 +4,8 @@ mod db;
 mod digest;
 mod install;
 mod model;
+mod observe;
+mod render;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -31,18 +33,10 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Observe => {
-            println!("observe：守护进程尚未实现（第二阶段）。");
-        }
-        Command::Digest => {
-            digest::run().await?;
-        }
-        Command::Show => {
-            show()?;
-        }
-        Command::Install => {
-            install::run()?;
-        }
+        Command::Observe => observe::run().await?,
+        Command::Digest => digest::run().await?,
+        Command::Show => show()?,
+        Command::Install => install::run()?,
     }
     Ok(())
 }

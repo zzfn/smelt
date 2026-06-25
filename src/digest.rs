@@ -1,7 +1,8 @@
-//! digest：读取 shell 历史，调用 DeepSeek API 提炼 instinct 并入库。
+//! digest：读取 shell 历史，调用 DeepSeek API 提炼 instinct 并入库，最后刷新 global.md。
 
 use crate::db;
 use crate::model::{Instinct, Scope};
+use crate::render;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -82,6 +83,9 @@ pub async fn run() -> Result<()> {
         db::upsert(&conn, &it)?;
         println!("  [{:.2}] {}", confidence, r.content);
     }
+
+    let path = render::write_global()?;
+    println!("已更新 {:?}", path);
     Ok(())
 }
 
