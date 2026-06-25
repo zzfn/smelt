@@ -57,7 +57,7 @@ fn show() -> Result<()> {
     }
     for it in items {
         println!(
-            "[{:.2}] ({}) {}  <{}> ×{}",
+            "[{:.2}] ({}) {}  <{}> x{}",
             it.confidence,
             it.scope.as_str(),
             it.content,
