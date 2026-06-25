@@ -3,6 +3,7 @@
 mod db;
 mod digest;
 mod install;
+mod merge;
 mod model;
 mod observe;
 mod render;
@@ -23,6 +24,8 @@ enum Command {
     Observe,
     /// 手动触发一次蒸馏
     Digest,
+    /// 对已有 instincts 做语义去重合并
+    Merge,
     /// 打印当前 instincts
     Show,
     /// 注册 Mac LaunchAgent 开机自启
@@ -35,13 +38,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Observe => observe::run().await?,
         Command::Digest => digest::run().await?,
+        Command::Merge => merge::run().await?,
         Command::Show => show()?,
         Command::Install => install::run()?,
     }
     Ok(())
 }
 
-/// 从 DB 读出 instinct，按 confidence 排序打印。
 fn show() -> Result<()> {
     let conn = db::open()?;
     let items = db::list_by_confidence(&conn)?;

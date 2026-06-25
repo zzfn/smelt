@@ -5,7 +5,6 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-/// 返回 ~/.smelt 目录，不存在则创建。
 pub fn smelt_dir() -> Result<PathBuf> {
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("无法定位 home 目录"))?
@@ -14,7 +13,6 @@ pub fn smelt_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// 打开 ~/.smelt/smelt.db 并确保表结构存在。
 pub fn open() -> Result<Connection> {
     let path = smelt_dir()?.join("smelt.db");
     let conn = Connection::open(path)?;
@@ -22,7 +20,6 @@ pub fn open() -> Result<Connection> {
     Ok(conn)
 }
 
-/// 建表（幂等）。
 fn init(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS instincts (
@@ -54,19 +51,33 @@ pub fn upsert(conn: &Connection, it: &Instinct) -> Result<()> {
             last_seen=excluded.last_seen,
             scope=excluded.scope",
         rusqlite::params![
-            it.id,
-            it.content,
-            it.confidence,
-            domain,
-            it.evidence_count,
-            it.last_seen,
-            it.scope.as_str(),
+            it.id, it.content, it.confidence, domain,
+            it.evidence_count, it.last_seen, it.scope.as_str(),
         ],
     )?;
     Ok(())
 }
 
-/// 读出所有 instinct，按 confidence 降序。
+/// 清空并重建整张表（去重合并后的整体替换，事务保证原子）。
+pub fn replace_all(conn: &Connection, items: &[Instinct]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM instincts", [])?;
+    for it in items {
+        let domain = serde_json::to_string(&it.domain)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO instincts
+                (id, content, confidence, domain, evidence_count, last_seen, scope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                it.id, it.content, it.confidence, domain,
+                it.evidence_count, it.last_seen, it.scope.as_str(),
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn list_by_confidence(conn: &Connection) -> Result<Vec<Instinct>> {
     let mut stmt = conn.prepare(
         "SELECT id, content, confidence, domain, evidence_count, last_seen, scope
