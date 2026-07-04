@@ -16,3 +16,8 @@ dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 qrcode = "0.14"
+# GPUI + gpui-component（组件库，Apache-2.0）。三者锁到 gpui-component 用的同一个
+# zed commit，避免版本漂移；gpui_platform 开 runtime_shaders 免装完整 Xcode。
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
