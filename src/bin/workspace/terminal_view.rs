@@ -28,9 +28,10 @@ pub const FONT_PX: f32 = 13.0;
 pub const LINE_PX: f32 = 18.0;
 /// 等宽字宽 ≈ 字号 × 该比例（用于从窗口宽度估算列数）。
 const CELL_W_RATIO: f32 = 0.6;
-/// 估算的边距 / 标签栏高度，用于从窗口尺寸推算终端可用网格区域。
-const PAD_X: f32 = 16.0;
-const PAD_Y: f32 = 16.0;
+/// 终端内容的每侧内边距（避免文字贴边被裁）。canvas 覆盖层保持满尺寸，
+/// 只把网格原点按此偏移，故鼠标/IME 坐标一致，网格可用区 = 尺寸 − 2×PAD。
+const PAD_X: f32 = 12.0;
+const PAD_Y: f32 = 8.0;
 /// Shift+PageUp/Down 每次滚动的行数。
 const PAGE_LINES: i32 = 20;
 
@@ -277,7 +278,7 @@ impl EntityInputHandler for TerminalView {
         // 候选窗要摆在光标格子上：从网格原点按 列×字宽 / 行×行高 偏移。
         let (row, col) = self.cursor.unwrap_or((0, 0));
         let origin = element_bounds.origin
-            + point(px(col as f32 * self.cell_w), px(row as f32 * LINE_PX));
+            + point(px(PAD_X + col as f32 * self.cell_w), px(PAD_Y + row as f32 * LINE_PX));
         Some(Bounds {
             origin,
             size: size(px(2.0), px(LINE_PX)),
@@ -322,8 +323,9 @@ impl Render for TerminalView {
                 FONT_PX * CELL_W_RATIO
             };
             self.cell_w = cell_w; // 供鼠标坐标换算
-            let cols = (((w - PAD_X).max(0.0) / cell_w).floor() as usize).clamp(4, 1000);
-            let grid_rows = (((h - PAD_Y).max(0.0) / LINE_PX).floor() as usize).clamp(2, 1000);
+            // 可用网格区 = 自身尺寸减去左右 / 上下各一份内边距。
+            let cols = (((w - 2.0 * PAD_X).max(0.0) / cell_w).floor() as usize).clamp(4, 1000);
+            let grid_rows = (((h - 2.0 * PAD_Y).max(0.0) / LINE_PX).floor() as usize).clamp(2, 1000);
             self.terminal.resize(grid_rows, cols);
         }
 
@@ -466,6 +468,8 @@ impl Render for TerminalView {
                     .flex()
                     .flex_col()
                     .size_full()
+                    .px(px(PAD_X))
+                    .py(px(PAD_Y))
                     .text_size(px(FONT_PX))
                     .line_height(px(LINE_PX))
                     .children(frame.rows.into_iter().enumerate().map(move |(r, row)| {
@@ -496,8 +500,11 @@ impl Render for TerminalView {
                             },
                             &hitbox,
                         );
-                        // 网格原点 = 覆盖层原点（终端主体已去内边距，直接对齐）
-                        origin_cell.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
+                        // 网格原点 = 覆盖层原点 + 内边距（终端主体带内边距，坐标相应右下偏移）
+                        origin_cell.set((
+                            f32::from(bounds.origin.x) + PAD_X,
+                            f32::from(bounds.origin.y) + PAD_Y,
+                        ));
                         // 记录自身尺寸，供按卡片大小算行列
                         size_cell.set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
                         window.handle_input(&fh, ElementInputHandler::new(bounds, entity), cx);

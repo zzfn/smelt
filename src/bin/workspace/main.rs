@@ -19,9 +19,14 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+    Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenu, SidebarMenuItem,
 };
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
+use gpui_component::resizable::{
+    h_resizable, resizable_panel, v_resizable, ResizablePanelEvent, ResizableState,
+};
+use gpui_component::scroll::ScrollableElement;
+use gpui_component::tab::{Tab, TabBar};
 use gpui_component::tag::Tag;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
@@ -150,6 +155,76 @@ enum MainView {
     Git,
 }
 
+/// 主区终端分屏布局树：叶子是一个终端，内部 Split 把区域按某轴切成多块。
+/// 每个 Split 各持一个 ResizableState 记住拖动比例；递归即可任意嵌套分屏。
+enum Pane {
+    Leaf(Entity<TerminalView>),
+    Split {
+        axis: Axis,
+        state: Entity<ResizableState>,
+        children: Vec<Pane>,
+    },
+}
+
+/// 由一组终端建初始布局：单个即叶子，多个横向并排（后续可拖拽 / 再切分）。
+fn build_layout(tabs: &[Entity<TerminalView>], cx: &mut Context<Workspace>) -> Pane {
+    if tabs.len() == 1 {
+        Pane::Leaf(tabs[0].clone())
+    } else {
+        let state = cx.new(|_| ResizableState::default());
+        Pane::Split {
+            axis: Axis::Horizontal,
+            state,
+            children: tabs.iter().map(|t| Pane::Leaf(t.clone())).collect(),
+        }
+    }
+}
+
+/// 在布局树里找到 target 终端所在叶子，就地替换成「原叶子 + 新叶子」的二分 Split。
+/// 找到并替换返回 true；未命中返回 false。
+fn split_leaf(
+    pane: &mut Pane,
+    target: EntityId,
+    axis: Axis,
+    state: Entity<ResizableState>,
+    new_leaf: Entity<TerminalView>,
+) -> bool {
+    match pane {
+        Pane::Leaf(t) if t.entity_id() == target => {
+            let old = Pane::Leaf(t.clone());
+            *pane = Pane::Split {
+                axis,
+                state,
+                children: vec![old, Pane::Leaf(new_leaf)],
+            };
+            true
+        }
+        Pane::Leaf(_) => false,
+        Pane::Split { children, .. } => children
+            .iter_mut()
+            .any(|c| split_leaf(c, target, axis, state.clone(), new_leaf.clone())),
+    }
+}
+
+/// 从布局树移除 target 终端的叶子；某 Split 移除后只剩一个子节点则塌缩掉这层。
+fn remove_leaf(pane: &mut Pane, target: EntityId) {
+    if let Pane::Split { children, .. } = pane {
+        if let Some(pos) = children
+            .iter()
+            .position(|c| matches!(c, Pane::Leaf(t) if t.entity_id() == target))
+        {
+            children.remove(pos);
+        } else {
+            for c in children.iter_mut() {
+                remove_leaf(c, target);
+            }
+        }
+        if children.len() == 1 {
+            *pane = children.remove(0);
+        }
+    }
+}
+
 /// 打开查看的文件：路径 + 预高亮的行。每行是若干 (颜色, 文本) 片段。
 /// 高亮在打开时一次算好并存起来，滚动时 uniform_list 只按可见范围取行渲染。
 /// 用 Rc 让 uniform_list 的 'static 闭包能廉价地共享这份数据。
@@ -185,12 +260,118 @@ struct GitDiff {
     lines: Rc<Vec<DiffLine>>,
 }
 
+/// 工作台的持久化状态：主区分屏布局树 + 活动叶子 + 侧栏宽度。
+/// 存 ~/.smelt/workspace.json，启动时据此重建分屏（结构 / 嵌套 / 方向完整恢复）。
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct WsState {
+    /// 主区分屏布局树（None = 旧存档 / 无，回退用 tabs 重建）。
+    #[serde(default)]
+    layout: Option<PaneState>,
+    /// 活动叶子在布局树「深度优先遍历序」中的序号。
+    active: usize,
+    /// 会话侧栏拖出的宽度（px）；None = 用默认值。
+    #[serde(default)]
+    sidebar_w: Option<f32>,
+    /// 兼容旧存档：仅有终端 cwd 列表时据此重建（横向并排）。
+    #[serde(default)]
+    tabs: Vec<Option<String>>,
+}
+
+/// 可序列化的分屏布局镜像：叶子存该终端 cwd，Split 存方向 + 子节点。
+/// 拖动比例暂不持久化，重开按均分；结构 / 嵌套 / 方向完整恢复。
+#[derive(serde::Serialize, serde::Deserialize)]
+enum PaneState {
+    Leaf { cwd: Option<String> },
+    Split { axis: SplitAxis, children: Vec<PaneState> },
+}
+
+/// Split 方向的可序列化镜像（gpui::Axis 无法直接序列化）。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+enum SplitAxis {
+    H,
+    V,
+}
+
+impl From<Axis> for SplitAxis {
+    fn from(a: Axis) -> Self {
+        if matches!(a, Axis::Horizontal) {
+            SplitAxis::H
+        } else {
+            SplitAxis::V
+        }
+    }
+}
+
+impl From<SplitAxis> for Axis {
+    fn from(a: SplitAxis) -> Self {
+        match a {
+            SplitAxis::H => Axis::Horizontal,
+            SplitAxis::V => Axis::Vertical,
+        }
+    }
+}
+
+/// 把渲染用的布局树导出成可序列化镜像（叶子读取各终端当前 cwd）。
+fn pane_to_state(pane: &Pane, cx: &App) -> PaneState {
+    match pane {
+        Pane::Leaf(t) => PaneState::Leaf { cwd: t.read(cx).cwd() },
+        Pane::Split { axis, children, .. } => PaneState::Split {
+            axis: (*axis).into(),
+            children: children.iter().map(|c| pane_to_state(c, cx)).collect(),
+        },
+    }
+}
+
+/// 按存档镜像重建布局树：深度优先遍历，遇叶子就新建终端并 push 到 tabs
+/// （push 顺序即「遍历序」，与存档里的 active 索引一致）。
+fn rebuild_pane(
+    ps: &PaneState,
+    tabs: &mut Vec<Entity<TerminalView>>,
+    cx: &mut Context<Workspace>,
+) -> Pane {
+    match ps {
+        PaneState::Leaf { cwd } => {
+            let v = cx.new(|cx| TerminalView::new(cx, cwd.clone()));
+            tabs.push(v.clone());
+            Pane::Leaf(v)
+        }
+        PaneState::Split { axis, children } => {
+            let state = cx.new(|_| ResizableState::default());
+            let children = children.iter().map(|c| rebuild_pane(c, tabs, cx)).collect();
+            Pane::Split { axis: (*axis).into(), state, children }
+        }
+    }
+}
+
+/// 收集布局树所有叶子终端的 EntityId，顺序 = 深度优先遍历序（= 存档 active 基准）。
+fn collect_leaf_ids(pane: &Pane, out: &mut Vec<EntityId>) {
+    match pane {
+        Pane::Leaf(t) => out.push(t.entity_id()),
+        Pane::Split { children, .. } => {
+            for c in children {
+                collect_leaf_ids(c, out);
+            }
+        }
+    }
+}
+
+/// 存档文件路径：~/.smelt/workspace.json。
+fn ws_state_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".smelt").join("workspace.json"))
+}
+
+/// 读取存档；文件不存在/损坏都返回 None，交由调用方回退默认。
+fn load_ws_state() -> Option<WsState> {
+    let data = std::fs::read_to_string(ws_state_path()?).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
 /// 工作台根视图：多标签终端管理器。
 struct Workspace {
     tabs: Vec<Entity<TerminalView>>,
     active: usize,
-    /// 网格列数：1=单终端，2=两列，3=三列。
-    layout_cols: usize,
+    /// 主区终端分屏布局树（叶子引用 tabs 里的终端；与 tabs 保持同步）。
+    layout: Pane,
     /// 主区当前视图：终端 / 文件树 / Git。
     view: MainView,
     /// 文件树里已展开的文件夹绝对路径。
@@ -211,15 +392,61 @@ struct Workspace {
     palette: Option<Entity<ListState<CmdDelegate>>>,
     /// 命令面板的事件订阅（确认/取消）；随面板关闭一并释放。
     _palette_sub: Option<Subscription>,
+    /// 各滚动区的常驻滚动句柄——供 gpui-component Scrollbar 读取位置并绘制。
+    /// 必须常驻（每帧新建会丢失滚动位置）。
+    git_files_scroll: ScrollHandle,
+    diff_scroll: UniformListScrollHandle,
+    file_scroll: UniformListScrollHandle,
+    /// 根布局左右分栏（会话侧栏 ↔ 主区）的可拖拽状态；常驻以保住拖出的宽度。
+    root_resize: Entity<ResizableState>,
+    /// 侧栏初始宽度（px）：启动时从存档恢复，作为 resizable_panel 的初始 size。
+    sidebar_w: f32,
+    /// 侧栏 resize 事件订阅（拖动完写回存档）；随视图存活。
+    _resize_sub: Subscription,
 }
 
 impl Workspace {
     fn new(cx: &mut Context<Self>) -> Self {
-        let first = cx.new(|cx| TerminalView::new(cx, current_dir()));
+        // 优先按存档的布局树重建分屏；旧存档（仅 tabs 列表）或无存档则回退横向并排。
+        let saved = load_ws_state();
+        let sidebar_w = saved.as_ref().and_then(|s| s.sidebar_w).unwrap_or(230.);
+
+        let mut tabs: Vec<Entity<TerminalView>> = Vec::new();
+        let mut layout;
+        let mut active;
+        match saved.as_ref().and_then(|s| s.layout.as_ref()) {
+            Some(ps) => {
+                layout = rebuild_pane(ps, &mut tabs, cx);
+                active = saved.as_ref().map_or(0, |s| s.active);
+            }
+            None => {
+                for cwd in saved.as_ref().map(|s| s.tabs.clone()).unwrap_or_default() {
+                    tabs.push(cx.new(|cx| TerminalView::new(cx, cwd)));
+                }
+                active = saved.as_ref().map_or(0, |s| s.active);
+                if tabs.is_empty() {
+                    tabs.push(cx.new(|cx| TerminalView::new(cx, current_dir())));
+                }
+                layout = build_layout(&tabs, cx);
+            }
+        }
+        // 兜底（理论不会触发）+ 夹紧活动索引。
+        if tabs.is_empty() {
+            tabs.push(cx.new(|cx| TerminalView::new(cx, current_dir())));
+            layout = Pane::Leaf(tabs[0].clone());
+        }
+        active = active.min(tabs.len() - 1);
+
+        // 订阅侧栏 resize：拖动完 emit Resized，写回存档以持久化宽度。
+        let root_resize = cx.new(|_| ResizableState::default());
+        let _resize_sub = cx.subscribe(&root_resize, |this, _state, _e: &ResizablePanelEvent, cx| {
+            this.save_state(cx);
+        });
+
         Self {
-            tabs: vec![first],
-            active: 0,
-            layout_cols: 1,
+            tabs,
+            active,
+            layout,
             view: MainView::Terminal,
             expanded: HashSet::new(),
             open_file: None,
@@ -230,15 +457,75 @@ impl Workspace {
             sidebar_open: true,
             palette: None,
             _palette_sub: None,
+            git_files_scroll: ScrollHandle::new(),
+            diff_scroll: UniformListScrollHandle::new(),
+            file_scroll: UniformListScrollHandle::new(),
+            root_resize,
+            sidebar_w,
+            _resize_sub,
         }
     }
 
-    /// 在指定目录新建标签并激活。
+    /// 在指定目录新建终端，并在当前活动 pane 上横向切一刀放进布局树。
     fn add_tab(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
         let view = cx.new(|cx| TerminalView::new(cx, cwd));
-        self.tabs.push(view);
+        self.insert_terminal(view, Axis::Horizontal, cx);
+    }
+
+    /// 把新终端登记进 tabs，并在当前活动 pane 上按 axis 切一刀（保持 tabs 与布局树同步）。
+    fn insert_terminal(
+        &mut self,
+        view: Entity<TerminalView>,
+        axis: Axis,
+        cx: &mut Context<Self>,
+    ) {
+        let old = self.tabs.get(self.active).cloned();
+        self.tabs.push(view.clone());
         self.active = self.tabs.len() - 1;
+        match old {
+            Some(old) => {
+                let state = cx.new(|_| ResizableState::default());
+                split_leaf(&mut self.layout, old.entity_id(), axis, state, view);
+            }
+            // tabs 原本为空（理论不会发生）：布局退化为单叶子。
+            None => self.layout = Pane::Leaf(view),
+        }
+        self.save_state(cx);
         cx.notify();
+    }
+
+    /// 在当前活动 pane 上分屏：Horizontal=右侧并排，Vertical=下方堆叠。
+    fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.read(cx).cwd())
+            .or_else(current_dir);
+        let view = cx.new(|cx| TerminalView::new(cx, cwd));
+        self.insert_terminal(view, axis, cx);
+    }
+
+    /// 把分屏布局树 + 活动叶子（遍历序）+ 侧栏宽度写入 ~/.smelt/workspace.json（失败静默忽略）。
+    fn save_state(&self, cx: &mut Context<Self>) {
+        let Some(path) = ws_state_path() else { return };
+        let layout = pane_to_state(&self.layout, cx);
+        // 活动索引按布局树遍历序存（与 rebuild_pane 的 push 顺序对齐）。
+        let mut ids = Vec::new();
+        collect_leaf_ids(&self.layout, &mut ids);
+        let active = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.entity_id())
+            .and_then(|id| ids.iter().position(|x| *x == id))
+            .unwrap_or(0);
+        let sidebar_w = self.root_resize.read(cx).sizes().first().copied().map(f32::from);
+        let state = WsState { layout: Some(layout), active, sidebar_w, tabs: Vec::new() };
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, json);
+        }
     }
 
     /// 「+」新建标签：继承当前活动标签的目录。
@@ -270,17 +557,47 @@ impl Workspace {
         .detach();
     }
 
+    /// 打开从 Finder 拖入的路径为项目：文件夹直接用，文件取其父目录，各开一个新标签。
+    fn open_paths(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        for p in paths {
+            let dir = if p.is_dir() { Some(p.as_path()) } else { p.parent() };
+            if let Some(d) = dir.and_then(|d| d.to_str()) {
+                self.add_tab(Some(d.to_string()), cx);
+            }
+        }
+    }
+
     fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 || ix >= self.tabs.len() {
             return; // 至少保留一个终端
         }
+        let target = self.tabs[ix].entity_id();
+        remove_leaf(&mut self.layout, target);
         self.tabs.remove(ix);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         } else if self.active > ix {
             self.active -= 1;
         }
+        self.save_state(cx);
         cx.notify();
+    }
+
+    /// 关闭当前活动 pane。
+    fn close_active(&mut self, cx: &mut Context<Self>) {
+        self.close_tab(self.active, cx);
+    }
+
+    /// 按终端句柄聚焦对应 pane（点击 pane / 侧栏条目走这里）。
+    fn activate_entity(
+        &mut self,
+        e: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.tabs.iter().position(|t| t.entity_id() == e.entity_id()) {
+            self.activate(ix, window, cx);
+        }
     }
 
     /// 聚焦当前活动终端。
@@ -296,18 +613,9 @@ impl Workspace {
         if ix < self.tabs.len() {
             self.active = ix;
             self.focus_active(window, cx);
+            self.save_state(cx);
             cx.notify();
         }
-    }
-
-    /// 循环切换网格布局：1 → 2 → 3 → 1 列。
-    fn cycle_layout(&mut self, cx: &mut Context<Self>) {
-        self.layout_cols = match self.layout_cols {
-            1 => 2,
-            2 => 3,
-            _ => 1,
-        };
-        cx.notify();
     }
 
     fn next_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -477,6 +785,61 @@ impl Workspace {
             Cmd::SwitchTab(i) => self.activate(i, window, cx),
         }
     }
+
+    /// 递归渲染分屏布局树：Leaf 渲染一个终端（活动 pane 描边 + 点击聚焦），
+    /// Split 用 h/v_resizable 把子节点排成可拖拽的并排 / 堆叠。
+    fn render_pane(&self, pane: &Pane, path: &str, cx: &mut Context<Self>) -> AnyElement {
+        match pane {
+            Pane::Leaf(t) => {
+                let active = self
+                    .tabs
+                    .get(self.active)
+                    .is_some_and(|a| a.entity_id() == t.entity_id());
+                // 叠加层（absolute，不占布局、不挡点击）区分活动 / 非活动：
+                // 活动 pane 用 ring 色描一圈；非活动 pane 整块压暗拉开对比。
+                let overlay = if active {
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .border_2()
+                        .border_color(cx.theme().ring)
+                } else {
+                    div().absolute().inset_0().bg(hsla(0., 0., 0., 0.28))
+                };
+                let te = t.clone();
+                div()
+                    .id(SharedString::from(path.to_string()))
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    // 点击非活动 pane 即聚焦它（终端自身也会抢焦点，二者一致）。
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, window, cx| {
+                            this.activate_entity(&te, window, cx)
+                        }),
+                    )
+                    .child(t.clone())
+                    .child(overlay)
+                    .into_any_element()
+            }
+            Pane::Split { axis, state, children } => {
+                let id = SharedString::from(path.to_string());
+                let mut group = if matches!(axis, Axis::Horizontal) {
+                    h_resizable(id)
+                } else {
+                    v_resizable(id)
+                }
+                .with_state(state);
+                for (i, c) in children.iter().enumerate() {
+                    group = group.child(self.render_pane(c, &format!("{path}-{i}"), cx));
+                }
+                group.into_any_element()
+            }
+        }
+    }
 }
 
 impl Render for Workspace {
@@ -485,18 +848,9 @@ impl Render for Workspace {
         let can_close = self.tabs.len() > 1;
 
         // 主题色 token（跟随 gpui-component 主题，替代硬编码）
-        let (c_bg, c_sidebar, c_border, c_muted, c_accent, c_accent_fg, c_primary, c_popover) = {
+        let (c_bg, c_border, c_popover, c_muted) = {
             let t = cx.theme();
-            (
-                t.background,
-                t.sidebar,
-                t.border,
-                t.muted_foreground,
-                t.sidebar_accent,
-                t.sidebar_accent_foreground,
-                t.primary,
-                t.popover,
-            )
+            (t.background, t.border, t.popover, t.muted_foreground)
         };
 
         // 先收集标签标题，释放对 self.tabs 的借用
@@ -506,6 +860,12 @@ impl Render for Workspace {
             .enumerate()
             .map(|(ix, v)| (ix, v.read(cx).title().to_string()))
             .collect();
+        // 当前活动标签的标题：放到标题栏右侧作为上下文提示。
+        let active_title = titles
+            .iter()
+            .find(|(ix, _)| *ix == active)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default();
 
         // 左侧会话侧栏
         // 按 cwd 把终端分组成项目（保持出现顺序）
@@ -571,18 +931,9 @@ impl Render for Workspace {
 
         let sidebar_el = Sidebar::new("workspace-sidebar")
             .collapsible(SidebarCollapsible::Offcanvas)
-            .collapsed(!self.sidebar_open)
-            .w(px(230.))
-            .header(
-                SidebarHeader::new().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(Icon::new(IconName::SquareTerminal))
-                        .child(div().font_bold().child("smelt")),
-                ),
-            )
+            // 宽度交给外层 resizable_panel 控制（可拖），这里填满 panel。
+            // 品牌已移到顶部标题栏，侧栏直接从「会话」开始，避免重复。
+            .w(relative(1.))
             .child(SidebarGroup::new("会话").child(SidebarMenu::new().children(menu_items)))
             // 不用 SidebarFooter：它会给整块 footer 挂 hover 背景（sidebar_accent），
             // 盖住按钮自己的 hover。直接放普通容器，让每个按钮各自 hover 可见。
@@ -594,57 +945,15 @@ impl Render for Workspace {
                     .w_full()
                     .p_1()
                     .child(new_tab_button(cx))
-                    .child(open_project_button(cx))
-                    .child(div().flex_1())
-                    .child(layout_button(self.layout_cols, cx)),
+                    .child(open_project_button(cx)),
             );
 
-        // 主内容：单终端 或 网格（多列）
-        let cols = self.layout_cols;
-        let n = self.tabs.len();
-        let content = if cols <= 1 {
-            div().flex_1().min_w_0().child(self.tabs[active].clone())
-        } else {
-            let rows: Vec<Div> = (0..n)
-                .step_by(cols)
-                .map(|start| {
-                    let end = (start + cols).min(n);
-                    let cards: Vec<Div> = (start..end)
-                        .map(|ix| {
-                            let is_active = ix == active;
-                            let view = self.tabs[ix].clone();
-                            let title = titles.get(ix).map(|(_, t)| t.clone()).unwrap_or_default();
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .border_1()
-                                .border_color(if is_active { c_primary } else { c_border })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _ev, window, cx| {
-                                        this.activate(ix, window, cx)
-                                    }),
-                                )
-                                // 卡片标题头
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_sm()
-                                        .bg(if is_active { c_accent } else { c_sidebar })
-                                        .text_color(if is_active { c_accent_fg } else { c_muted })
-                                        .child(title),
-                                )
-                                .child(div().flex_1().min_w_0().child(view))
-                        })
-                        .collect();
-                    div().flex_1().min_w_0().flex().gap_1().children(cards)
-                })
-                .collect();
-            div().flex_1().flex().flex_col().gap_1().p_1().children(rows)
-        };
+        // 主内容：分屏布局树（递归 Split，叶子是终端）。
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(self.render_pane(&self.layout, "pane", cx));
 
         // 命令面板弹层：搜索框 + 候选列表全部由 ListState 渲染。
         let palette_overlay = self.palette.as_ref().map(|state| {
@@ -679,9 +988,14 @@ impl Render for Workspace {
         div()
             .relative()
             .flex()
+            .flex_col()
             .size_full()
             .bg(c_bg)
             .font_family(terminal_view::FONT_FAMILY)
+            // 从 Finder 拖文件/文件夹进窗口 → 当作项目开新标签（文件取其父目录）。
+            .on_drop::<ExternalPaths>(cx.listener(|this, ep: &ExternalPaths, _window, cx| {
+                this.open_paths(ep.paths(), cx);
+            }))
             // 全局快捷键：Cmd+K 面板 / Cmd+B 侧栏 / Cmd+\ 布局 / Cmd+[ ] 切换
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
@@ -700,42 +1014,85 @@ impl Render for Workspace {
                         this.sidebar_open = !this.sidebar_open;
                         cx.notify();
                     }
-                    "\\" => this.cycle_layout(cx),
                     "[" => this.prev_active(window, cx),
                     "]" => this.next_active(window, cx),
+                    // Cmd+D 竖切（右侧并排）/ Cmd+Shift+D 横切（下方堆叠）
+                    "d" => {
+                        let axis = if ks.modifiers.shift {
+                            Axis::Vertical
+                        } else {
+                            Axis::Horizontal
+                        };
+                        this.split_active(axis, cx);
+                    }
+                    // Cmd+W 关闭当前 pane（至少留一个）
+                    "w" => this.close_active(cx),
                     _ => {}
                 }
             }))
-            // 左侧会话侧栏（gpui-component Sidebar 组件）
-            .child(sidebar_el)
-            // 主区：顶部视图切换 + 内容
+            // 顶部集成标题栏：透明 + 红绿灯占位 + 可拖拽，替代割裂的系统灰条。
             .child(
-                div()
-                    .flex_1()
-                    // min_w_0：主区在根 flex 行里默认 min-width:auto，会被最长终端行
-                    // 撑到不肯收缩，导致宽度被内容反向放大。归零后才能正常按剩余空间收缩。
-                    .min_w_0()
+                TitleBar::new().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::SquareTerminal))
+                        .child(div().font_bold().child("smelt"))
+                        .child(div().text_color(c_muted).child(active_title)),
+                ),
+            )
+            // 主体：左侧会话侧栏 + 右侧主区，占满标题栏以下的剩余高度。
+            .child(
+                div().flex_1().min_h_0().flex().child(
+                h_resizable("root-split")
+                    .with_state(&self.root_resize)
+                    // 会话侧栏：可拖拽宽度（160–420），Cmd+B 整体显隐
+                    .child(
+                        resizable_panel()
+                            .size(px(self.sidebar_w))
+                            .size_range(px(160.)..px(420.))
+                            .visible(self.sidebar_open)
+                            .child(sidebar_el),
+                    )
+                    // 主区：顶部视图切换 + 内容
+                    .child(resizable_panel().child(
+                        div()
+                            .flex_1()
+                            // min_w_0：主区在根 flex 行里默认 min-width:auto，会被最长终端行
+                            // 撑到不肯收缩，导致宽度被内容反向放大。归零后才能正常按剩余空间收缩。
+                            .min_w_0()
                     .flex()
                     .flex_col()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_1()
-                            .border_b_1()
-                            .border_color(c_border)
-                            .child(view_tab(0, "终端", self.view == MainView::Terminal, MainView::Terminal, cx))
-                            .child(view_tab(1, "文件树", self.view == MainView::Files, MainView::Files, cx))
-                            .child(view_tab(2, "Git", self.view == MainView::Git, MainView::Git, cx)),
+                        TabBar::new("main-view-tabs")
+                            .underline()
+                            // 左缩进 12px，与终端/文件内容左边基线对齐（不贴边）；
+                            // underline 变体的底边线是绝对满宽 div，不受此内边距影响。
+                            .pl(px(12.))
+                            .selected_index(match self.view {
+                                MainView::Terminal => 0,
+                                MainView::Files => 1,
+                                MainView::Git => 2,
+                            })
+                            .on_click(cx.listener(|this, ix: &usize, _window, cx| {
+                                this.view = match *ix {
+                                    0 => MainView::Terminal,
+                                    1 => MainView::Files,
+                                    _ => MainView::Git,
+                                };
+                                cx.notify();
+                            }))
+                            .child(Tab::new().label("终端"))
+                            .child(Tab::new().label("文件树"))
+                            .child(Tab::new().label("Git")),
                     )
                     .child(match self.view {
                         MainView::Terminal => content,
                         MainView::Files => {
                             let cwd = self.tabs.get(active).and_then(|t| t.read(cx).cwd());
                             let tree = file_tree(cwd, &self.expanded, cx);
-                            let content = file_content_pane(&self.open_file, cx);
+                            let content = file_content_pane(&self.open_file, &self.file_scroll, cx);
                             div()
                                 .flex_1()
                                 // min_h_0：否则这个 flex item 会被文件内容撑到整份文件那么高、
@@ -753,43 +1110,22 @@ impl Render for Workspace {
                         }
                         MainView::Git => {
                             let cwd = self.tabs.get(active).and_then(|t| t.read(cx).cwd());
-                            git_view(cwd, &self.git_diff, self.diff_split, cx)
+                            git_view(
+                                cwd,
+                                &self.git_diff,
+                                self.diff_split,
+                                &self.git_files_scroll,
+                                &self.diff_scroll,
+                                cx,
+                            )
                         }
                     }),
+                    )),
+                ),
             )
             // 命令面板（最上层）
             .children(palette_overlay)
     }
-}
-
-/// 顶部视图切换标签。
-fn view_tab(
-    id: usize,
-    label: &str,
-    active: bool,
-    view: MainView,
-    cx: &mut Context<Workspace>,
-) -> Stateful<Div> {
-    let t = cx.theme();
-    let (fg, bg, hover) = if active {
-        (t.foreground, t.accent, t.accent)
-    } else {
-        (t.muted_foreground, t.background, t.accent)
-    };
-    div()
-        .id(("view", id))
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .text_sm()
-        .bg(bg)
-        .text_color(fg)
-        .hover(move |s| s.bg(hover))
-        .on_click(cx.listener(move |this, _ev, _window, cx| {
-            this.view = view;
-            cx.notify();
-        }))
-        .child(label.to_string())
 }
 
 /// 主区占位视图（文件树 / Git 尚未实现）。
@@ -916,6 +1252,8 @@ fn git_view(
     cwd: Option<String>,
     git_diff: &Option<GitDiff>,
     split: bool,
+    files_scroll: &ScrollHandle,
+    diff_scroll: &UniformListScrollHandle,
     cx: &mut Context<Workspace>,
 ) -> Div {
     let (muted, fg, border, accent) = {
@@ -952,6 +1290,8 @@ fn git_view(
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(files_scroll)
+            .vertical_scrollbar(files_scroll)
             .flex()
             .flex_col()
             .p_1()
@@ -1029,12 +1369,17 @@ fn git_view(
         .min_h_0()
         .flex()
         .child(left)
-        .child(git_diff_pane(git_diff, split, cx))
+        .child(git_diff_pane(git_diff, split, diff_scroll, cx))
 }
 
 /// Git diff 查看面板：uniform_list 虚拟滚动。split 为 true 时并排（左旧右新），
 /// 否则统一视图。顶部文件名右侧有「统一/并排」切换按钮。
-fn git_diff_pane(git_diff: &Option<GitDiff>, split: bool, cx: &mut Context<Workspace>) -> Div {
+fn git_diff_pane(
+    git_diff: &Option<GitDiff>,
+    split: bool,
+    diff_scroll: &UniformListScrollHandle,
+    cx: &mut Context<Workspace>,
+) -> Div {
     let (muted, fg, border, accent) = {
         let t = cx.theme();
         (t.muted_foreground, t.foreground, t.border, t.accent)
@@ -1063,7 +1408,8 @@ fn git_diff_pane(git_diff: &Option<GitDiff>, split: bool, cx: &mut Context<Works
             .w_full()
             .py_1()
             .font_family(terminal_view::FONT_FAMILY)
-            .text_sm();
+            .text_sm()
+            .track_scroll(diff_scroll);
 
             // 「统一 / 并排」切换按钮。
             let toggle = div()
@@ -1102,7 +1448,17 @@ fn git_diff_pane(git_diff: &Option<GitDiff>, split: bool, cx: &mut Context<Works
                         .child(div().flex_1().min_w_0().child(name))
                         .child(toggle),
                 )
-                .child(list)
+                // 包一层 relative 容器承载 gpui-component 竖向滚动条（覆盖在 diff 上）。
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .child(list)
+                        .vertical_scrollbar(diff_scroll),
+                )
         }
     }
 }
@@ -1478,7 +1834,11 @@ fn highlight_all(path: &str, content: &str) -> Vec<Vec<(Rgba, String)>> {
 }
 
 /// 文件内容查看面板：uniform_list 虚拟滚动，只渲染可见行（高亮已预计算）。
-fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspace>) -> Div {
+fn file_content_pane(
+    open_file: &Option<OpenFile>,
+    file_scroll: &UniformListScrollHandle,
+    cx: &mut Context<Workspace>,
+) -> Div {
     let (muted, fg, border) = {
         let t = cx.theme();
         (t.muted_foreground, t.foreground, t.border)
@@ -1512,7 +1872,8 @@ fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspace>) 
             .p_2()
             .font_family(terminal_view::FONT_FAMILY)
             .text_sm()
-            .text_color(fg);
+            .text_color(fg)
+            .track_scroll(file_scroll);
 
             div()
                 .flex_1()
@@ -1530,7 +1891,17 @@ fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspace>) 
                         .border_color(border)
                         .child(name),
                 )
-                .child(list)
+                // relative 容器承载竖向滚动条。
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .child(list)
+                        .vertical_scrollbar(file_scroll),
+                )
         }
     }
 }
@@ -1577,31 +1948,6 @@ fn open_project_button(cx: &mut Context<Workspace>) -> Stateful<Div> {
     })
 }
 
-/// 布局切换按钮：显示当前列数图标，点击循环 1/2/3 列（无匹配 svg，用字符）。
-fn layout_button(cols: usize, cx: &mut Context<Workspace>) -> Stateful<Div> {
-    let glyph = match cols {
-        1 => "▢",
-        2 => "▥",
-        _ => "▦",
-    };
-    let (fg, hover) = {
-        let t = cx.theme();
-        (t.sidebar_foreground, t.sidebar_accent)
-    };
-    div()
-        .id("layout")
-        .flex()
-        .items_center()
-        .justify_center()
-        .size_7()
-        .rounded_md()
-        .text_color(fg)
-        .hover(move |s| s.bg(hover))
-        .tooltip(move |window, cx| Tooltip::new("切换布局").build(window, cx))
-        .child(glyph)
-        .on_click(cx.listener(|this, _ev, _window, cx| this.cycle_layout(cx)))
-}
-
 /// 当前工作目录字符串。
 fn current_dir() -> Option<String> {
     std::env::current_dir()
@@ -1620,7 +1966,12 @@ fn main() {
         Theme::change(ThemeMode::Dark, None, cx);
 
         cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
+            let window_options = WindowOptions {
+                // 透明标题栏：红绿灯浮在内容上，拖拽 / 双击最大化由自定义 TitleBar 接管。
+                titlebar: Some(TitleBar::title_bar_options()),
+                ..Default::default()
+            };
+            cx.open_window(window_options, |window, cx| {
                 let view = cx.new(|cx| Workspace::new(cx));
                 // 顶层视图必须包一层 Root（组件库的主题/遮罩系统要求）。
                 cx.new(|cx| Root::new(view, window, cx))
