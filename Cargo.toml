@@ -21,8 +21,12 @@ qrcode = "0.14"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+# 组件库自带图标资源（Sidebar 等组件的 IconName 需要注册它才能渲染 svg）。
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 # 内嵌终端：portable-pty 起 shell 子进程并拿到 PTY，alacritty_terminal 做
 # 终端状态机（ANSI 解析 + 网格模型），GPUI 负责把网格渲染出来。
 portable-pty = "0.9"
 alacritty_terminal = { version = "0.26", default-features = false }
 smol = "2"  # 定时器：驱动终端网格的定时快照重绘
+# 文件查看器语法高亮：内置几十种语言语法+主题，用 fancy-regex 纯 Rust 免装 onig(C)。
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }

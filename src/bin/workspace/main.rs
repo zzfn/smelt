@@ -10,9 +10,18 @@ mod terminal_view;
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::OnceLock;
 
 use gpui::*;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::sidebar::{
+    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 use terminal_view::TerminalView;
 
@@ -41,6 +50,14 @@ enum MainView {
     Git,
 }
 
+/// 打开查看的文件：路径 + 预高亮的行。每行是若干 (颜色, 文本) 片段。
+/// 高亮在打开时一次算好并存起来，滚动时 uniform_list 只按可见范围取行渲染。
+/// 用 Rc 让 uniform_list 的 'static 闭包能廉价地共享这份数据。
+struct OpenFile {
+    path: String,
+    lines: Rc<Vec<Vec<(Rgba, String)>>>,
+}
+
 /// 工作台根视图：多标签终端管理器。
 struct Workspace {
     tabs: Vec<Entity<TerminalView>>,
@@ -51,8 +68,10 @@ struct Workspace {
     view: MainView,
     /// 文件树里已展开的文件夹绝对路径。
     expanded: HashSet<String>,
-    /// 当前在文件树里打开查看的文件 (路径, 内容)。
-    open_file: Option<(String, String)>,
+    /// 当前在文件树里打开查看的文件（含预高亮的行数据）。
+    open_file: Option<OpenFile>,
+    /// 打开文件的自增序号：后台高亮完成时用它判断结果是否已过期（切了别的文件）。
+    file_gen: u64,
     /// 左侧会话侧栏是否展开（Cmd+B 切换）。
     sidebar_open: bool,
     /// 命令面板（Cmd+K）；None 表示未打开。
@@ -70,6 +89,7 @@ impl Workspace {
             view: MainView::Terminal,
             expanded: HashSet::new(),
             open_file: None,
+            file_gen: 0,
             sidebar_open: true,
             palette: None,
             palette_focus: cx.focus_handle(),
@@ -175,16 +195,38 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 文件树：打开一个文件查看内容（读文本，最多 3000 行）。
+    /// 文件树：打开一个文件查看内容。读文本 + 语法高亮放到后台线程跑（大文件不卡 UI），
+    /// 算完回主线程写入。用自增 file_gen 丢弃过期结果（期间又切了别的文件）。
     fn view_file(&mut self, path: String, cx: &mut Context<Self>) {
-        let content = std::fs::read_to_string(&path)
-            .map(|c| {
-                let lines: Vec<&str> = c.lines().take(3000).collect();
-                lines.join("\n")
-            })
-            .unwrap_or_else(|_| "（无法以文本方式读取：可能是二进制文件）".to_string());
-        self.open_file = Some((path, content));
+        self.file_gen = self.file_gen.wrapping_add(1);
+        let gen = self.file_gen;
+        // 先占位（清空旧内容 + 显示文件名），高亮完成后替换。
+        self.open_file = Some(OpenFile { path: path.clone(), lines: Rc::new(Vec::new()) });
         cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let p = path.clone();
+            let lines = cx
+                .background_executor()
+                .spawn(async move {
+                    match std::fs::read_to_string(&p) {
+                        Ok(text) => highlight_all(&p, &text),
+                        Err(_) => vec![vec![(
+                            rgb(0x808080),
+                            "（无法以文本方式读取：可能是二进制文件）".to_string(),
+                        )]],
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // 只有当前仍是这次打开的文件才写入，避免旧任务覆盖新文件。
+                if this.file_gen == gen {
+                    this.open_file = Some(OpenFile { path, lines: Rc::new(lines) });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -259,12 +301,11 @@ impl Render for Workspace {
         let can_close = self.tabs.len() > 1;
 
         // 主题色 token（跟随 gpui-component 主题，替代硬编码）
-        let (c_bg, c_sidebar, c_sidebar_border, c_border, c_muted, c_accent, c_accent_fg, c_primary, c_popover, c_fg) = {
+        let (c_bg, c_sidebar, c_border, c_muted, c_accent, c_accent_fg, c_primary, c_popover, c_fg) = {
             let t = cx.theme();
             (
                 t.background,
                 t.sidebar,
-                t.sidebar_border,
                 t.border,
                 t.muted_foreground,
                 t.sidebar_accent,
@@ -301,60 +342,85 @@ impl Render for Workspace {
             }
         }
 
-        let sidebar = if self.sidebar_open {
-            // 项目头 + 其下终端行
-            let mut rows: Vec<AnyElement> = Vec::new();
-            for (name, ixs) in &projects {
-                rows.push(project_header(name.clone(), cx).into_any_element());
-                for &ix in ixs {
-                    let title = titles.get(ix).map(|(_, t)| t.clone()).unwrap_or_default();
-                    rows.push(
-                        sidebar_row(ix, title, ix == active, can_close, cx).into_any_element(),
-                    );
-                }
-            }
-            Some(
+        // 项目 → 终端 两级菜单（gpui-component Sidebar）。
+        // Sidebar 组件的回调是 Fn(&_, &mut Window, &mut App)，拿不到 Context<Self>，
+        // 故捕获 entity 句柄在闭包里 update 自身。
+        let this = cx.entity();
+        let menu_items: Vec<SidebarMenuItem> = projects
+            .iter()
+            .map(|(name, ixs)| {
+                let term_items: Vec<SidebarMenuItem> = ixs
+                    .iter()
+                    .map(|&ix| {
+                        let title = titles.get(ix).map(|(_, t)| t.clone()).unwrap_or_default();
+                        let e_act = this.clone();
+                        let mut item = SidebarMenuItem::new(title)
+                            .icon(IconName::SquareTerminal)
+                            .active(ix == active)
+                            .on_click(move |_ev, window, cx| {
+                                e_act.update(cx, |ws, cx| ws.activate(ix, window, cx));
+                            });
+                        if can_close {
+                            let e_close = this.clone();
+                            item = item.suffix(move |_w, _cx| {
+                                let e = e_close.clone();
+                                Button::new(("close-tab", ix))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::CircleX)
+                                    .on_click(move |_ev, _w, cx| {
+                                        // 别把点击冒泡成「切换到该终端」
+                                        cx.stop_propagation();
+                                        e.update(cx, |ws, cx| ws.close_tab(ix, cx));
+                                    })
+                            });
+                        }
+                        item
+                    })
+                    .collect();
+                SidebarMenuItem::new(name.clone())
+                    .icon(IconName::Folder)
+                    .default_open(true)
+                    .click_to_toggle(true)
+                    .children(term_items)
+            })
+            .collect();
+
+        let sidebar_el = Sidebar::new("workspace-sidebar")
+            .collapsible(SidebarCollapsible::Offcanvas)
+            .collapsed(!self.sidebar_open)
+            .w(px(230.))
+            .header(
+                SidebarHeader::new().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::SquareTerminal))
+                        .child(div().font_bold().child("smelt")),
+                ),
+            )
+            .child(SidebarGroup::new("会话").child(SidebarMenu::new().children(menu_items)))
+            // 不用 SidebarFooter：它会给整块 footer 挂 hover 背景（sidebar_accent），
+            // 盖住按钮自己的 hover。直接放普通容器，让每个按钮各自 hover 可见。
+            .footer(
                 div()
                     .flex()
-                    .flex_col()
-                    .w(px(220.))
-                    .h_full()
-                    .bg(c_sidebar)
-                    .border_r_1()
-                    .border_color(c_sidebar_border)
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .text_sm()
-                            .text_color(c_muted)
-                            .child("会话"),
-                    )
-                    .child(div().flex().flex_col().flex_1().children(rows))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_1()
-                            .border_t_1()
-                            .border_color(c_sidebar_border)
-                            .child(new_tab_button(cx))
-                            .child(open_project_button(cx))
-                            .child(div().flex_1())
-                            .child(layout_button(self.layout_cols, cx)),
-                    ),
-            )
-        } else {
-            None
-        };
+                    .items_center()
+                    .gap_1()
+                    .w_full()
+                    .p_1()
+                    .child(new_tab_button(cx))
+                    .child(open_project_button(cx))
+                    .child(div().flex_1())
+                    .child(layout_button(self.layout_cols, cx)),
+            );
 
         // 主内容：单终端 或 网格（多列）
         let cols = self.layout_cols;
         let n = self.tabs.len();
         let content = if cols <= 1 {
-            div().flex_1().child(self.tabs[active].clone())
+            div().flex_1().min_w_0().child(self.tabs[active].clone())
         } else {
             let rows: Vec<Div> = (0..n)
                 .step_by(cols)
@@ -367,6 +433,7 @@ impl Render for Workspace {
                             let title = titles.get(ix).map(|(_, t)| t.clone()).unwrap_or_default();
                             div()
                                 .flex_1()
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .border_1()
@@ -387,10 +454,10 @@ impl Render for Workspace {
                                         .text_color(if is_active { c_accent_fg } else { c_muted })
                                         .child(title),
                                 )
-                                .child(div().flex_1().child(view))
+                                .child(div().flex_1().min_w_0().child(view))
                         })
                         .collect();
-                    div().flex_1().flex().gap_1().children(cards)
+                    div().flex_1().min_w_0().flex().gap_1().children(cards)
                 })
                 .collect();
             div().flex_1().flex().flex_col().gap_1().p_1().children(rows)
@@ -490,12 +557,15 @@ impl Render for Workspace {
                     _ => {}
                 }
             }))
-            // 左侧会话侧栏
-            .children(sidebar)
+            // 左侧会话侧栏（gpui-component Sidebar 组件）
+            .child(sidebar_el)
             // 主区：顶部视图切换 + 内容
             .child(
                 div()
                     .flex_1()
+                    // min_w_0：主区在根 flex 行里默认 min-width:auto，会被最长终端行
+                    // 撑到不肯收缩，导致宽度被内容反向放大。归零后才能正常按剩余空间收缩。
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .child(
@@ -519,6 +589,9 @@ impl Render for Workspace {
                             let content = file_content_pane(&self.open_file, cx);
                             div()
                                 .flex_1()
+                                // min_h_0：否则这个 flex item 会被文件内容撑到整份文件那么高、
+                                // 溢出窗口，导致内部 uniform_list 拿不到有界高度而无法滚动。
+                                .min_h_0()
                                 .flex()
                                 .child(
                                     div()
@@ -579,18 +652,6 @@ fn placeholder_view(text: &str, muted: Hsla) -> Div {
         .justify_center()
         .text_color(muted)
         .child(text.to_string())
-}
-
-/// 侧栏里的项目头（分组标题）。
-fn project_header(name: String, cx: &mut Context<Workspace>) -> Div {
-    let muted = cx.theme().muted_foreground;
-    div()
-        .px_2()
-        .pt_2()
-        .pb_1()
-        .text_sm()
-        .text_color(muted)
-        .child(format!("▾ {name}"))
 }
 
 /// 文件树视图：读取项目目录，已展开的文件夹递归显示，点击文件夹展开/收起。
@@ -769,19 +830,88 @@ fn git_status_color(st: &str) -> Rgba {
     }
 }
 
-/// 文件内容查看面板：逐行显示选中文件的文本。
-fn file_content_pane(open_file: &Option<(String, String)>, cx: &mut Context<Workspace>) -> Div {
+/// 语法集/主题集只加载一次（load_defaults 较重），进程内缓存复用。
+fn syntax_set() -> &'static SyntaxSet {
+    static SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+fn theme_set() -> &'static ThemeSet {
+    static SET: OnceLock<ThemeSet> = OnceLock::new();
+    SET.get_or_init(ThemeSet::load_defaults)
+}
+
+/// syntect 颜色 → gpui 颜色。
+fn syn_color(c: syntect::highlighting::Color) -> Rgba {
+    rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32)
+}
+
+/// 文件查看的固定行高（供 uniform_list 虚拟滚动，需每行等高）。
+const FILE_LINE_H: f32 = 20.0;
+
+/// 一次性把整份文本语法高亮成「行 → (颜色, 片段) 列表」。
+/// syntect 的高亮是有状态的（逐行累积），必须从头顺序处理，不能随机访问，
+/// 所以在打开文件时算好、存下来，滚动时只取可见行。最多 20000 行。
+fn highlight_all(path: &str, content: &str) -> Vec<Vec<(Rgba, String)>> {
+    let ss = syntax_set();
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let syntax = ss
+        .find_syntax_by_extension(ext)
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut hl = HighlightLines::new(syntax, &theme_set().themes["base16-ocean.dark"]);
+    content
+        .lines()
+        .take(20000)
+        .map(|line| {
+            hl.highlight_line(line, ss)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(style, text)| (syn_color(style.foreground), text.to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+/// 文件内容查看面板：uniform_list 虚拟滚动，只渲染可见行（高亮已预计算）。
+fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspace>) -> Div {
     let (muted, fg, border) = {
         let t = cx.theme();
         (t.muted_foreground, t.foreground, t.border)
     };
     match open_file {
         None => placeholder_view("← 从左侧选择文件查看内容", muted),
-        Some((path, content)) => {
-            let name = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
+        Some(of) => {
+            let name = of.path.rsplit('/').next().unwrap_or(of.path.as_str()).to_string();
+            let lines = of.lines.clone(); // Rc clone：闭包按可见范围取行
+            let count = lines.len();
+
+            let list = uniform_list("file-content", count, move |range, _window, _cx| {
+                range
+                    .map(|i| {
+                        let spans = &lines[i];
+                        let row = div().flex().whitespace_nowrap().h(px(FILE_LINE_H));
+                        if spans.is_empty() {
+                            // 空行放不间断空格占位，保持行高。
+                            row.child("\u{00a0}".to_string())
+                        } else {
+                            row.children(spans.iter().map(|(color, text)| {
+                                div().text_color(*color).child(text.clone())
+                            }))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p_2()
+            .font_family(terminal_view::FONT_FAMILY)
+            .text_sm()
+            .text_color(fg);
+
             div()
                 .flex_1()
                 .min_w_0()
+                .min_h_0()
                 .flex()
                 .flex_col()
                 .child(
@@ -794,22 +924,7 @@ fn file_content_pane(open_file: &Option<(String, String)>, cx: &mut Context<Work
                         .border_color(border)
                         .child(name),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .p_2()
-                        .font_family(terminal_view::FONT_FAMILY)
-                        .text_sm()
-                        .text_color(fg)
-                        .children(
-                            content
-                                .lines()
-                                .map(|l| div().whitespace_nowrap().child(l.to_string())),
-                        ),
-                )
+                .child(list)
         }
     }
 }
@@ -872,99 +987,70 @@ fn palette_key(
     }
 }
 
-/// 侧栏里的一个会话行：点击切换；活动态高亮；可关闭时带「×」。
-fn sidebar_row(
-    ix: usize,
-    title: String,
-    active: bool,
-    can_close: bool,
+/// 侧栏底部工具按钮：图标 + 明显 hover + tooltip。
+/// （组件 Button 的 ghost 在暗色下 hover 几乎不可见，这里自绘保证反馈明显。）
+fn tool_button(
+    id: &'static str,
+    icon: IconName,
+    tip: &'static str,
     cx: &mut Context<Workspace>,
+    handler: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
 ) -> Stateful<Div> {
-    let t = cx.theme();
-    let (bg, fg, muted, hover) = if active {
-        (
-            t.sidebar_accent,
-            t.sidebar_accent_foreground,
-            t.muted_foreground,
-            t.sidebar_accent,
-        )
-    } else {
-        (
-            t.sidebar,
-            t.sidebar_foreground,
-            t.muted_foreground,
-            t.sidebar_accent,
-        )
+    let (fg, hover) = {
+        let t = cx.theme();
+        (t.sidebar_foreground, t.sidebar_accent)
     };
-
-    let mut row = div()
-        .id(("sess", ix))
+    div()
+        .id(id)
         .flex()
         .items_center()
-        .gap_2()
-        .px_3()
-        .py_1()
-        .bg(bg)
+        .justify_center()
+        .size_7()
+        .rounded_md()
         .text_color(fg)
-        .text_sm()
         .hover(move |s| s.bg(hover))
-        .on_click(cx.listener(move |this, _ev, window, cx| {
-            this.activate(ix, window, cx);
-        }))
-        .child(div().flex_1().child(title));
-
-    if can_close {
-        row = row.child(
-            div()
-                .id(("sess-close", ix))
-                .px_1()
-                .rounded_sm()
-                .text_color(muted)
-                .on_click(cx.listener(move |this, _ev, _window, cx| {
-                    cx.stop_propagation();
-                    this.close_tab(ix, cx);
-                }))
-                .child("×"),
-        );
-    }
-
-    row
+        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .child(Icon::new(icon))
+        .on_click(cx.listener(move |this, _ev, window, cx| handler(this, window, cx)))
 }
 
 /// 「+」新建终端按钮（继承当前项目目录）。
-fn new_tab_button(cx: &mut Context<Workspace>) -> Button {
-    Button::new("new-tab")
-        .ghost()
-        .label("+")
-        .tooltip("新建终端")
-        .on_click(cx.listener(|this, _ev, _window, cx| {
-            this.new_tab(cx);
-        }))
+fn new_tab_button(cx: &mut Context<Workspace>) -> Stateful<Div> {
+    tool_button("new-tab", IconName::Plus, "新建终端", cx, |this, _w, cx| {
+        this.new_tab(cx)
+    })
 }
 
-/// 布局切换按钮：显示当前列数图标，点击循环 1/2/3 列。
-fn layout_button(cols: usize, cx: &mut Context<Workspace>) -> Button {
-    let icon = match cols {
+/// 「打开项目」按钮：弹选择框选目录，在其中开新标签。
+fn open_project_button(cx: &mut Context<Workspace>) -> Stateful<Div> {
+    tool_button("open-project", IconName::Folder, "打开项目", cx, |this, _w, cx| {
+        this.open_project(cx)
+    })
+}
+
+/// 布局切换按钮：显示当前列数图标，点击循环 1/2/3 列（无匹配 svg，用字符）。
+fn layout_button(cols: usize, cx: &mut Context<Workspace>) -> Stateful<Div> {
+    let glyph = match cols {
         1 => "▢",
         2 => "▥",
         _ => "▦",
     };
-    Button::new("layout")
-        .ghost()
-        .label(icon)
-        .tooltip("切换布局")
+    let (fg, hover) = {
+        let t = cx.theme();
+        (t.sidebar_foreground, t.sidebar_accent)
+    };
+    div()
+        .id("layout")
+        .flex()
+        .items_center()
+        .justify_center()
+        .size_7()
+        .rounded_md()
+        .text_color(fg)
+        .hover(move |s| s.bg(hover))
+        .tooltip(move |window, cx| Tooltip::new("切换布局").build(window, cx))
+        .child(glyph)
         .on_click(cx.listener(|this, _ev, _window, cx| this.cycle_layout(cx)))
-}
-
-/// 「打开项目」按钮：弹选择框选目录，在其中开新标签。
-fn open_project_button(cx: &mut Context<Workspace>) -> Button {
-    Button::new("open-project")
-        .ghost()
-        .label("📂")
-        .tooltip("打开项目")
-        .on_click(cx.listener(|this, _ev, _window, cx| {
-            this.open_project(cx);
-        }))
 }
 
 /// 当前工作目录字符串。
@@ -975,7 +1061,10 @@ fn current_dir() -> Option<String> {
 }
 
 fn main() {
-    gpui_platform::application().run(move |cx| {
+    // with_assets 注册组件库图标资源，Sidebar 的 IconName svg 才能渲染。
+    gpui_platform::application()
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx| {
         // 用任何 gpui-component 功能前必须先初始化。
         gpui_component::init(cx);
         // 深色主题（与终端配色一致）

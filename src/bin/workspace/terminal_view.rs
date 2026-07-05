@@ -54,6 +54,8 @@ pub struct TerminalView {
     grid_size: Rc<StdCell<(f32, f32)>>,
     /// 当前 Cmd 悬停的链接范围 (行, 起列, 止列)，用于高亮 + 切换鼠标样式。
     hover_url: Option<(usize, usize, usize)>,
+    /// 最近一帧的光标位置 (行, 列)，供 IME 定位候选窗（bounds_for_range）。
+    cursor: Option<(usize, usize)>,
 }
 
 impl TerminalView {
@@ -89,6 +91,7 @@ impl TerminalView {
             grid_origin: Rc::new(StdCell::new((0.0, 0.0))),
             grid_size: Rc::new(StdCell::new((0.0, 0.0))),
             hover_url: None,
+            cursor: None,
         }
     }
 
@@ -271,8 +274,12 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        // 候选窗要摆在光标格子上：从网格原点按 列×字宽 / 行×行高 偏移。
+        let (row, col) = self.cursor.unwrap_or((0, 0));
+        let origin = element_bounds.origin
+            + point(px(col as f32 * self.cell_w), px(row as f32 * LINE_PX));
         Some(Bounds {
-            origin: element_bounds.origin,
+            origin,
             size: size(px(2.0), px(LINE_PX)),
         })
     }
@@ -322,6 +329,7 @@ impl Render for TerminalView {
 
         let frame = self.terminal.snapshot();
         let cursor = frame.cursor;
+        self.cursor = cursor; // 存下来供 IME 候选窗定位
         let sel = self.sel;
         let hover_url = self.hover_url;
         let has_hover = hover_url.is_some();
@@ -335,6 +343,11 @@ impl Render for TerminalView {
             .relative()
             .track_focus(&self.focus_handle)
             .size_full()
+            // 关键：裁剪溢出 + 允许收缩到 0，否则长行的 min-content 宽度会把
+            // 容器越撑越宽，canvas 量到更大宽度 → 列数变多 → 行更长，形成放大循环。
+            .overflow_hidden()
+            .min_w_0()
+            .min_h_0()
             .bg(rgb(0x1a1b26))
             .text_color(rgb(0xc0caf5))
             .font_family(FONT_FAMILY)
