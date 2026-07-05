@@ -73,7 +73,7 @@ impl Render for Workspace {
             .flex_col()
             .size_full()
             .bg(rgb(0x1a1b26))
-            .font_family("monospace")
+            .font_family(terminal_view::FONT_FAMILY)
             // 标签栏
             .child(
                 div()

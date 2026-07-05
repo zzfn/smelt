@@ -1,13 +1,21 @@
 //! 单个终端视图：一个 Terminal + 焦点 + IME + 网格渲染 + 键盘/滚轮输入。
 //! 多个 TerminalView 由 Workspace 以标签形式管理。
 
+use std::cell::Cell as StdCell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::*;
 use smol::Timer;
 
 use crate::terminal::{self, Terminal};
+
+/// 选区高亮背景色。
+const SEL_BG: u32 = 0x0033_4a6a;
+
+/// 终端字体：Nerd Font 的严格等宽变体（含图标/powerline 字形，且单格宽对齐）。
+pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 
 /// 终端网格刷新间隔（后台线程在更新，UI 定时快照重绘）。
 const REFRESH: Duration = Duration::from_millis(30);
@@ -32,6 +40,12 @@ pub struct TerminalView {
     /// 输入法合成中的预编辑文本（未提交），仅用于满足 IME 协议，不发给 PTY。
     marked_text: Option<String>,
     title: String,
+    /// 鼠标框选：(锚点, 当前端) 的 (行, 列)。
+    sel: Option<((usize, usize), (usize, usize))>,
+    /// 上次测得的等宽字符像素宽（鼠标坐标换算用）。
+    cell_w: f32,
+    /// 网格原点（含内边距）的窗口像素坐标，由 canvas 在 paint 时写入。
+    grid_origin: Rc<StdCell<(f32, f32)>>,
 }
 
 impl TerminalView {
@@ -61,6 +75,9 @@ impl TerminalView {
             did_focus: false,
             marked_text: None,
             title,
+            sel: None,
+            cell_w: 8.0,
+            grid_origin: Rc::new(StdCell::new((0.0, 0.0))),
         }
     }
 
@@ -70,6 +87,79 @@ impl TerminalView {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// 窗口像素坐标 → 网格单元 (行, 列)。
+    fn pos_to_cell(&self, pos: Point<Pixels>) -> (usize, usize) {
+        let (ox, oy) = self.grid_origin.get();
+        let x = (f32::from(pos.x) - ox).max(0.0);
+        let y = (f32::from(pos.y) - oy).max(0.0);
+        let col = (x / self.cell_w.max(1.0)).floor() as usize;
+        let row = (y / LINE_PX).floor() as usize;
+        (row, col)
+    }
+
+    /// 提取当前选区文本（用于复制）。按 (行,列) 字典序规范化。
+    fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.sel?;
+        let (s, e) = if a <= b { (a, b) } else { (b, a) };
+        let frame = self.terminal.snapshot();
+        if frame.rows.is_empty() {
+            return None;
+        }
+        let last_row = e.0.min(frame.rows.len() - 1);
+        let mut out = String::new();
+        for r in s.0..=last_row {
+            let row = &frame.rows[r];
+            if !row.is_empty() {
+                let lo = if r == s.0 { s.1 } else { 0 };
+                let hi = (if r == e.0 { e.1 } else { row.len() - 1 }).min(row.len() - 1);
+                let mut line = String::new();
+                if lo <= hi {
+                    for c in lo..=hi {
+                        line.push(row[c].ch);
+                    }
+                }
+                out.push_str(line.trim_end());
+            }
+            if r != last_row {
+                out.push('\n');
+            }
+        }
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// 双击选词：以点击单元为中心，向两侧扩展到空白为止。
+    fn word_at(&self, (r, c): (usize, usize)) -> Option<((usize, usize), (usize, usize))> {
+        let frame = self.terminal.snapshot();
+        let row = frame.rows.get(r)?;
+        if c >= row.len() || row[c].ch.is_whitespace() {
+            return Some(((r, c), (r, c)));
+        }
+        let mut lo = c;
+        while lo > 0 && !row[lo - 1].ch.is_whitespace() {
+            lo -= 1;
+        }
+        let mut hi = c;
+        while hi + 1 < row.len() && !row[hi + 1].ch.is_whitespace() {
+            hi += 1;
+        }
+        Some(((r, lo), (r, hi)))
+    }
+
+    /// 三击选行：整行到最后一个非空白字符。
+    fn line_at(&self, (r, _c): (usize, usize)) -> Option<((usize, usize), (usize, usize))> {
+        let frame = self.terminal.snapshot();
+        let row = frame.rows.get(r)?;
+        let last = row
+            .iter()
+            .rposition(|cell| !cell.ch.is_whitespace())
+            .unwrap_or(0);
+        Some(((r, 0), (r, last)))
     }
 }
 
@@ -176,7 +266,7 @@ impl Render for TerminalView {
             // 精确测量等宽字符宽度（量一个 'M'）；异常时回退到 0.6 估算。
             let run = TextRun {
                 len: 1,
-                font: font("monospace"),
+                font: font(FONT_FAMILY),
                 color: hsla(0.0, 0.0, 1.0, 1.0),
                 background_color: None,
                 underline: None,
@@ -189,6 +279,7 @@ impl Render for TerminalView {
             } else {
                 FONT_PX * CELL_W_RATIO
             };
+            self.cell_w = cell_w; // 供鼠标坐标换算
             let vw = f32::from(vp.width);
             let vh = f32::from(vp.height);
             let cols = (((vw - PAD_X) / cell_w).floor() as usize).max(20);
@@ -198,8 +289,11 @@ impl Render for TerminalView {
 
         let frame = self.terminal.snapshot();
         let cursor = frame.cursor;
+        let sel = self.sel;
+        let base_font = font(FONT_FAMILY);
         let fh = self.focus_handle.clone();
         let entity = cx.entity();
+        let origin_cell = self.grid_origin.clone();
 
         div()
             .relative()
@@ -207,10 +301,17 @@ impl Render for TerminalView {
             .size_full()
             .bg(rgb(0x1a1b26))
             .text_color(rgb(0xc0caf5))
-            .font_family("monospace")
+            .font_family(FONT_FAMILY)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
                 let ks = &ev.keystroke;
                 let m = &ks.modifiers;
+                // Cmd+C 复制选区
+                if m.platform && ks.key == "c" {
+                    if let Some(text) = this.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                    return;
+                }
                 // Cmd+V 粘贴：读剪贴板写入 PTY
                 if m.platform && ks.key == "v" {
                     if let Some(text) = cx.read_from_clipboard().and_then(|it| it.text()) {
@@ -245,13 +346,47 @@ impl Render for TerminalView {
                     cx.notify();
                 }
             }))
+            // 鼠标框选
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    let cell = this.pos_to_cell(ev.position);
+                    this.sel = match ev.click_count {
+                        2 => this.word_at(cell),         // 双击选词
+                        n if n >= 3 => this.line_at(cell), // 三击选行
+                        _ => Some((cell, cell)),
+                    };
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                if ev.pressed_button == Some(MouseButton::Left) {
+                    if let Some((a, _)) = this.sel {
+                        let head = this.pos_to_cell(ev.position);
+                        this.sel = Some((a, head));
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
+                    // 单击（锚点==端点，未拖动）清除选区
+                    if let Some((a, b)) = this.sel {
+                        if a == b {
+                            this.sel = None;
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
             // 终端主体：逐行渲染 alacritty 网格快照（带颜色 / 光标）
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .size_full()
-                    .p_2()
                     .text_size(px(FONT_PX))
                     .line_height(px(LINE_PX))
                     .children(frame.rows.into_iter().enumerate().map(move |(r, row)| {
@@ -259,62 +394,104 @@ impl Render for TerminalView {
                             Some((cr, cc)) if cr == r => Some(cc),
                             _ => None,
                         };
-                        render_row(row, cc)
+                        let sr = sel_range_for_row(r, sel, row.len());
+                        render_row(row, cc, sr, &base_font)
                     })),
             )
-            // 透明覆盖层：在 paint 阶段注册 IME 输入处理器。
+            // 透明覆盖层：paint 阶段注册 IME 输入处理器，并记录网格原点。
             .child(
                 canvas(
                     move |_bounds, _window, _cx| {},
                     move |bounds, _, window, cx| {
+                        // 网格原点 = 覆盖层原点（终端主体已去内边距，直接对齐）
+                        origin_cell.set((
+                            f32::from(bounds.origin.x),
+                            f32::from(bounds.origin.y),
+                        ));
                         window.handle_input(&fh, ElementInputHandler::new(bounds, entity), cx);
                     },
                 )
                 .absolute()
-                .size_full(),
+                .inset_0(),
             )
     }
 }
 
-/// 渲染一行：把同属性的连续单元合并成一个 span；光标单元反色单独渲染。
-fn render_row(row: Vec<terminal::Cell>, cursor_col: Option<usize>) -> Div {
-    let mut spans: Vec<Div> = Vec::new();
+/// 渲染一行：整行作为一个 StyledText，逐段用 TextRun 上色（前景+背景+粗体+下划线）。
+/// 整行只整形一次 —— 拖选拆分不抖、宽度精确不截断。光标单元反色、选区单元高亮。
+fn render_row(
+    row: Vec<terminal::Cell>,
+    cursor_col: Option<usize>,
+    sel: Option<(usize, usize)>,
+    base_font: &Font,
+) -> Div {
+    let is_sel = |i: usize| sel.map_or(false, |(lo, hi)| i >= lo && i <= hi);
+    // 单元 i 的最终样式：光标反色 > 选区高亮 > 原色。
+    let style_of = |i: usize| -> (u32, u32, bool, bool) {
+        let c = &row[i];
+        let (mut fg, mut bg) = (c.fg, c.bg);
+        if Some(i) == cursor_col {
+            std::mem::swap(&mut fg, &mut bg);
+        } else if is_sel(i) {
+            bg = SEL_BG;
+        }
+        (fg, bg, c.bold, c.underline)
+    };
+
+    let mut line = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
     let mut i = 0;
     while i < row.len() {
-        if Some(i) == cursor_col {
-            let c = &row[i];
-            spans.push(cell_span(&c.ch.to_string(), c.bg, c.fg, c.bold, c.underline));
-            i += 1;
-            continue;
-        }
-        let c = &row[i];
-        let (fg, bg, bold, underline) = (c.fg, c.bg, c.bold, c.underline);
-        let mut text = String::new();
-        while i < row.len()
-            && Some(i) != cursor_col
-            && row[i].fg == fg
-            && row[i].bg == bg
-            && row[i].bold == bold
-            && row[i].underline == underline
-        {
-            text.push(row[i].ch);
+        let style = style_of(i);
+        let (fg, bg, bold, underline) = style;
+        let mut seg_len = 0usize;
+        while i < row.len() && style_of(i) == style {
+            let ch = row[i].ch;
+            line.push(ch);
+            seg_len += ch.len_utf8();
             i += 1;
         }
-        spans.push(cell_span(&text, fg, bg, bold, underline));
+        let mut fnt = base_font.clone();
+        if bold {
+            fnt.weight = FontWeight::BOLD;
+        }
+        runs.push(TextRun {
+            len: seg_len,
+            font: fnt,
+            color: Hsla::from(rgb(fg)),
+            background_color: Some(Hsla::from(rgb(bg))),
+            underline: underline.then(|| UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(Hsla::from(rgb(fg))),
+                wavy: false,
+            }),
+            strikethrough: None,
+        });
     }
-    div().flex().h(px(LINE_PX)).children(spans)
+
+    div()
+        .h(px(LINE_PX))
+        .child(StyledText::new(line).with_runs(runs))
 }
 
-/// 一个文本 span：前景/背景色 + 可选粗体/下划线。
-fn cell_span(text: &str, fg: u32, bg: u32, bold: bool, underline: bool) -> Div {
-    let mut d = div().child(text.to_string()).text_color(rgb(fg)).bg(rgb(bg));
-    if bold {
-        d = d.font_weight(FontWeight::BOLD);
+/// 计算某行落在选区内的列范围（按 (行,列) 字典序规范化）。
+fn sel_range_for_row(
+    r: usize,
+    sel: Option<((usize, usize), (usize, usize))>,
+    row_len: usize,
+) -> Option<(usize, usize)> {
+    let (a, b) = sel?;
+    let (s, e) = if a <= b { (a, b) } else { (b, a) };
+    if r < s.0 || r > e.0 || row_len == 0 {
+        return None;
     }
-    if underline {
-        d = d.underline();
+    let lo = if r == s.0 { s.1 } else { 0 };
+    let hi = (if r == e.0 { e.1 } else { row_len - 1 }).min(row_len - 1);
+    if lo > hi {
+        None
+    } else {
+        Some((lo, hi))
     }
-    d
 }
 
 /// 把一次「非文本按键」转成写给 PTY 的字节：特殊键和 Ctrl 组合。
