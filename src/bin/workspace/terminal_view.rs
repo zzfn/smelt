@@ -46,6 +46,8 @@ pub struct TerminalView {
     cell_w: f32,
     /// 网格原点（含内边距）的窗口像素坐标，由 canvas 在 paint 时写入。
     grid_origin: Rc<StdCell<(f32, f32)>>,
+    /// 鼠标当前是否悬停在链接上（用于切换鼠标样式）。
+    hover_link: bool,
 }
 
 impl TerminalView {
@@ -78,6 +80,7 @@ impl TerminalView {
             sel: None,
             cell_w: 8.0,
             grid_origin: Rc::new(StdCell::new((0.0, 0.0))),
+            hover_link: false,
         }
     }
 
@@ -160,6 +163,16 @@ impl TerminalView {
             .rposition(|cell| !cell.ch.is_whitespace())
             .unwrap_or(0);
         Some(((r, 0), (r, last)))
+    }
+
+    /// 点击单元处若落在某个 URL 上，返回该 URL。
+    fn url_at(&self, (r, c): (usize, usize)) -> Option<String> {
+        let frame = self.terminal.snapshot();
+        let row = frame.rows.get(r)?;
+        find_urls(row)
+            .into_iter()
+            .find(|&(a, b, _)| c >= a && c <= b)
+            .map(|(_, _, url)| url)
     }
 }
 
@@ -290,6 +303,7 @@ impl Render for TerminalView {
         let frame = self.terminal.snapshot();
         let cursor = frame.cursor;
         let sel = self.sel;
+        let hover_link = self.hover_link;
         let base_font = font(FONT_FAMILY);
         let fh = self.focus_handle.clone();
         let entity = cx.entity();
@@ -352,6 +366,13 @@ impl Render for TerminalView {
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus_handle, cx);
                     let cell = this.pos_to_cell(ev.position);
+                    // Cmd+点击打开链接
+                    if ev.modifiers.platform {
+                        if let Some(url) = this.url_at(cell) {
+                            cx.open_url(&url);
+                            return;
+                        }
+                    }
                     this.sel = match ev.click_count {
                         2 => this.word_at(cell),         // 双击选词
                         n if n >= 3 => this.line_at(cell), // 三击选行
@@ -367,6 +388,23 @@ impl Render for TerminalView {
                         this.sel = Some((a, head));
                         cx.notify();
                     }
+                } else {
+                    // 按住 Cmd 悬停链接时才变手型（与 Cmd+点击打开保持一致）
+                    let over = ev.modifiers.platform
+                        && this.url_at(this.pos_to_cell(ev.position)).is_some();
+                    if over != this.hover_link {
+                        this.hover_link = over;
+                        cx.notify();
+                    }
+                }
+            }))
+            // 按/松 Cmd 时（鼠标不动也）即时切换链接手型
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, window, cx| {
+                let pos = window.mouse_position();
+                let over = ev.modifiers.platform && this.url_at(this.pos_to_cell(pos)).is_some();
+                if over != this.hover_link {
+                    this.hover_link = over;
+                    cx.notify();
                 }
             }))
             .on_mouse_up(
@@ -395,19 +433,27 @@ impl Render for TerminalView {
                             _ => None,
                         };
                         let sr = sel_range_for_row(r, sel, row.len());
-                        render_row(row, cc, sr, &base_font)
+                        let links = find_urls(&row);
+                        render_row(row, cc, sr, &base_font, &links)
                     })),
             )
             // 透明覆盖层：paint 阶段注册 IME 输入处理器，并记录网格原点。
             .child(
                 canvas(
-                    move |_bounds, _window, _cx| {},
-                    move |bounds, _, window, cx| {
+                    // prepaint：建一个覆盖终端区的 hitbox（供设置鼠标样式用）
+                    move |bounds, window, _cx| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    move |bounds, hitbox, window, cx| {
+                        // 鼠标样式：悬停链接时手型，否则文本 I-beam
+                        window.set_cursor_style(
+                            if hover_link {
+                                CursorStyle::PointingHand
+                            } else {
+                                CursorStyle::IBeam
+                            },
+                            &hitbox,
+                        );
                         // 网格原点 = 覆盖层原点（终端主体已去内边距，直接对齐）
-                        origin_cell.set((
-                            f32::from(bounds.origin.x),
-                            f32::from(bounds.origin.y),
-                        ));
+                        origin_cell.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
                         window.handle_input(&fh, ElementInputHandler::new(bounds, entity), cx);
                     },
                 )
@@ -424,9 +470,11 @@ fn render_row(
     cursor_col: Option<usize>,
     sel: Option<(usize, usize)>,
     base_font: &Font,
+    links: &[(usize, usize, String)],
 ) -> Div {
     let is_sel = |i: usize| sel.map_or(false, |(lo, hi)| i >= lo && i <= hi);
-    // 单元 i 的最终样式：光标反色 > 选区高亮 > 原色。
+    let is_link = |i: usize| links.iter().any(|&(a, b, _)| i >= a && i <= b);
+    // 单元 i 的最终样式：光标反色 > 选区高亮 > 原色；链接加下划线。
     let style_of = |i: usize| -> (u32, u32, bool, bool) {
         let c = &row[i];
         let (mut fg, mut bg) = (c.fg, c.bg);
@@ -435,7 +483,7 @@ fn render_row(
         } else if is_sel(i) {
             bg = SEL_BG;
         }
-        (fg, bg, c.bold, c.underline)
+        (fg, bg, c.bold, c.underline || is_link(i))
     };
 
     let mut line = String::new();
@@ -492,6 +540,52 @@ fn sel_range_for_row(
     } else {
         Some((lo, hi))
     }
+}
+
+/// 在一行里找出所有 URL，返回 (起列, 止列含, url)。
+fn find_urls(row: &[terminal::Cell]) -> Vec<(usize, usize, String)> {
+    let n = row.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if starts_scheme(row, i) {
+            let mut j = i;
+            while j < n && is_url_char(row[j].ch) {
+                j += 1;
+            }
+            // 去掉结尾的标点
+            let mut end = j;
+            while end > i
+                && matches!(
+                    row[end - 1].ch,
+                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+                )
+            {
+                end -= 1;
+            }
+            if end - i >= 10 {
+                let url: String = (i..end).map(|k| row[k].ch).collect();
+                out.push((i, end - 1, url));
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 判断第 i 列起是否是 http:// 或 https://。
+fn starts_scheme(row: &[terminal::Cell], i: usize) -> bool {
+    let at = |pat: &str| {
+        let pc: Vec<char> = pat.chars().collect();
+        i + pc.len() <= row.len() && (0..pc.len()).all(|k| row[i + k].ch == pc[k])
+    };
+    at("http://") || at("https://")
+}
+
+fn is_url_char(c: char) -> bool {
+    !c.is_whitespace() && !matches!(c, '<' | '>' | '"' | '`' | '|' | '{' | '}' | '^')
 }
 
 /// 把一次「非文本按键」转成写给 PTY 的字节：特殊键和 Ctrl 组合。
