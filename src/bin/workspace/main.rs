@@ -27,11 +27,41 @@ impl Workspace {
         }
     }
 
-    fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| TerminalView::new(cx, current_dir()));
+    /// 在指定目录新建标签并激活。
+    fn add_tab(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| TerminalView::new(cx, cwd));
         self.tabs.push(view);
         self.active = self.tabs.len() - 1;
         cx.notify();
+    }
+
+    /// 「+」新建标签：继承当前活动标签的目录。
+    fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.read(cx).cwd())
+            .or_else(current_dir);
+        self.add_tab(cwd, cx);
+    }
+
+    /// 「打开项目」：弹原生选择框选一个目录，在其中开新标签。
+    fn open_project(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择项目目录".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let dir = dir.to_str().map(String::from);
+                    this.update(cx, |this, cx| this.add_tab(dir, cx)).ok();
+                }
+            }
+        })
+        .detach();
     }
 
     fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -84,7 +114,8 @@ impl Render for Workspace {
                     .py_1()
                     .bg(rgb(0x16161e))
                     .children(tab_buttons)
-                    .child(new_tab_button(cx)),
+                    .child(new_tab_button(cx))
+                    .child(open_project_button(cx)),
             )
             // 活动终端
             .child(div().flex_1().child(active_view))
@@ -146,7 +177,7 @@ fn tab_button(
     tab
 }
 
-/// 「+」新建标签按钮。
+/// 「+」新建标签按钮（继承当前项目目录）。
 fn new_tab_button(cx: &mut Context<Workspace>) -> Stateful<Div> {
     div()
         .id("new-tab")
@@ -158,6 +189,20 @@ fn new_tab_button(cx: &mut Context<Workspace>) -> Stateful<Div> {
             this.new_tab(cx);
         }))
         .child("+")
+}
+
+/// 「打开项目」按钮：弹选择框选目录，在其中开新标签。
+fn open_project_button(cx: &mut Context<Workspace>) -> Stateful<Div> {
+    div()
+        .id("open-project")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_color(rgb(0x565f89))
+        .on_click(cx.listener(|this, _ev, _window, cx| {
+            this.open_project(cx);
+        }))
+        .child("📂")
 }
 
 /// 当前工作目录字符串。

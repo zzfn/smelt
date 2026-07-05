@@ -14,6 +14,9 @@ use crate::terminal::{self, Terminal};
 /// 选区高亮背景色。
 const SEL_BG: u32 = 0x0033_4a6a;
 
+/// 悬停链接的高亮前景色。
+const LINK_FG: u32 = 0x007d_cfff;
+
 /// 终端字体：Nerd Font 的严格等宽变体（含图标/powerline 字形，且单格宽对齐）。
 pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 
@@ -40,14 +43,16 @@ pub struct TerminalView {
     /// 输入法合成中的预编辑文本（未提交），仅用于满足 IME 协议，不发给 PTY。
     marked_text: Option<String>,
     title: String,
+    /// 初始工作目录（新建标签继承用）。
+    cwd: Option<String>,
     /// 鼠标框选：(锚点, 当前端) 的 (行, 列)。
     sel: Option<((usize, usize), (usize, usize))>,
     /// 上次测得的等宽字符像素宽（鼠标坐标换算用）。
     cell_w: f32,
     /// 网格原点（含内边距）的窗口像素坐标，由 canvas 在 paint 时写入。
     grid_origin: Rc<StdCell<(f32, f32)>>,
-    /// 鼠标当前是否悬停在链接上（用于切换鼠标样式）。
-    hover_link: bool,
+    /// 当前 Cmd 悬停的链接范围 (行, 起列, 止列)，用于高亮 + 切换鼠标样式。
+    hover_url: Option<(usize, usize, usize)>,
 }
 
 impl TerminalView {
@@ -77,15 +82,20 @@ impl TerminalView {
             did_focus: false,
             marked_text: None,
             title,
+            cwd,
             sel: None,
             cell_w: 8.0,
             grid_origin: Rc::new(StdCell::new((0.0, 0.0))),
-            hover_link: false,
+            hover_url: None,
         }
     }
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    pub fn cwd(&self) -> Option<String> {
+        self.cwd.clone()
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
@@ -173,6 +183,16 @@ impl TerminalView {
             .into_iter()
             .find(|&(a, b, _)| c >= a && c <= b)
             .map(|(_, _, url)| url)
+    }
+
+    /// 单元处链接的范围 (行, 起列, 止列)，用于悬停高亮。
+    fn link_range_at(&self, (r, c): (usize, usize)) -> Option<(usize, usize, usize)> {
+        let frame = self.terminal.snapshot();
+        let row = frame.rows.get(r)?;
+        find_urls(row)
+            .into_iter()
+            .find(|&(a, b, _)| c >= a && c <= b)
+            .map(|(a, b, _)| (r, a, b))
     }
 }
 
@@ -303,7 +323,8 @@ impl Render for TerminalView {
         let frame = self.terminal.snapshot();
         let cursor = frame.cursor;
         let sel = self.sel;
-        let hover_link = self.hover_link;
+        let hover_url = self.hover_url;
+        let has_hover = hover_url.is_some();
         let base_font = font(FONT_FAMILY);
         let fh = self.focus_handle.clone();
         let entity = cx.entity();
@@ -389,21 +410,27 @@ impl Render for TerminalView {
                         cx.notify();
                     }
                 } else {
-                    // 按住 Cmd 悬停链接时才变手型（与 Cmd+点击打开保持一致）
-                    let over = ev.modifiers.platform
-                        && this.url_at(this.pos_to_cell(ev.position)).is_some();
-                    if over != this.hover_link {
-                        this.hover_link = over;
+                    // 按住 Cmd 悬停链接：记录链接范围（用于高亮 + 手型）
+                    let hl = if ev.modifiers.platform {
+                        this.link_range_at(this.pos_to_cell(ev.position))
+                    } else {
+                        None
+                    };
+                    if hl != this.hover_url {
+                        this.hover_url = hl;
                         cx.notify();
                     }
                 }
             }))
-            // 按/松 Cmd 时（鼠标不动也）即时切换链接手型
+            // 按/松 Cmd 时（鼠标不动也）即时更新链接高亮/手型
             .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, window, cx| {
-                let pos = window.mouse_position();
-                let over = ev.modifiers.platform && this.url_at(this.pos_to_cell(pos)).is_some();
-                if over != this.hover_link {
-                    this.hover_link = over;
+                let hl = if ev.modifiers.platform {
+                    this.link_range_at(this.pos_to_cell(window.mouse_position()))
+                } else {
+                    None
+                };
+                if hl != this.hover_url {
+                    this.hover_url = hl;
                     cx.notify();
                 }
             }))
@@ -433,8 +460,11 @@ impl Render for TerminalView {
                             _ => None,
                         };
                         let sr = sel_range_for_row(r, sel, row.len());
-                        let links = find_urls(&row);
-                        render_row(row, cc, sr, &base_font, &links)
+                        let hl = match hover_url {
+                            Some((hr, a, b)) if hr == r => Some((a, b)),
+                            _ => None,
+                        };
+                        render_row(row, cc, sr, &base_font, hl)
                     })),
             )
             // 透明覆盖层：paint 阶段注册 IME 输入处理器，并记录网格原点。
@@ -445,7 +475,7 @@ impl Render for TerminalView {
                     move |bounds, hitbox, window, cx| {
                         // 鼠标样式：悬停链接时手型，否则文本 I-beam
                         window.set_cursor_style(
-                            if hover_link {
+                            if has_hover {
                                 CursorStyle::PointingHand
                             } else {
                                 CursorStyle::IBeam
@@ -470,20 +500,26 @@ fn render_row(
     cursor_col: Option<usize>,
     sel: Option<(usize, usize)>,
     base_font: &Font,
-    links: &[(usize, usize, String)],
+    hover_link: Option<(usize, usize)>,
 ) -> Div {
     let is_sel = |i: usize| sel.map_or(false, |(lo, hi)| i >= lo && i <= hi);
-    let is_link = |i: usize| links.iter().any(|&(a, b, _)| i >= a && i <= b);
-    // 单元 i 的最终样式：光标反色 > 选区高亮 > 原色；链接加下划线。
+    let is_link = |i: usize| hover_link.map_or(false, |(a, b)| i >= a && i <= b);
+    // 悬停链接：高亮色 + 下划线；再叠加光标反色 / 选区背景。
     let style_of = |i: usize| -> (u32, u32, bool, bool) {
         let c = &row[i];
-        let (mut fg, mut bg) = (c.fg, c.bg);
+        let mut fg = c.fg;
+        let mut bg = c.bg;
+        let mut underline = c.underline;
+        if is_link(i) {
+            fg = LINK_FG;
+            underline = true;
+        }
         if Some(i) == cursor_col {
             std::mem::swap(&mut fg, &mut bg);
         } else if is_sel(i) {
             bg = SEL_BG;
         }
-        (fg, bg, c.bold, c.underline || is_link(i))
+        (fg, bg, c.bold, underline)
     };
 
     let mut line = String::new();
