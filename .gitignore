@@ -8,3 +8,9 @@
 .env
 
 # 注意：Cargo.lock 对二进制（bin）项目应保留，故此处不忽略。
+
+# 打包产物
+dist/
+
+# macOS 目录元数据
+.DS_Store

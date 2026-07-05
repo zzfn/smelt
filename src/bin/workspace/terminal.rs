@@ -153,6 +153,9 @@ impl Terminal {
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let mut cmd = CommandBuilder::new(shell);
+        // login shell（-l）：读 ~/.zprofile 拿到完整 PATH。打包成 .app 双击启动时
+        // 系统给的 PATH 很精简，不走 login 就找不到 homebrew 里的命令（如 starship）。
+        cmd.arg("-l");
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
