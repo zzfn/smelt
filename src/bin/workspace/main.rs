@@ -21,6 +21,8 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
+use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
+use gpui_component::tag::Tag;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 use terminal_view::TerminalView;
@@ -36,10 +38,108 @@ enum Cmd {
     SwitchTab(usize),
 }
 
-/// 命令面板状态。
-struct Palette {
-    query: String,
-    selected: usize,
+/// 命令面板的单个列表项：标签 + 选中态。
+#[derive(IntoElement)]
+struct CmdItem {
+    base: ListItem,
+    label: SharedString,
+    selected: bool,
+}
+
+impl CmdItem {
+    fn new(id: impl Into<ElementId>, label: SharedString, selected: bool) -> Self {
+        Self {
+            base: ListItem::new(id).selected(selected),
+            label,
+            selected,
+        }
+    }
+}
+
+impl Selectable for CmdItem {
+    fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        self.selected
+    }
+}
+
+impl RenderOnce for CmdItem {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let fg = if self.selected {
+            cx.theme().accent_foreground
+        } else {
+            cx.theme().foreground
+        };
+        self.base.px_3().py_1().child(div().text_color(fg).child(self.label))
+    }
+}
+
+/// 命令面板列表的数据源：全部命令 + 当前查询过滤结果。
+/// 搜索输入、上下选择、回车确认、Esc 取消都由 `ListState` 负责。
+struct CmdDelegate {
+    all: Vec<(SharedString, Cmd)>,
+    matched: Vec<(SharedString, Cmd)>,
+    selected_index: Option<IndexPath>,
+}
+
+impl CmdDelegate {
+    fn new(all: Vec<(SharedString, Cmd)>) -> Self {
+        Self {
+            matched: all.clone(),
+            all,
+            selected_index: Some(IndexPath::default()),
+        }
+    }
+}
+
+impl ListDelegate for CmdDelegate {
+    type Item = CmdItem;
+
+    fn items_count(&self, _section: usize, _: &App) -> usize {
+        self.matched.len()
+    }
+
+    fn perform_search(
+        &mut self,
+        query: &str,
+        _: &mut Window,
+        _: &mut Context<ListState<Self>>,
+    ) -> Task<()> {
+        let q = query.to_lowercase();
+        self.matched = self
+            .all
+            .iter()
+            .filter(|(label, _)| q.is_empty() || label.to_lowercase().contains(&q))
+            .cloned()
+            .collect();
+        Task::ready(())
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: Option<IndexPath>,
+        _: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) {
+        self.selected_index = ix;
+        cx.notify();
+    }
+
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _: &mut Window,
+        _: &mut Context<ListState<Self>>,
+    ) -> Option<Self::Item> {
+        let selected = Some(ix) == self.selected_index;
+        self.matched
+            .get(ix.row)
+            .map(|(label, _)| CmdItem::new(ix, label.clone(), selected))
+    }
 }
 
 /// 主区视图：终端 / 文件树 / Git（按项目切换）。
@@ -58,6 +158,33 @@ struct OpenFile {
     lines: Rc<Vec<Vec<(Rgba, String)>>>,
 }
 
+/// diff 行的类型，决定行号显示、前景色、整行背景与左侧色条。
+#[derive(Clone, Copy, PartialEq)]
+enum DiffKind {
+    Add,     // 增行（+）
+    Del,     // 删行（-）
+    Context, // 上下文行（空格）
+    Hunk,    // @@ 段头
+    Meta,    // diff/index/+++/--- 等元信息
+}
+
+/// 一行 diff：旧/新行号（None 表示该侧无此行）、类型、去掉 +/-/空格前缀的文本。
+/// segments 为 Some 时表示做过行内 diff：每段 (文本, 是否变化)，变化段渲染时上深底。
+struct DiffLine {
+    old_ln: Option<u32>,
+    new_ln: Option<u32>,
+    kind: DiffKind,
+    text: String,
+    segments: Option<Vec<(String, bool)>>,
+}
+
+/// Git 视图里当前选中查看的文件 diff：文件相对路径 + 结构化的 diff 行。
+/// 用 Rc 供 uniform_list 闭包共享。
+struct GitDiff {
+    path: String,
+    lines: Rc<Vec<DiffLine>>,
+}
+
 /// 工作台根视图：多标签终端管理器。
 struct Workspace {
     tabs: Vec<Entity<TerminalView>>,
@@ -72,11 +199,18 @@ struct Workspace {
     open_file: Option<OpenFile>,
     /// 打开文件的自增序号：后台高亮完成时用它判断结果是否已过期（切了别的文件）。
     file_gen: u64,
+    /// Git 视图里当前查看的文件 diff；None 表示未选中任何文件。
+    git_diff: Option<GitDiff>,
+    /// 打开 diff 的自增序号（独立于 file_gen，避免和文件高亮任务互相取消）。
+    diff_gen: u64,
+    /// diff 是否用并排（split）视图；false 为统一（unified）视图。
+    diff_split: bool,
     /// 左侧会话侧栏是否展开（Cmd+B 切换）。
     sidebar_open: bool,
-    /// 命令面板（Cmd+K）；None 表示未打开。
-    palette: Option<Palette>,
-    palette_focus: FocusHandle,
+    /// 命令面板（Cmd+K）；None 表示未打开。搜索/导航/确认由 ListState 负责。
+    palette: Option<Entity<ListState<CmdDelegate>>>,
+    /// 命令面板的事件订阅（确认/取消）；随面板关闭一并释放。
+    _palette_sub: Option<Subscription>,
 }
 
 impl Workspace {
@@ -90,9 +224,12 @@ impl Workspace {
             expanded: HashSet::new(),
             open_file: None,
             file_gen: 0,
+            git_diff: None,
+            diff_gen: 0,
+            diff_split: false,
             sidebar_open: true,
             palette: None,
-            palette_focus: cx.focus_handle(),
+            _palette_sub: None,
         }
     }
 
@@ -229,17 +366,77 @@ impl Workspace {
         .detach();
     }
 
+    /// Git 视图：查看某个改动文件的 diff。已跟踪文件用 `git diff HEAD`，
+    /// 未跟踪文件（??）用 `git diff --no-index` 展示全文（整体当作新增）。
+    /// 跑 git + 着色放后台，用 file_gen 丢弃过期结果。
+    fn open_diff(&mut self, root: String, path: String, untracked: bool, cx: &mut Context<Self>) {
+        self.diff_gen = self.diff_gen.wrapping_add(1);
+        let gen = self.diff_gen;
+        self.git_diff = Some(GitDiff { path: path.clone(), lines: Rc::new(Vec::new()) });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let (r, p) = (root.clone(), path.clone());
+            let lines = cx
+                .background_executor()
+                .spawn(async move {
+                    let out = if untracked {
+                        std::process::Command::new("git")
+                            .args(["-C", &r, "diff", "--no-index", "--", "/dev/null", &p])
+                            .output()
+                    } else {
+                        std::process::Command::new("git")
+                            .args(["-C", &r, "diff", "HEAD", "--", &p])
+                            .output()
+                    };
+                    // --no-index 有差异时退出码为 1，所以不看 status，只要拿到 stdout。
+                    let text = match out {
+                        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+                        Err(e) => format!("无法执行 git diff：{e}"),
+                    };
+                    parse_diff(&text)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.diff_gen == gen {
+                    this.git_diff = Some(GitDiff { path, lines: Rc::new(lines) });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = Some(Palette {
-            query: String::new(),
-            selected: 0,
-        });
-        window.focus(&self.palette_focus, cx);
+        let all: Vec<(SharedString, Cmd)> = self
+            .all_commands(cx)
+            .into_iter()
+            .map(|(label, cmd)| (label.into(), cmd))
+            .collect();
+        let state = cx.new(|cx| ListState::new(CmdDelegate::new(all), window, cx).searchable(true));
+        // 确认（回车/点击）执行命令；取消（Esc）关闭面板。
+        self._palette_sub = Some(cx.subscribe_in(
+            &state,
+            window,
+            |this, state, ev: &ListEvent, window, cx| match ev {
+                ListEvent::Confirm(ix) => {
+                    let cmd = state.read(cx).delegate().matched.get(ix.row).map(|(_, c)| c.clone());
+                    if let Some(cmd) = cmd {
+                        this.exec_cmd(cmd, window, cx);
+                    }
+                }
+                ListEvent::Cancel => this.close_palette(window, cx),
+                _ => {}
+            },
+        ));
+        state.update(cx, |s, cx| s.focus(window, cx));
+        self.palette = Some(state);
         cx.notify();
     }
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = None;
+        self._palette_sub = None;
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -257,19 +454,6 @@ impl Workspace {
             v.push((format!("切换到: {}", t.read(cx).title()), Cmd::SwitchTab(i)));
         }
         v
-    }
-
-    /// 按查询过滤后的命令。
-    fn filtered(&self, cx: &App) -> Vec<(String, Cmd)> {
-        let q = self
-            .palette
-            .as_ref()
-            .map(|p| p.query.to_lowercase())
-            .unwrap_or_default();
-        self.all_commands(cx)
-            .into_iter()
-            .filter(|(label, _)| q.is_empty() || label.to_lowercase().contains(&q))
-            .collect()
     }
 
     fn exec_cmd(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
@@ -301,7 +485,7 @@ impl Render for Workspace {
         let can_close = self.tabs.len() > 1;
 
         // 主题色 token（跟随 gpui-component 主题，替代硬编码）
-        let (c_bg, c_sidebar, c_border, c_muted, c_accent, c_accent_fg, c_primary, c_popover, c_fg) = {
+        let (c_bg, c_sidebar, c_border, c_muted, c_accent, c_accent_fg, c_primary, c_popover) = {
             let t = cx.theme();
             (
                 t.background,
@@ -312,7 +496,6 @@ impl Render for Workspace {
                 t.sidebar_accent_foreground,
                 t.primary,
                 t.popover,
-                t.foreground,
             )
         };
 
@@ -463,48 +646,25 @@ impl Render for Workspace {
             div().flex_1().flex().flex_col().gap_1().p_1().children(rows)
         };
 
-        // 命令面板弹层
-        let palette_overlay = self.palette.as_ref().map(|p| {
-            let cmds = self.filtered(cx);
-            let sel = if cmds.is_empty() {
-                0
-            } else {
-                p.selected.min(cmds.len() - 1)
-            };
-            let query = p.query.clone();
-            let items: Vec<Stateful<Div>> = cmds
-                .iter()
-                .enumerate()
-                .map(|(i, (label, cmd))| {
-                    let is_sel = i == sel;
-                    let cmd = cmd.clone();
-                    let mut d = div()
-                        .id(("cmd", i))
-                        .px_3()
-                        .py_1()
-                        .text_color(if is_sel { c_accent_fg } else { c_muted })
-                        .on_click(cx.listener(move |this, _ev, window, cx| {
-                            this.exec_cmd(cmd.clone(), window, cx)
-                        }))
-                        .child(label.clone());
-                    if is_sel {
-                        d = d.bg(c_accent);
-                    }
-                    d
-                })
-                .collect();
-
+        // 命令面板弹层：搜索框 + 候选列表全部由 ListState 渲染。
+        let palette_overlay = self.palette.as_ref().map(|state| {
             div()
                 .absolute()
                 .inset_0()
                 .flex()
                 .justify_center()
                 .pt(px(80.))
+                // 点背景空白处关闭面板
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
+                )
                 .child(
                     div()
-                        .track_focus(&self.palette_focus)
-                        .on_key_down(cx.listener(palette_key))
+                        // 点面板内部不冒泡到背景，避免误关
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .w(px(480.))
+                        .h(px(360.))
                         .flex()
                         .flex_col()
                         .bg(c_popover)
@@ -512,18 +672,7 @@ impl Render for Workspace {
                         .border_color(c_border)
                         .rounded_lg()
                         .shadow_lg()
-                        .child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .text_color(c_fg)
-                                .child(if query.is_empty() {
-                                    "› 输入命令…".to_string()
-                                } else {
-                                    format!("› {}", query)
-                                }),
-                        )
-                        .children(items),
+                        .child(List::new(state).search_placeholder("输入命令…")),
                 )
         });
 
@@ -604,7 +753,7 @@ impl Render for Workspace {
                         }
                         MainView::Git => {
                             let cwd = self.tabs.get(active).and_then(|t| t.read(cx).cwd());
-                            git_view(cwd, cx)
+                            git_view(cwd, &self.git_diff, self.diff_split, cx)
                         }
                     }),
             )
@@ -671,15 +820,37 @@ fn file_tree(cwd: Option<String>, expanded: &HashSet<String>, cx: &mut Context<W
         .enumerate()
         .map(|(i, (depth, name, is_dir, path))| {
             let indent = px(8.0 + depth as f32 * 14.0);
-            let icon = if is_dir {
+            // 展开箭头：目录用 chevron 图标（展开朝下 / 收起朝右），文件留等宽占位对齐。
+            let arrow = if is_dir {
+                div()
+                    .w(px(14.))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        Icon::new(if expanded.contains(&path) {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(px(12.))
+                        .text_color(muted),
+                    )
+                    .into_any_element()
+            } else {
+                div().w(px(14.)).into_any_element()
+            };
+            // 类型图标：目录（展开 / 收起用不同文件夹图标）与文件区分。
+            let type_icon = Icon::new(if is_dir {
                 if expanded.contains(&path) {
-                    "▾"
+                    IconName::FolderOpen
                 } else {
-                    "▸"
+                    IconName::Folder
                 }
             } else {
-                " "
-            };
+                IconName::File
+            })
+            .size(px(14.))
+            .text_color(if is_dir { fg } else { muted });
             let p = path.clone();
             div()
                 .id(("file", i))
@@ -699,7 +870,8 @@ fn file_tree(cwd: Option<String>, expanded: &HashSet<String>, cx: &mut Context<W
                         this.view_file(p.clone(), cx);
                     }
                 }))
-                .child(icon.to_string())
+                .child(arrow)
+                .child(type_icon)
                 .child(name)
         })
         .collect();
@@ -739,11 +911,16 @@ fn walk_dir(
     }
 }
 
-/// Git 视图：显示当前分支 + 改动文件（git status）。
-fn git_view(cwd: Option<String>, cx: &mut Context<Workspace>) -> Div {
-    let (muted, fg, border) = {
+/// Git 视图：左侧分支 + 改动文件列表（可点击），右侧显示选中文件的 diff。
+fn git_view(
+    cwd: Option<String>,
+    git_diff: &Option<GitDiff>,
+    split: bool,
+    cx: &mut Context<Workspace>,
+) -> Div {
+    let (muted, fg, border, accent) = {
         let t = cx.theme();
-        (t.muted_foreground, t.foreground, t.border)
+        (t.muted_foreground, t.foreground, t.border, t.accent)
     };
     let Some(root) = cwd else {
         return placeholder_view("无项目目录", muted);
@@ -766,17 +943,43 @@ fn git_view(cwd: Option<String>, cx: &mut Context<Workspace>) -> Div {
         }
     }
 
-    let body = if files.is_empty() {
-        placeholder_view("工作区干净，无改动 ✓", muted)
+    let selected = git_diff.as_ref().map(|d| d.path.clone());
+    let file_list = if files.is_empty() {
+        placeholder_view("工作区干净，无改动 ✓", muted).into_any_element()
     } else {
         div()
+            .id("git-files")
             .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .p_1()
             .children(files.into_iter().enumerate().map(|(i, (st, path))| {
-                let color = git_status_color(&st);
-                div()
+                let st_trim = st.trim();
+                // 状态标记用 Tag 彩色胶囊：新增=绿 删除=红 修改=黄 未跟踪=灰 其余=蓝。
+                let label = if st_trim.is_empty() {
+                    "•".to_string()
+                } else {
+                    st_trim.to_string()
+                };
+                let status_tag = if st_trim.contains('?') {
+                    Tag::secondary()
+                } else if st_trim.contains('A') {
+                    Tag::success()
+                } else if st_trim.contains('D') {
+                    Tag::danger()
+                } else if st_trim.contains('M') {
+                    Tag::warning()
+                } else {
+                    Tag::info()
+                }
+                .small()
+                .child(label);
+                let untracked = st.contains('?');
+                let is_sel = selected.as_deref() == Some(path.as_str());
+                let (r, p) = (root.clone(), path.clone());
+                let row = div()
                     .id(("git", i))
                     .flex()
                     .items_center()
@@ -784,24 +987,31 @@ fn git_view(cwd: Option<String>, cx: &mut Context<Workspace>) -> Div {
                     .px_2()
                     .py(px(1.0))
                     .text_sm()
-                    .child(
-                        div()
-                            .w(px(22.))
-                            .text_color(color)
-                            .child(if st.trim().is_empty() {
-                                "•".to_string()
-                            } else {
-                                st.trim().to_string()
-                            }),
-                    )
-                    .child(div().text_color(fg).child(path))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(accent))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_diff(r.clone(), p.clone(), untracked, cx)
+                    }))
+                    .child(status_tag)
+                    .child(div().min_w_0().text_color(fg).child(path));
+                // 选中项高亮背景（无 .when，用普通条件分支）。
+                if is_sel {
+                    row.bg(accent)
+                } else {
+                    row
+                }
             }))
+            .into_any_element()
     };
 
-    div()
-        .flex_1()
+    let left = div()
+        .w(px(300.))
+        .min_h_0()
         .flex()
         .flex_col()
+        .border_r_1()
+        .border_color(border)
         .child(
             div()
                 .px_3()
@@ -812,21 +1022,417 @@ fn git_view(cwd: Option<String>, cx: &mut Context<Workspace>) -> Div {
                 .border_color(border)
                 .child(format!("⎇ {branch}")),
         )
-        .child(body)
+        .child(file_list);
+
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .child(left)
+        .child(git_diff_pane(git_diff, split, cx))
 }
 
-/// git 状态码 → 颜色（约定色）。
-fn git_status_color(st: &str) -> Rgba {
-    if st.contains('?') {
-        rgb(0x565f89) // 未跟踪
-    } else if st.contains('A') {
-        rgb(0x9ece6a) // 新增
-    } else if st.contains('D') {
-        rgb(0xf7768e) // 删除
-    } else if st.contains('M') {
-        rgb(0xe0af68) // 修改
-    } else {
-        rgb(0x7aa2f7)
+/// Git diff 查看面板：uniform_list 虚拟滚动。split 为 true 时并排（左旧右新），
+/// 否则统一视图。顶部文件名右侧有「统一/并排」切换按钮。
+fn git_diff_pane(git_diff: &Option<GitDiff>, split: bool, cx: &mut Context<Workspace>) -> Div {
+    let (muted, fg, border, accent) = {
+        let t = cx.theme();
+        (t.muted_foreground, t.foreground, t.border, t.accent)
+    };
+    match git_diff {
+        None => placeholder_view("← 选择改动文件查看 diff", muted),
+        Some(d) => {
+            let name = d.path.rsplit('/').next().unwrap_or(d.path.as_str()).to_string();
+            let lines = d.lines.clone();
+
+            let list = if split {
+                let rows = Rc::new(build_split_rows(&lines));
+                let count = rows.len();
+                let lines2 = lines.clone();
+                uniform_list("git-diff-split", count, move |range, _w, _cx| {
+                    range.map(|i| render_split_row(&rows[i], &lines2)).collect::<Vec<_>>()
+                })
+            } else {
+                let count = lines.len();
+                uniform_list("git-diff", count, move |range, _w, _cx| {
+                    range.map(|i| render_diff_line(&lines[i])).collect::<Vec<_>>()
+                })
+            }
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .py_1()
+            .font_family(terminal_view::FONT_FAMILY)
+            .text_sm();
+
+            // 「统一 / 并排」切换按钮。
+            let toggle = div()
+                .id("diff-split-toggle")
+                .px_2()
+                .py(px(1.0))
+                .text_xs()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(fg)
+                .bg(accent)
+                .hover(|d| d.opacity(0.8))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.diff_split = !this.diff_split;
+                    cx.notify();
+                }))
+                .child(if split { "并排 ⇄" } else { "统一 ☰" }.to_string());
+
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .text_sm()
+                        .text_color(muted)
+                        .border_b_1()
+                        .border_color(border)
+                        .child(div().flex_1().min_w_0().child(name))
+                        .child(toggle),
+                )
+                .child(list)
+        }
+    }
+}
+
+/// 把 git diff 文本解析成结构化的行：从 @@ 段头取起始行号，逐行推进旧/新行号，
+/// 并按前缀判定类型、剥掉 +/-/空格前缀。空 diff 给一句提示。
+fn parse_diff(text: &str) -> Vec<DiffLine> {
+    let mk = |old_ln, new_ln, kind, text: &str| DiffLine {
+        old_ln,
+        new_ln,
+        kind,
+        text: text.to_string(),
+        segments: None,
+    };
+    if text.trim().is_empty() {
+        return vec![mk(None, None, DiffKind::Meta, "（无差异）")];
+    }
+    let mut old_ln = 0u32;
+    let mut new_ln = 0u32;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("@@") {
+            let (o, n) = parse_hunk(line);
+            old_ln = o;
+            new_ln = n;
+            out.push(mk(None, None, DiffKind::Hunk, line));
+        } else if line.starts_with("+++")
+            || line.starts_with("---")
+            || line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file")
+            || line.starts_with("similarity")
+            || line.starts_with("rename ")
+        {
+            out.push(mk(None, None, DiffKind::Meta, line));
+        } else if let Some(t) = line.strip_prefix('+') {
+            out.push(mk(None, Some(new_ln), DiffKind::Add, t));
+            new_ln += 1;
+        } else if let Some(t) = line.strip_prefix('-') {
+            out.push(mk(Some(old_ln), None, DiffKind::Del, t));
+            old_ln += 1;
+        } else {
+            // 上下文行（以空格开头，或 diff 末尾的空行）。
+            let t = line.strip_prefix(' ').unwrap_or(line);
+            out.push(mk(Some(old_ln), Some(new_ln), DiffKind::Context, t));
+            old_ln += 1;
+            new_ln += 1;
+        }
+    }
+    mark_inline(&mut out);
+    out
+}
+
+/// 后处理：对每组「连续删行紧跟连续增行」按顺序逐行配对，做字符级 inline diff，
+/// 把两侧变化的具体片段标出来（存进各自的 segments）。行太长则跳过（避免 O(n·m)）。
+fn mark_inline(lines: &mut [DiffLine]) {
+    let n = lines.len();
+    let mut i = 0;
+    while i < n {
+        if lines[i].kind != DiffKind::Del {
+            i += 1;
+            continue;
+        }
+        let del_start = i;
+        while i < n && lines[i].kind == DiffKind::Del {
+            i += 1;
+        }
+        let add_start = i;
+        while i < n && lines[i].kind == DiffKind::Add {
+            i += 1;
+        }
+        let pairs = (add_start - del_start).min(i - add_start);
+        for k in 0..pairs {
+            let (di, ai) = (del_start + k, add_start + k);
+            let (dt, at) = (lines[di].text.clone(), lines[ai].text.clone());
+            if dt.len() + at.len() > 4000 {
+                continue; // 超长行不做行内 diff
+            }
+            let (dseg, aseg) = inline_segments(&dt, &at);
+            lines[di].segments = Some(dseg);
+            lines[ai].segments = Some(aseg);
+        }
+    }
+}
+
+/// 对一对 (旧行, 新行) 做字符级 diff，分别产出两侧的 (片段, 是否变化) 列表。
+/// 旧行里被删除的字符标变化，新行里新增的字符标变化，相等部分两侧都不标。
+fn inline_segments(old: &str, new: &str) -> (Vec<(String, bool)>, Vec<(String, bool)>) {
+    let diff = similar::TextDiff::from_chars(old, new);
+    let mut olds: Vec<(String, bool)> = Vec::new();
+    let mut news: Vec<(String, bool)> = Vec::new();
+    // 把相邻同状态的字符合并成段，减少 span 数量。
+    let push = |v: &mut Vec<(String, bool)>, ch: &str, changed: bool| {
+        if let Some(last) = v.last_mut() {
+            if last.1 == changed {
+                last.0.push_str(ch);
+                return;
+            }
+        }
+        v.push((ch.to_string(), changed));
+    };
+    for change in diff.iter_all_changes() {
+        let val = change.value();
+        match change.tag() {
+            similar::ChangeTag::Equal => {
+                push(&mut olds, val, false);
+                push(&mut news, val, false);
+            }
+            similar::ChangeTag::Delete => push(&mut olds, val, true),
+            similar::ChangeTag::Insert => push(&mut news, val, true),
+        }
+    }
+    (olds, news)
+}
+
+/// 从 hunk 头 `@@ -a,b +c,d @@` 解析出旧/新起始行号（a、c）。
+fn parse_hunk(line: &str) -> (u32, u32) {
+    let (mut old, mut new) = (0u32, 0u32);
+    for tok in line.split_whitespace() {
+        if let Some(s) = tok.strip_prefix('-') {
+            old = s.split(',').next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        } else if let Some(s) = tok.strip_prefix('+') {
+            new = s.split(',').next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        }
+    }
+    (old, new)
+}
+
+/// 渲染一行 diff：左侧色条 + 旧/新行号槽 + 文本；整行按类型上淡背景。
+/// 若有 segments（行内 diff 结果），变化片段再叠一层更深的底色。
+fn render_diff_line(l: &DiffLine) -> Div {
+    // (前景, 整行背景, 色条, 行内变化片段深底) —— None 表示不上色。
+    let (fg, bg, bar, hl): (Rgba, Option<Rgba>, Option<Rgba>, Rgba) = match l.kind {
+        DiffKind::Add => (rgb(0xb5e08a), Some(rgb(0x16261a)), Some(rgb(0x4ba14b)), rgb(0x2f6b34)),
+        DiffKind::Del => (rgb(0xf7a3ae), Some(rgb(0x2a1620)), Some(rgb(0xc75c6a)), rgb(0x7a2836)),
+        DiffKind::Context => (rgb(0xc0caf5), None, None, rgb(0)),
+        DiffKind::Hunk => (rgb(0x7dcfff), Some(rgb(0x16202e)), None, rgb(0)),
+        DiffKind::Meta => (rgb(0x565f89), None, None, rgb(0)),
+    };
+    let gutter = |n: Option<u32>| {
+        div()
+            .w(px(44.))
+            .px_1()
+            .flex()
+            .justify_end()
+            .text_color(rgb(0x4a5178))
+            .child(n.map(|v| v.to_string()).unwrap_or_default())
+    };
+
+    // 文本区：有行内 diff 就拆成多段（变化段上深底），否则整行一个文本。
+    let text_area = match &l.segments {
+        Some(segs) => div().flex_1().px_2().text_color(fg).flex().children(
+            segs.iter().map(|(s, changed)| {
+                let span = div().child(s.clone());
+                if *changed {
+                    span.bg(hl).rounded_sm()
+                } else {
+                    span
+                }
+            }),
+        ),
+        None => div()
+            .flex_1()
+            .px_2()
+            .text_color(fg)
+            .child(if l.text.is_empty() { "\u{00a0}".to_string() } else { l.text.clone() }),
+    };
+
+    let mut row = div().flex().items_center().h(px(FILE_LINE_H)).whitespace_nowrap();
+    if let Some(b) = bg {
+        row = row.bg(b);
+    }
+    row
+        // 左侧色条：增/删才有，其它用等宽透明占位保持对齐。
+        .child(match bar {
+            Some(c) => div().w(px(2.)).h_full().bg(c),
+            None => div().w(px(2.)).h_full(),
+        })
+        .child(gutter(l.old_ln))
+        .child(gutter(l.new_ln))
+        .child(text_area)
+}
+
+/// 并排视图的一行：Both = 左(旧侧)/右(新侧)各一行（None 为空侧占位）；
+/// Full = 横跨整宽的 hunk/meta 行。存的是 GitDiff.lines 里的索引。
+enum SplitRow {
+    Both(Option<usize>, Option<usize>),
+    Full(usize),
+}
+
+/// 把线性的 diff 行重排成并排的行对：上下文左右对齐；一组删/增按顺序配对，
+/// 数量不等时多出的一侧留空；纯新增（无对应删行）左侧空。
+fn build_split_rows(lines: &[DiffLine]) -> Vec<SplitRow> {
+    let n = lines.len();
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < n {
+        match lines[i].kind {
+            DiffKind::Hunk | DiffKind::Meta => {
+                rows.push(SplitRow::Full(i));
+                i += 1;
+            }
+            DiffKind::Context => {
+                rows.push(SplitRow::Both(Some(i), Some(i)));
+                i += 1;
+            }
+            DiffKind::Del => {
+                let ds = i;
+                while i < n && lines[i].kind == DiffKind::Del {
+                    i += 1;
+                }
+                let de = i;
+                let as_ = i;
+                while i < n && lines[i].kind == DiffKind::Add {
+                    i += 1;
+                }
+                let ae = i;
+                let (dn, an) = (de - ds, ae - as_);
+                for k in 0..dn.max(an) {
+                    let l = (k < dn).then_some(ds + k);
+                    let r = (k < an).then_some(as_ + k);
+                    rows.push(SplitRow::Both(l, r));
+                }
+            }
+            DiffKind::Add => {
+                // 纯新增块（前面没有删行）：左侧空、右侧逐行。
+                while i < n && lines[i].kind == DiffKind::Add {
+                    rows.push(SplitRow::Both(None, Some(i)));
+                    i += 1;
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// diff 行类型 → (前景, 整行背景, 左色条, 行内变化片段深底)。
+fn diff_colors(kind: DiffKind) -> (Rgba, Option<Rgba>, Option<Rgba>, Rgba) {
+    match kind {
+        DiffKind::Add => (rgb(0xb5e08a), Some(rgb(0x16261a)), Some(rgb(0x4ba14b)), rgb(0x2f6b34)),
+        DiffKind::Del => (rgb(0xf7a3ae), Some(rgb(0x2a1620)), Some(rgb(0xc75c6a)), rgb(0x7a2836)),
+        DiffKind::Context => (rgb(0xc0caf5), None, None, rgb(0)),
+        DiffKind::Hunk => (rgb(0x7dcfff), Some(rgb(0x16202e)), None, rgb(0)),
+        DiffKind::Meta => (rgb(0x565f89), None, None, rgb(0)),
+    }
+}
+
+/// 文本区（flex_1）：有 segments 就拆成多段（变化段上深底），否则整行一段。
+fn diff_text_area(l: &DiffLine, fg: Rgba, hl: Rgba) -> Div {
+    match &l.segments {
+        Some(segs) => div().flex_1().px_2().text_color(fg).flex().children(segs.iter().map(
+            |(s, changed)| {
+                let span = div().child(s.clone());
+                if *changed {
+                    span.bg(hl).rounded_sm()
+                } else {
+                    span
+                }
+            },
+        )),
+        None => div()
+            .flex_1()
+            .px_2()
+            .text_color(fg)
+            .child(if l.text.is_empty() { "\u{00a0}".to_string() } else { l.text.clone() }),
+    }
+}
+
+/// 渲染并排的半行（左或右，flex_1）。idx 为 None 时是空侧占位（暗底）。
+/// left=true 用旧行号，否则用新行号。
+fn render_half(idx: Option<usize>, left: bool, lines: &[DiffLine]) -> Div {
+    // overflow_hidden：长行必须裁剪在本半区内，否则会溢出盖住另一半，并排就糊了。
+    let base = div().flex_1().min_w_0().overflow_hidden().flex().items_center().h_full();
+    let Some(i) = idx else {
+        // 空侧：略暗的底表示「此侧无对应行」。
+        return base.bg(rgb(0x101218));
+    };
+    let l = &lines[i];
+    let (fg, bg, bar, hl) = diff_colors(l.kind);
+    let ln = if left { l.old_ln } else { l.new_ln };
+    let mut row = base;
+    if let Some(b) = bg {
+        row = row.bg(b);
+    }
+    row.child(match bar {
+        Some(c) => div().w(px(2.)).h_full().bg(c),
+        None => div().w(px(2.)).h_full(),
+    })
+    .child(
+        div()
+            .w(px(44.))
+            .px_1()
+            .flex()
+            .justify_end()
+            .text_color(rgb(0x4a5178))
+            .child(ln.map(|v| v.to_string()).unwrap_or_default()),
+    )
+    .child(diff_text_area(l, fg, hl))
+}
+
+/// 渲染并排视图的一行。
+fn render_split_row(row: &SplitRow, lines: &[DiffLine]) -> Div {
+    match row {
+        SplitRow::Full(i) => {
+            let l = &lines[*i];
+            let (fg, bg, _, _) = diff_colors(l.kind);
+            let mut d = div()
+                .flex()
+                .items_center()
+                .h(px(FILE_LINE_H))
+                .w_full()
+                .overflow_hidden()
+                .whitespace_nowrap();
+            if let Some(b) = bg {
+                d = d.bg(b);
+            }
+            d.child(div().px_2().text_color(fg).child(l.text.clone()))
+        }
+        SplitRow::Both(l, r) => div()
+            .flex()
+            .items_center()
+            .h(px(FILE_LINE_H))
+            // w_full 关键：容器占满整宽，两个 flex_1 半区才会真正各占一半；
+            // 否则容器 hug content，grow 失效，空侧塌成 0 宽、内容顶到最左。
+            .w_full()
+            .whitespace_nowrap()
+            .child(render_half(*l, true, lines))
+            .child(div().w(px(1.)).h_full().bg(rgb(0x2a2e3d))) // 中缝分隔
+            .child(render_half(*r, false, lines)),
     }
 }
 
@@ -930,63 +1536,6 @@ fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspace>) 
 }
 
 /// 命令面板的键盘处理：字符过滤、上下选择、回车执行、Esc 关闭。
-fn palette_key(
-    this: &mut Workspace,
-    ev: &KeyDownEvent,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    if this.palette.is_none() {
-        return;
-    }
-    let ks = &ev.keystroke;
-    match ks.key.as_str() {
-        "escape" => this.close_palette(window, cx),
-        "up" => {
-            if let Some(p) = this.palette.as_mut() {
-                p.selected = p.selected.saturating_sub(1);
-            }
-            cx.notify();
-        }
-        "down" => {
-            let len = this.filtered(cx).len();
-            if let Some(p) = this.palette.as_mut() {
-                if len > 0 && p.selected + 1 < len {
-                    p.selected += 1;
-                }
-            }
-            cx.notify();
-        }
-        "backspace" => {
-            if let Some(p) = this.palette.as_mut() {
-                p.query.pop();
-                p.selected = 0;
-            }
-            cx.notify();
-        }
-        "enter" => {
-            let sel = this.palette.as_ref().map(|p| p.selected).unwrap_or(0);
-            let cmds = this.filtered(cx);
-            if let Some((_, cmd)) = cmds.into_iter().nth(sel) {
-                this.exec_cmd(cmd, window, cx);
-            }
-        }
-        _ => {
-            if !ks.modifiers.platform && !ks.modifiers.control && !ks.modifiers.function {
-                if let Some(kc) = ks.key_char.clone() {
-                    if !kc.is_empty() {
-                        if let Some(p) = this.palette.as_mut() {
-                            p.query.push_str(&kc);
-                            p.selected = 0;
-                        }
-                        cx.notify();
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// 侧栏底部工具按钮：图标 + 明显 hover + tooltip。
 /// （组件 Button 的 ghost 在暗色下 hover 几乎不可见，这里自绘保证反馈明显。）
 fn tool_button(

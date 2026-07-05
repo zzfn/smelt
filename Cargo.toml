@@ -30,3 +30,5 @@ alacritty_terminal = { version = "0.26", default-features = false }
 smol = "2"  # 定时器：驱动终端网格的定时快照重绘
 # 文件查看器语法高亮：内置几十种语言语法+主题，用 fancy-regex 纯 Rust 免装 onig(C)。
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# diff 行内高亮：对配对的删/增行做字符级 diff，标出具体变化的片段。
+similar = "2"
