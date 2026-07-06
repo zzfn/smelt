@@ -48,3 +48,32 @@
 ## 宠物
 - 鼠标很近时凑上来 / 划过身体害羞挤压（距离 / 接触反应）
 - Stage 3：打字跟宠物多轮对话（输入框 + 对话历史）
+
+---
+
+## 终端渲染性能：P0 已解决空闲开销，调试 HUD 的帧率是结构性成本
+
+**✅ 已做（P0）**：`TerminalView` 的 30ms 定时器以前无条件 `cx.notify()`，导致哪怕 shell
+完全空闲也以 33 次/秒的频率重画。改用 alacritty 自带的 `Term::damage()` 判断内容是否
+真变化，没变就跳过。实测：空闲终端 5 秒内 `render()` 从理论上的 165 次降到 8 次。
+过程中隔离测试抓到一个真 bug——`damage_cursor()` 无条件标记光标格，必须排除"仅光标
+那一格"的脏区才算数，见 `terminal.rs` 的 `damage_gate_tests`。
+
+**🔍 调试 HUD（Cmd+Shift+F）测出的 30-40 FPS 不会因为 P0 变化，原因已查清**：
+- HUD 用 `window.request_animation_frame()` 强制 Workspace 每帧重画；GPUI 的
+  `window.refreshing` 机制会让同一帧里所有被摸到的实体（包括 TerminalView）跟着
+  强制重画，绕开各自的 dirty 判断——这是 GPUI `view.rs` 里 prepaint 复用逻辑的一部分
+  （`!dirty_views.contains && !refreshing` 才复用），不是 P0 没生效
+- 实测过"啥都不动"和"`yes` 持续刷屏"两种场景下 HUD 帧率相近，证实这个数字取决于
+  **屏幕上有多少行要重新布局+绘制**，跟内容是否变化无关
+- 已用真实分段计时排除了 `snapshot()`（重负载下 median 0.8ms，可忽略）；GPUI 自带
+  `LineLayoutCache` 大概率已经在做"内容没变就不重新整形文字"（按 text+font+runs 内容
+  跨帧复用，见 `text_system/line_layout.rs`）——原计划的"按行内容哈希缓存"（codux 同款
+  方案）大概率是重复造轮子，故未实施
+- 剩下的成本只能是 **Taffy 给 ~50 行 Div 做布局 + GPU 绘制提交**，这是当前"每行一个
+  独立 Div 交给 Taffy 排布"这种渲染方式的结构性成本，测不到更细（裸调 GPUI 元素构造
+  函数脱离真实 App/Window 上下文会直接让 rustc 编译崩溃，这条路不安全）
+
+**🔲 若以后要继续优化**：只有真在日常使用（非 HUD 极端测试）里明显感觉到"疯狂刷屏时卡"
+才值得——需要绕开 `Div`/`Taffy`，自己写一个手动整形+绘制的终端元素（类似 codux 自己
+写的 `TerminalElement`），是比 P0 大得多的重写，收益未知，先不做。
