@@ -37,6 +37,8 @@ const EYE_LOOK_MAX: f32 = 4.0;
 const IDLE_CHAT_FRAMES: f32 = 20.0 * 160.0;
 /// 光标静止多少帧判为「用户离开」（20fps × ~600s = 10 分钟）。
 const AFK_FRAMES: f32 = 20.0 * 600.0;
+/// 切换 app 后再评论的冷却帧数（20fps × ~75s）：频繁切 app 时不啰嗦。
+const APP_SWITCH_COOLDOWN: f32 = 20.0 * 75.0;
 
 /// 点一下宠物轮换的台词。
 const LINES: &[&str] = &[
@@ -157,6 +159,10 @@ pub struct PetView {
     still_frames: f32,
     /// 是否已就本次「离开」提醒过（光标一动就复位）。
     afk_notified: bool,
+    /// 上次感知到的前台 app 名（用于检测「切换了 app」）。
+    last_app: Option<String>,
+    /// 切 app 评论的冷却计时（帧），>0 时不评论。
+    app_switch_cd: f32,
 }
 
 impl PetView {
@@ -213,7 +219,31 @@ impl PetView {
                         && this.idle_frames > IDLE_CHAT_FRAMES
                     {
                         this.idle_frames = 0.0;
-                        this.ask_agent("你有点无聊了，主动跟主人搭一句家常。".into(), cx);
+                        let ctx = this.app_ctx();
+                        this.ask_agent(format!("你有点无聊了{ctx}，主动跟主人搭一句家常。"), cx);
+                    }
+
+                    // 感知前台 app：切到别的 app 时偶尔评论一句（带冷却，不啰嗦）。
+                    if this.app_switch_cd > 0.0 {
+                        this.app_switch_cd -= 1.0;
+                    }
+                    let front = frontmost_app();
+                    if front != this.last_app {
+                        let had_prev = this.last_app.is_some();
+                        this.last_app = front.clone();
+                        // 首次观测只记基线不评论；切到 smelt 自己也不评论。
+                        if had_prev && this.app_switch_cd <= 0.0 {
+                            if let Some(app) = front.filter(|a| a != "smelt" && a != "Smelt") {
+                                this.app_switch_cd = APP_SWITCH_COOLDOWN;
+                                this.proactive_say(
+                                    format!(
+                                        "主人刚切到「{app}」这个应用，用宠物口吻俏皮地评论一句，别超过 15 字。"
+                                    ),
+                                    format!("在用 {app} 呀～"),
+                                    cx,
+                                );
+                            }
+                        }
                     }
 
                     // 整点报时（9–22 点；跨过整点时报一次）。
@@ -262,7 +292,17 @@ impl PetView {
             last_mouse: None,
             still_frames: 0.0,
             afk_notified: false,
+            last_app: None,
+            app_switch_cd: 0.0,
         }
+    }
+
+    /// 当前前台 app 的上下文串（喂给大脑，让搭话更贴合当下）；无则空串。
+    fn app_ctx(&self) -> String {
+        self.last_app
+            .as_deref()
+            .map(|a| format!("（主人现在在用 {a}）"))
+            .unwrap_or_default()
     }
 
     /// 主动开口（受「播报开关」总控，且当前没在说话时才说）：
@@ -533,8 +573,9 @@ impl Render for PetView {
                         this.poke = (this.poke + 0.2).min(1.0);
                         this.bounce = 1.0;
                         if Self::agent_on(cx) {
-                            // 开了大脑 → LLM 即兴回应，替代写死台词。
-                            this.ask_agent("主人戳了戳你，俏皮地回应一句。".into(), cx);
+                            // 开了大脑 → LLM 即兴回应（带上当前 app 上下文），替代写死台词。
+                            let ctx = this.app_ctx();
+                            this.ask_agent(format!("主人戳了戳你{ctx}，俏皮地回应一句。"), cx);
                         } else {
                             this.line_idx = (this.line_idx + 1) % LINES.len();
                             this.say(LINES[this.line_idx]);
@@ -573,6 +614,11 @@ impl Render for PetView {
                 )
         });
 
+        // 身体也朝鼠标方向倾（幅度比眼睛大 ≈1.8×）：div 不能旋转，用位移近似「歪头看你」。
+        // 与眼睛偏移同向叠加 → 整只都在看鼠标，而非只有瞳孔动。
+        let lean_x = eye_ox * 1.8 * s;
+        let lean_y = eye_oy * 1.0 * s;
+
         // 整窗透明：不设背景色，只有宠物本体可见；上方气泡、下方宠物。
         let mut root = div()
             .size_full()
@@ -585,7 +631,14 @@ impl Render for PetView {
         if let Some(bubble) = bubble {
             root = root.child(bubble);
         }
-        root.child(div().mt(px(bob)).child(body)).into_any_element()
+        root.child(
+            div()
+                .relative()
+                .left(px(lean_x))
+                .top(px(bob + lean_y))
+                .child(body),
+        )
+        .into_any_element()
     }
 }
 
@@ -729,6 +782,41 @@ fn mouse_state(window: &Window, s: f32) -> (f32, f32, bool, f32, f32) {
 #[cfg(not(target_os = "macos"))]
 fn mouse_state(_window: &Window, _s: f32) -> (f32, f32, bool, f32, f32) {
     (0.0, 0.0, true, 0.0, 0.0)
+}
+
+/// 当前前台 app 的名字（如 "Google Chrome" / "Xcode"）。
+/// 用 `[[NSWorkspace sharedWorkspace] frontmostApplication].localizedName`——只拿 app 名
+/// 无需任何权限（拿窗口标题 / 网址才要辅助功能权限，这里不碰）。
+#[cfg(target_os = "macos")]
+fn frontmost_app() -> Option<String> {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        let ws: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if ws.is_null() {
+            return None;
+        }
+        let app: *mut Object = msg_send![ws, frontmostApplication];
+        if app.is_null() {
+            return None;
+        }
+        let name: *mut Object = msg_send![app, localizedName];
+        if name.is_null() {
+            return None;
+        }
+        let utf8: *const std::os::raw::c_char = msg_send![name, UTF8String];
+        if utf8.is_null() {
+            return None;
+        }
+        let s = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+        (!s.is_empty()).then_some(s)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn frontmost_app() -> Option<String> {
+    None
 }
 
 /// 设置窗口是否「点击穿透」：`passthrough=true` 时整窗放行鼠标事件到下层。
