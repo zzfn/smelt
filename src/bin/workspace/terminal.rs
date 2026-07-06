@@ -10,7 +10,7 @@ use std::thread;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
@@ -438,9 +438,62 @@ impl Terminal {
         Frame { rows, cursor }
     }
 
-    /// 上下滚动历史缓冲：正数向上翻看历史，负数向下。
+    /// 上下滚动历史缓冲：正数向上翻看历史，负数向下。（Shift+PageUp 用，强制本地历史。）
     pub fn scroll(&mut self, lines: i32) {
         if let Ok(mut term) = self.term.lock() {
+            term.scroll_display(Scroll::Delta(lines));
+        }
+    }
+
+    /// 滚轮：按终端当前模式分流，`lines` 正数向上、负数向下，`(row,col)` 为 0 基单元格。
+    ///
+    /// - 应用开了鼠标上报（MOUSE_MODE）→ 把滚轮编码成鼠标滚轮事件发给应用。**Claude Code
+    ///   等 TUI 就是靠这个滚动**（它们在备用屏、无本地 scrollback，等的是鼠标事件）。
+    /// - 备用屏 + 备用滚动（ALT_SCREEN+ALTERNATE_SCROLL）→ 发方向键。
+    /// - 否则（普通主屏）→ 滚本地历史缓冲。
+    pub fn scroll_wheel(&mut self, lines: i32, row: usize, col: usize) {
+        let mode = match self.term.lock() {
+            Ok(term) => *term.mode(),
+            Err(_) => return,
+        };
+        let count = (lines.unsigned_abs() as usize).clamp(1, 8);
+        let up = lines > 0;
+
+        // intersects 而非 contains：MOUSE_MODE 是 REPORT_CLICK|MOTION|DRAG 的组合，很多 TUI
+        // （如 Claude Code）只开其中一位（MOUSE_MOTION），contains 会漏判，intersects 才对。
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            // 鼠标滚轮「按下」事件：上=64 下=65；坐标 1 基。
+            let cb: u8 = if up { 64 } else { 65 };
+            let cx = col.saturating_add(1);
+            let cy = row.saturating_add(1);
+            let mut buf = Vec::new();
+            for _ in 0..count {
+                if mode.contains(TermMode::SGR_MOUSE) {
+                    buf.extend_from_slice(format!("\x1b[<{cb};{cx};{cy}M").as_bytes());
+                } else {
+                    // 普通 X10 编码：各值偏移 32，坐标裁到 223。
+                    let bx = 32u8.saturating_add(cx.min(223) as u8);
+                    let by = 32u8.saturating_add(cy.min(223) as u8);
+                    buf.extend_from_slice(&[0x1b, b'[', b'M', 32 + cb, bx, by]);
+                }
+            }
+            self.send_input(&buf);
+        } else if mode.contains(TermMode::ALT_SCREEN)
+            && mode.contains(TermMode::ALTERNATE_SCROLL)
+        {
+            // 备用屏无本地历史：发方向键（应用光标模式用 SS3，否则 CSI）。
+            let seq: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            let mut buf = Vec::with_capacity(seq.len() * count);
+            for _ in 0..count {
+                buf.extend_from_slice(seq);
+            }
+            self.send_input(&buf);
+        } else if let Ok(mut term) = self.term.lock() {
             term.scroll_display(Scroll::Delta(lines));
         }
     }

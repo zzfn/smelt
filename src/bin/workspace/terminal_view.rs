@@ -527,7 +527,9 @@ impl Render for TerminalView {
                     ScrollDelta::Pixels(p) => (f32::from(p.y) / LINE_PX) as i32,
                 };
                 if lines != 0 {
-                    this.terminal.scroll(lines);
+                    // 按终端模式分流：TUI（Claude Code）转成鼠标滚轮事件，普通 shell 滚历史。
+                    let (row, col) = this.pos_to_cell(ev.position);
+                    this.terminal.scroll_wheel(lines, row, col);
                     cx.notify();
                 }
             }))
