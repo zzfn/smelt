@@ -164,6 +164,7 @@ enum MainView {
     Terminal,
     Files,
     Git,
+    Settings,
 }
 
 /// 会话里 agent 的状态（用于总览页状态徽章）。借鉴 codex 的 ThreadStatus 细分：
@@ -655,8 +656,8 @@ struct Workspace {
     diff_split: bool,
     /// 左侧会话侧栏是否展开（Cmd+B 切换）。
     sidebar_open: bool,
-    /// 外观设置面板是否打开（标题栏齿轮切换）。
-    settings_open: bool,
+    /// 上一次的视图（用于从设置返回）。
+    prev_view: MainView,
     /// 通知面板是否打开（标题栏铃铛切换）。
     notifications_open: bool,
     /// 命令面板（Cmd+K）；None 表示未打开。搜索/导航/确认由 ListState 负责。
@@ -701,6 +702,8 @@ struct Workspace {
     last_frame: Option<Instant>,
     /// 平滑后的帧率（EMA）。
     fps_ema: f32,
+    /// 退出确认拦截弹窗开关
+    show_quit_confirm: bool,
 }
 
 /// 宠物大脑配置的四个输入框（base_url / api_key / model / persona）。
@@ -767,7 +770,7 @@ impl Workspace {
             diff_gen: 0,
             diff_split: false,
             sidebar_open: true,
-            settings_open: false,
+            prev_view: MainView::Terminal,
             notifications_open: false,
             palette: None,
             _palette_sub: None,
@@ -791,6 +794,7 @@ impl Workspace {
             debug_hud: false,
             last_frame: None,
             fps_ema: 0.0,
+            show_quit_confirm: false,
         };
         // 立即写盘：把本次启动生成/沿用的会话 id 落到存档。否则首启（或旧存档迁移）
         // 生成的新 id 只在内存里，若用户不做任何布局操作就退出，重开会因无 id 而
@@ -1522,16 +1526,98 @@ impl Workspace {
         )
     }
 
-    /// 渲染外观设置浮层（标题栏齿轮打开）：背景色 / 背景图 / 不透明度 / 模糊。
-    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// 渲染无条件退出确认弹层：磨砂遮罩 + 确认退出/取消按钮。
+    fn render_quit_confirm(&self, cx: &mut Context<Self>) -> Div {
+        let (fg, muted, border, popover) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground, t.border, t.popover)
+        };
+        let c_blue_tint: Hsla = rgba(0x4a9eff24).into();
+        let c_blue_hover: Hsla = rgba(0x4a9eff40).into();
+        let c_neutral_bg: Hsla = rgba(0xffffff0a).into();
+        let c_neutral_hover: Hsla = rgba(0xffffff1f).into();
+
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x000000aa))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                v_flex()
+                    .w(px(320.))
+                    .p_5()
+                    .bg(popover)
+                    .border_1()
+                    .border_color(border)
+                    .rounded_lg()
+                    .shadow_lg()
+                    .gap_4()
+                    .child(
+                        div()
+                            .font_bold()
+                            .text_color(fg)
+                            .text_lg()
+                            .child("确定退出 Smelt 吗？")
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("退出工作台后，后台守护进程仍在运行，但当前活动的终端连接将被断开。")
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("cancel-quit")
+                                    .px_3()
+                                    .py(px(5.))
+                                    .rounded_lg()
+                                    .bg(c_neutral_bg)
+                                    .border_1()
+                                    .border_color(rgba(0xffffff12))
+                                    .text_sm()
+                                    .text_color(fg)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(c_neutral_hover))
+                                    .child("取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_quit_confirm = false;
+                                        cx.notify();
+                                    }))
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-quit")
+                                    .px_3()
+                                    .py(px(5.))
+                                    .rounded_lg()
+                                    .bg(c_blue_tint)
+                                    .border_1()
+                                    .border_color(rgba(0xffffff12))
+                                    .text_sm()
+                                    .text_color(rgb(0x8fc7ff))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(c_blue_hover))
+                                    .child("确定退出")
+                                    .on_click(|_, _, cx| cx.quit())
+                            )
+                    )
+            )
+    }
+
+    /// 渲染独立设置页面：铺满主区、居中限宽、支持滚动。
+    fn render_settings_page(&self, cx: &mut Context<Self>) -> Div {
         let (fg, muted, border, popover) = {
             let t = cx.theme();
             (t.foreground, t.muted_foreground, t.border, t.popover)
         };
         let ap = cx.global::<Appearance>().clone();
-        // 背景色 / 不透明度 / 宠物色改用 gpui-component 组件（ColorPicker / Slider），
-        // 组件实体在 init_llm_inputs 里懒创建，这里直接引用 self.* 渲染（旧的色板 / 档位
-        // chip 已删）。
 
         let blur_chip = Switch::new("blur").checked(ap.blur).label("毛玻璃").on_click(
             cx.listener(|this, checked: &bool, window, cx| {
@@ -1542,13 +1628,15 @@ impl Workspace {
 
         let pick_btn = div()
             .id("pick-img")
-            .px_2()
-            .py_1()
+            .px_3()
+            .py_1_5()
             .rounded_md()
             .cursor_pointer()
             .text_xs()
             .text_color(fg)
             .bg(popover)
+            .border_1()
+            .border_color(border)
             .hover(|s| s.bg(border))
             .child("选择图片…".to_string())
             .on_mouse_down(
@@ -1557,13 +1645,15 @@ impl Workspace {
             );
         let clear_btn = div()
             .id("clear-img")
-            .px_2()
-            .py_1()
+            .px_3()
+            .py_1_5()
             .rounded_md()
             .cursor_pointer()
             .text_xs()
             .text_color(muted)
             .bg(popover)
+            .border_1()
+            .border_color(border)
             .hover(|s| s.bg(border))
             .child("清除".to_string())
             .on_mouse_down(
@@ -1577,7 +1667,7 @@ impl Workspace {
             .unwrap_or("无")
             .to_string();
 
-        let section = |title: &str| div().text_xs().text_color(muted).child(title.to_string());
+        let section = |title: &str| div().text_xs().font_semibold().text_color(muted).child(title.to_string());
 
         // —— 桌面宠物设置 ——
         let pc = cx.global::<pet::PetConfig>().clone();
@@ -1593,10 +1683,7 @@ impl Workspace {
                 this.update_pet_config(move |cfg| cfg.notify = v, cx)
             }),
         );
-        // 宠物颜色预设。
-        // 宠物颜色改用 ColorPicker（self.pet_color_picker）。
-        // 宠物大小。
-        // 宠物大小：单选组（小 0.8 / 中 1.0 / 大 1.25）。
+
         const PET_SIZES: [f32; 3] = [0.8, 1.0, 1.25];
         let size_ix = PET_SIZES.iter().position(|v| (pc.scale - v).abs() < 0.01);
         let pet_size_group = RadioGroup::horizontal("pet-size")
@@ -1611,7 +1698,6 @@ impl Workspace {
                 Radio::new("sz-l").label("大"),
             ]);
 
-        // 宠物大脑（LLM）开关。key/model 暂存 ~/.smelt/llm.json（后续做面板内编辑）。
         let lc = cx.global::<agent::LlmConfig>().clone();
         let llm_chip = Switch::new("pet-brain").checked(lc.enabled).label("大脑").on_click(
             cx.listener(|this, c: &bool, _w, cx| {
@@ -1619,7 +1705,6 @@ impl Workspace {
                 this.update_llm_config(move |cfg| cfg.enabled = v, cx)
             }),
         );
-        // 大脑配置输入框（base_url / key / model / persona）；输入框已懒创建时才渲染。
         let llm_fields = self.llm_inputs.as_ref().map(|inp| {
             let field = |label: &str, state: &Entity<gpui_component::input::InputState>| {
                 div()
@@ -1632,103 +1717,108 @@ impl Workspace {
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
+                .gap_3()
                 .child(field("接口地址 base_url", &inp.base_url))
                 .child(field("API Key", &inp.api_key))
                 .child(field("模型 model", &inp.model))
                 .child(field("人设 persona", &inp.persona))
         });
 
-        // 点背景空白关闭；面板停在右上（齿轮下方）。
-        div()
-            .absolute()
-            .inset_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _w, cx| {
-                    this.settings_open = false;
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(40.))
-                    .right(px(8.))
-                    .w(px(280.))
-                    .bg(popover)
-                    .border_1()
-                    .border_color(border)
-                    .rounded_lg()
-                    .shadow_lg()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    // 点面板内部不冒泡到背景，避免误关。
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(div().font_bold().text_color(fg).child("外观"))
+        div().size_full().child(
+            div()
+                .id("settings-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .p_6()
+                .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(540.))
+                    .mx_auto()
+                    .gap_6()
+                    // 页面大标题与切回按钮
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(section("背景色"))
-                            .children(self.bg_color_picker.as_ref().map(|p| ColorPicker::new(p).small())),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(section("背景图片"))
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(border)
+                            .pb_3()
+                            .child(div().text_2xl().font_bold().text_color(fg).child("设置"))
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(pick_btn)
-                                    .child(clear_btn)
+                                    .id("back-from-settings")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .border_1()
+                                    .border_color(border)
+                                    .hover(|s| s.bg(popover).text_color(fg))
+                                    .child("返回")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.view = this.prev_view;
+                                        cx.notify();
+                                    }))
+                            )
+                    )
+                    // —— 外观设置部分 ——
+                    .child(
+                        v_flex()
+                            .gap_4()
+                            .child(div().text_lg().font_bold().text_color(fg).child("外观"))
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(section("背景色"))
+                                    .children(self.bg_color_picker.as_ref().map(|p| ColorPicker::new(p).small())),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(section("背景图片"))
                                     .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .child(img_name),
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(pick_btn)
+                                            .child(clear_btn)
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(img_name),
+                                            ),
                                     ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(section("不透明度"))
-                            .children(self.opacity_slider.as_ref().map(Slider::new)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(section("背景模糊"))
-                            .child(blur_chip),
-                    )
-                    // 桌面宠物：显示 / 播报开关 + 颜色 + 大小。
-                    .child(div().h(px(1.)).bg(border))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(div().font_bold().text_color(fg).child("桌面宠物"))
+                            )
                             .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
+                                v_flex()
+                                    .gap_1()
+                                    .child(section("不透明度"))
+                                    .children(self.opacity_slider.as_ref().map(Slider::new)),
+                            )
+                            .child(
+                                h_flex()
+                                    .justify_between()
                                     .items_center()
-                                    .flex_wrap()
+                                    .child(section("背景模糊"))
+                                    .child(blur_chip),
+                            )
+                    )
+                    .child(div().h(px(1.)).bg(border)) // 分割线
+                    // —— 桌面宠物设置部分 ——
+                    .child(
+                        v_flex()
+                            .gap_4()
+                            .child(div().text_lg().font_bold().text_color(fg).child("桌面宠物"))
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_center()
                                     .child(pet_show_chip)
                                     .child(pet_notify_chip)
                                     .child(llm_chip),
@@ -1737,28 +1827,24 @@ impl Workspace {
                                 div()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child("大脑：接 DeepSeek 等，点击/通知/空闲用 LLM 说话"),
+                                    .child("大脑：接入 OpenAI 兼容接口，点击或通知宠物时将调用 LLM 主动说话。"),
                             )
                             .children(llm_fields)
                             .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
+                                v_flex()
                                     .gap_1()
                                     .child(section("颜色"))
                                     .children(self.pet_color_picker.as_ref().map(|p| ColorPicker::new(p).small())),
                             )
                             .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
+                                v_flex()
                                     .gap_1()
                                     .child(section("大小"))
                                     .child(pet_size_group),
-                            ),
-                    ),
+                            )
+                    )
             )
-            .into_any_element()
+        )
     }
 
     /// 文件树：展开/收起一个文件夹。
@@ -2067,7 +2153,7 @@ impl Render for Workspace {
         let can_close = self.sessions.len() > 1;
 
         // 首次打开设置面板时懒创建宠物大脑配置的输入框（需要 window）。
-        if self.settings_open && self.llm_inputs.is_none() {
+        if self.view == MainView::Settings && self.llm_inputs.is_none() {
             self.init_llm_inputs(window, cx);
         }
 
@@ -2378,6 +2464,10 @@ impl Render for Workspace {
             .size_full()
             .bg(c_bg)
             .font_family(terminal_view::FONT_FAMILY)
+            .on_action(cx.listener(|this, _: &Quit, _window, cx| {
+                this.show_quit_confirm = true;
+                cx.notify();
+            }))
             // 从 Finder 拖文件/文件夹进窗口 → 当作项目开新标签（文件取其父目录）。
             .on_drop::<ExternalPaths>(cx.listener(|this, ep: &ExternalPaths, _window, cx| {
                 this.open_paths(ep.paths(), cx);
@@ -2490,7 +2580,12 @@ impl Render for Workspace {
                                             MouseButton::Left,
                                             cx.listener(|this, _, _w, cx| {
                                                 cx.stop_propagation();
-                                                this.settings_open = !this.settings_open;
+                                                if this.view == MainView::Settings {
+                                                    this.view = this.prev_view;
+                                                } else {
+                                                    this.prev_view = this.view;
+                                                    this.view = MainView::Settings;
+                                                }
                                                 cx.notify();
                                             }),
                                         ),
@@ -2521,7 +2616,7 @@ impl Render for Workspace {
                     .flex()
                     .flex_col()
                     // 会话视图 tab（终端/文件树/Git）——总览是全局视图，走侧栏入口，不在这排里。
-                    .children((self.view != MainView::Overview).then(|| {
+                    .children((self.view != MainView::Overview && self.view != MainView::Settings).then(|| {
                         TabBar::new("main-view-tabs")
                             .underline()
                             // 左缩进 12px，与终端/文件内容左边基线对齐（不贴边）；
@@ -2586,14 +2681,15 @@ impl Render for Workspace {
                                 cx,
                             )
                         }
+                        MainView::Settings => self.render_settings_page(cx),
                     }),
                     )),
                 ),
             )
             // 命令面板（最上层）
             .children(palette_overlay)
-            // 外观设置浮层
-            .children(self.settings_open.then(|| self.render_settings(cx)))
+            // 退出确认拦截弹层
+            .children(self.show_quit_confirm.then(|| self.render_quit_confirm(cx)))
             // 通知面板浮层
             .children(self.notifications_open.then(|| self.render_notifications(cx)))
             // 调试 HUD：右上角帧率 + 帧耗时（Cmd+Shift+F 切换）
@@ -3519,7 +3615,6 @@ fn main() {
         Theme::change(ThemeMode::Dark, None, cx);
 
         // 应用菜单栏 + Cmd+Q 退出：macOS 顶部「Smelt」菜单，含「退出 Smelt ⌘Q」。
-        cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus(vec![
             Menu::new("Smelt").items([MenuItem::action("退出 Smelt", Quit)]),
