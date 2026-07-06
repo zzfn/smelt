@@ -426,12 +426,22 @@ struct SessionState {
     active: usize,
 }
 
-/// 可序列化的分屏布局镜像：叶子存该终端 cwd，Split 存方向 + 子节点。
+/// 可序列化的分屏布局镜像：叶子存该终端 cwd + 守护会话 id，Split 存方向 + 子节点。
 /// 拖动比例暂不持久化，重开按均分；结构 / 嵌套 / 方向完整恢复。
+/// id 用于重开 GUI 时 reattach smeltd 里还活着的会话（旧存档无 id → 开新会话）。
 #[derive(serde::Serialize, serde::Deserialize)]
 enum PaneState {
-    Leaf { cwd: Option<String> },
+    Leaf {
+        cwd: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+    },
     Split { axis: SplitAxis, children: Vec<PaneState> },
+}
+
+/// 新会话 id（uuid v4）：GUI 与 smeltd 之间的持久身份。
+fn new_sid() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Split 方向的可序列化镜像（gpui::Axis 无法直接序列化）。
@@ -463,7 +473,10 @@ impl From<SplitAxis> for Axis {
 /// 把渲染用的布局树导出成可序列化镜像（叶子读取各终端当前 cwd）。
 fn pane_to_state(pane: &Pane, cx: &App) -> PaneState {
     match pane {
-        Pane::Leaf(t) => PaneState::Leaf { cwd: t.read(cx).cwd() },
+        Pane::Leaf(t) => PaneState::Leaf {
+            cwd: t.read(cx).cwd(),
+            id: Some(t.read(cx).session_id().to_string()),
+        },
         Pane::Split { axis, children, .. } => PaneState::Split {
             axis: (*axis).into(),
             children: children.iter().map(|c| pane_to_state(c, cx)).collect(),
@@ -479,8 +492,10 @@ fn rebuild_pane(
     cx: &mut Context<Workspace>,
 ) -> Pane {
     match ps {
-        PaneState::Leaf { cwd } => {
-            let v = cx.new(|cx| TerminalView::new(cx, cwd.clone()));
+        PaneState::Leaf { cwd, id } => {
+            // 有存档 id → reattach 守护里还活着的会话；旧存档无 id → 开新会话。
+            let sid = id.clone().unwrap_or_else(new_sid);
+            let v = cx.new(|cx| TerminalView::new(cx, cwd.clone(), sid));
             tabs.push(v.clone());
             Pane::Leaf(v)
         }
@@ -658,7 +673,7 @@ impl Workspace {
             } else {
                 // 更旧格式：cwd 列表 → 每个 cwd 一个独立会话。
                 for cwd in s.tabs.clone() {
-                    let v = cx.new(|cx| TerminalView::new(cx, cwd));
+                    let v = cx.new(|cx| TerminalView::new(cx, cwd, new_sid()));
                     sessions.push(Session::single(v));
                 }
                 active_session = s.active;
@@ -673,7 +688,7 @@ impl Workspace {
             this.save_state(cx);
         });
 
-        Self {
+        let ws = Self {
             sessions,
             active_session,
             view: MainView::Terminal,
@@ -697,7 +712,12 @@ impl Workspace {
             git_cache: HashMap::new(),
             llm_inputs: None,
             llm_subs: Vec::new(),
-        }
+        };
+        // 立即写盘：把本次启动生成/沿用的会话 id 落到存档。否则首启（或旧存档迁移）
+        // 生成的新 id 只在内存里，若用户不做任何布局操作就退出，重开会因无 id 而
+        // 新开 shell，守护里旧会话成孤儿 —— reattach 全靠这一步。
+        ws.save_state(cx);
+        ws
     }
 
     /// 懒创建宠物大脑配置的输入框（需要 window，故在首次渲染设置面板时调）。
@@ -804,7 +824,7 @@ impl Workspace {
 
     /// 「+」/新建：开一个独立新会话（单终端），并切过去。
     fn add_session(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| TerminalView::new(cx, cwd));
+        let view = cx.new(|cx| TerminalView::new(cx, cwd, new_sid()));
         self.sessions.push(Session::single(view));
         self.active_session = self.sessions.len() - 1;
         self.save_state(cx);
@@ -816,7 +836,7 @@ impl Workspace {
         let Some(sess) = self.cur() else { return };
         let cwd = sess.active.read(cx).cwd().or_else(current_dir);
         let old = sess.active.entity_id();
-        let view = cx.new(|cx| TerminalView::new(cx, cwd));
+        let view = cx.new(|cx| TerminalView::new(cx, cwd, new_sid()));
         let state = cx.new(|_| ResizableState::default());
         let sess = &mut self.sessions[self.active_session];
         split_leaf(&mut sess.layout, old, axis, state, view.clone());
@@ -892,10 +912,16 @@ impl Workspace {
         }
     }
 
-    /// 关闭第 ix 个会话（至少保留一个）。
+    /// 关闭第 ix 个会话（至少保留一个）。用户主动关 → 让守护杀掉这些 shell
+    /// （区别于退出 GUI：那时不杀，会话在 smeltd 里持久活着）。
     fn close_session(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.sessions.len() <= 1 || ix >= self.sessions.len() {
             return;
+        }
+        let mut leaves = Vec::new();
+        collect_leaves(&self.sessions[ix].layout, &mut leaves);
+        for t in &leaves {
+            terminal::kill_remote(t.read(cx).session_id());
         }
         self.sessions.remove(ix);
         if self.active_session >= self.sessions.len() {
@@ -912,6 +938,8 @@ impl Workspace {
         let Some(sess) = self.cur() else { return };
         if sess.pane_count() > 1 {
             let target = sess.active.entity_id();
+            // 用户主动关 pane → 守护真正杀掉该 shell。
+            terminal::kill_remote(&sess.active.read(cx).session_id().to_string());
             let sess = &mut self.sessions[self.active_session];
             remove_leaf(&mut sess.layout, target);
             let mut leaves = Vec::new();
@@ -1188,6 +1216,8 @@ impl Workspace {
             .items_center()
             .gap_2()
             .child(div().text_xl().font_bold().text_color(fg).mr_2().child("总览"))
+            // 版本号：编译期取 Cargo.toml 的 version。
+            .child(div().text_sm().text_color(muted).mr_2().child(concat!("v", env!("CARGO_PKG_VERSION"))))
             .child(pill(format!("{} 会话", self.sessions.len()), fg, soft_bg))
             .child(pill(format!("{need} 需要处理"), c_red, red_tint))
             .child(pill(format!("{running} 运行中"), c_blue, blue_tint));

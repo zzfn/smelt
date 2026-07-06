@@ -68,6 +68,8 @@ pub struct TerminalView {
     running_frames: u32,
     /// 是否已就「卡住」提醒过（同一段运行只提醒一次）。
     stuck_notified: bool,
+    /// 守护里的会话 id（持久化到 workspace.json；重开 GUI 按它 reattach）。
+    session_id: String,
 }
 
 /// 标题是否以 braille spinner（U+2801–U+28FF）开头 —— 与 Session::status 的 Running 判定一致。
@@ -82,8 +84,9 @@ fn title_is_running(title: Option<String>) -> bool {
 const STUCK_FRAMES: u32 = 8 * 60 * 1000 / 30;
 
 impl TerminalView {
-    pub fn new(cx: &mut Context<Self>, cwd: Option<String>) -> Self {
-        let terminal = Terminal::spawn(24, 80, cwd.as_deref()).expect("启动内嵌终端失败");
+    pub fn new(cx: &mut Context<Self>, cwd: Option<String>, session_id: String) -> Self {
+        let terminal =
+            Terminal::spawn(24, 80, cwd.as_deref(), &session_id).expect("启动内嵌终端失败");
 
         // 定时重绘：后台读线程更新 Term 网格，这里每 30ms 通知 UI 刷新。
         // 顺便检查响铃：非活动会话也在跑此循环，故能在后台标记「需要注意」。
@@ -160,7 +163,13 @@ impl TerminalView {
             was_running: false,
             running_frames: 0,
             stuck_notified: false,
+            session_id,
         }
+    }
+
+    /// 守护里的会话 id（关 pane 时用它让守护真正杀掉 shell）。
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// 最近通知时刻（总览页「N 分钟前」用）。
@@ -219,13 +228,59 @@ impl TerminalView {
     }
 
     /// 窗口像素坐标 → 网格单元 (行, 列)。
-    fn pos_to_cell(&self, pos: Point<Pixels>) -> (usize, usize) {
+    /// 列号不能用均匀格宽 x/cell_w：中文等全角字符走系统回退字体（PingFang），
+    /// 实际字宽 ≠ 2×cell_w，行内中文越多偏差越大 → 框选高亮落后鼠标一大截。
+    /// 改为把该行文本按渲染同款方式整形，用 x 反查字符位置再映射回网格列。
+    fn pos_to_cell(&self, pos: Point<Pixels>, window: &mut Window) -> (usize, usize) {
         let (ox, oy) = self.grid_origin.get();
         let x = (f32::from(pos.x) - ox).max(0.0);
         let y = (f32::from(pos.y) - oy).max(0.0);
-        let col = (x / self.cell_w.max(1.0)).floor() as usize;
         let row = (y / LINE_PX).floor() as usize;
-        (row, col)
+        (row, self.col_for_x(row, x, window))
+    }
+
+    /// 视觉 x 偏移（相对网格原点）→ 该行的网格列。
+    fn col_for_x(&self, row_ix: usize, x: f32, window: &mut Window) -> usize {
+        let uniform = || (x / self.cell_w.max(1.0)).floor() as usize;
+        let frame = self.terminal.snapshot();
+        let Some(cells) = frame.rows.get(row_ix) else {
+            return uniform();
+        };
+        // 与 render_row 同规则构造行文本（'\0' 占位跳过），记录 字节偏移 → 网格列。
+        let mut line = String::new();
+        let mut byte_to_col: Vec<(usize, usize)> = Vec::new();
+        for (col, cell) in cells.iter().enumerate() {
+            if cell.ch != '\0' {
+                byte_to_col.push((line.len(), col));
+                line.push(cell.ch);
+            }
+        }
+        if line.is_empty() {
+            return uniform();
+        }
+        let run = TextRun {
+            len: line.len(),
+            font: font(FONT_FAMILY),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let layout = window.text_system().layout_line(&line, px(FONT_PX), &[run], None);
+        match layout.index_for_x(px(x)) {
+            // x 落在某个字形内 → 反查其字节偏移对应的网格列。
+            Some(ix) => match byte_to_col.binary_search_by_key(&ix, |&(b, _)| b) {
+                Ok(i) => byte_to_col[i].1,
+                Err(0) => 0,
+                Err(i) => byte_to_col[i - 1].1,
+            },
+            // 超出行尾 → 从最后一列起按均匀格宽外推（拖过行尾继续选）。
+            None => {
+                let last_col = byte_to_col.last().map_or(0, |&(_, c)| c);
+                let overflow = (x - f32::from(layout.width)).max(0.0);
+                last_col + 1 + (overflow / self.cell_w.max(1.0)).floor() as usize
+            }
+        }
     }
 
     /// 提取当前选区文本（用于复制）。按 (行,列) 字典序规范化。

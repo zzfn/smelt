@@ -1,18 +1,20 @@
-//! 内嵌终端后端：portable-pty 起 shell 子进程 + alacritty_terminal 做终端状态机。
+//! 内嵌终端前端：连接 smeltd 守护进程拿字节流 + alacritty_terminal 做终端状态机。
 //!
-//! 数据流：后台线程读 PTY 输出 → vte 解析器 advance → 更新共享的 Term 网格；
-//! UI 线程定时对网格做快照并重绘（见 main.rs 的定时 spawn）。
+//! PTY 与 shell 活在 smeltd 里（GUI 退出不杀会话，重开按 id 重连并重放恢复画面，
+//! 类 tmux；协议见 src/bin/smeltd.rs 头注释）。数据流：后台线程读守护 socket →
+//! vte 解析器 advance → 更新共享的 Term 网格；UI 线程定时对网格做快照并重绘。
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 /// 默认前景 / 背景色（与窗口底色一致，Tokyo Night 风格）。
 const DEFAULT_FG: u32 = 0x00c0_caf5;
@@ -229,11 +231,64 @@ impl OscScan {
     }
 }
 
-/// 一个内嵌终端：alacritty 的 Term（后台线程写、UI 线程读）+ PTY 写端。
+// ===================== smeltd 守护连接层 =====================
+
+fn sock_path() -> std::path::PathBuf {
+    let dir = dirs::home_dir().unwrap_or_else(|| "/tmp".into()).join(".smelt");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("smeltd.sock")
+}
+
+/// 连接守护；连不上就拉起同目录的 smeltd（独立进程组，GUI / 终端退出都不波及）再重试。
+fn connect_daemon() -> std::io::Result<UnixStream> {
+    let path = sock_path();
+    if let Ok(s) = UnixStream::connect(&path) {
+        return Ok(s);
+    }
+    let exe = std::env::current_exe()?;
+    let daemon = exe.with_file_name("smeltd");
+    {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let _ = std::process::Command::new(&daemon)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    // 守护 bind 很快，通常首轮就连上；给足 5s 兜底。
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(100));
+        if let Ok(s) = UnixStream::connect(&path) {
+            return Ok(s);
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "smeltd 未就绪"))
+}
+
+/// 让守护杀掉某会话（用户主动关 pane 时调用；GUI 退出不调 → 会话持久活着）。
+pub fn kill_remote(id: &str) {
+    let Ok(mut s) = UnixStream::connect(sock_path()) else { return };
+    let _ = writeln!(s, "{}", serde_json::json!({ "op": "kill", "id": id }));
+    // 等守护回执，确保 kill 落地后再继续（避免关 pane 后立刻退出时丢命令）。
+    let mut resp = String::new();
+    let _ = BufReader::new(s).read_line(&mut resp);
+}
+
+/// 客户端 → 守护的帧：[type:u8][len:u32 BE][payload]。type 0=输入，1=resize。
+fn write_frame(w: &mut UnixStream, ty: u8, payload: &[u8]) {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(ty);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    let _ = w.write_all(&frame);
+}
+
+/// 一个内嵌终端：alacritty 的 Term（后台线程写、UI 线程读）+ 守护连接写端。
 pub struct Terminal {
     term: Arc<Mutex<Term<EventProxy>>>,
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
+    writer: UnixStream,
     size: TermSize,
     /// 通知消息槽（响铃 / OSC 9 写入，UI 轮询 take_notification 取走）。
     notify: NotifySlot,
@@ -242,42 +297,19 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// 起一个 shell（$SHELL，默认 /bin/zsh），工作目录 cwd，网格尺寸 rows×cols。
-    pub fn spawn(rows: usize, cols: usize, cwd: Option<&str>) -> anyhow::Result<Self> {
+    /// 打开（或重连）守护里 id 对应的会话：shell 环境由 smeltd 负责（-l / TERM /
+    /// iTerm2 伪装 / LANG 兜底，见 smeltd.rs）。id 已存在 → attach，守护先重放输出
+    /// 缓冲恢复画面，再实时转发。
+    pub fn spawn(rows: usize, cols: usize, cwd: Option<&str>, id: &str) -> anyhow::Result<Self> {
         let size = TermSize { rows, cols };
 
-        // 1) 开 PTY 并起 shell 子进程
-        let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let mut cmd = CommandBuilder::new(shell);
-        // login shell（-l）：读 ~/.zprofile 拿到完整 PATH。打包成 .app 双击启动时
-        // 系统给的 PATH 很精简，不走 login 就找不到 homebrew 里的命令（如 starship）。
-        cmd.arg("-l");
-        if let Some(dir) = cwd {
-            cmd.cwd(dir);
-        }
-        cmd.env("TERM", "xterm-256color");
-        // 伪装成 iTerm2：Claude Code 的 auto 通知渠道靠 TERM_PROGRAM 识别终端，认出
-        // iTerm2 就自动发 OSC 9 通知（我们已支持捕获）→ 用户零配置即可收到「agent 需要
-        // 注意」。选 iTerm2 而非 Ghostty/Kitty：它不用 kitty 键盘协议（CSI u），不干扰
-        // 按键输入，副作用最小。TERM 仍保持 xterm-256color，不启用 iTerm 私有 terminfo。
-        cmd.env("TERM_PROGRAM", "iTerm.app");
-        cmd.env("TERM_PROGRAM_VERSION", "3.5.0");
-        // UTF-8 locale（对齐 Zed terminal 的做法）：双击 .app 启动时系统环境极简、
-        // 没有 LANG，zsh 会落到 C/POSIX locale，把 starship 输出的多字节 UTF-8 续字节
-        // 当成一个个 C1 控制符转义成 <009a> 之类，满屏乱码。父环境没设 LANG 才补
-        // en_US.UTF-8（尊重用户已设的 locale），保证 .app 双击也能正常显示中文/图标。
-        if std::env::var("LANG").is_err() {
-            cmd.env("LANG", "en_US.UTF-8");
-        }
-        let _child = pair.slave.spawn_command(cmd)?;
+        // 1) 连守护（不在则自动拉起）并声明要打开的会话
+        let mut writer = connect_daemon()?;
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({ "op": "open", "id": id, "cwd": cwd, "cols": cols, "rows": rows })
+        )?;
 
         // 2) alacritty 终端状态机（EventProxy 把响铃 / 标题写入共享槽）
         let notify: NotifySlot = Arc::new(Mutex::new(None));
@@ -289,8 +321,9 @@ impl Terminal {
         );
         let term = Arc::new(Mutex::new(term));
 
-        // 3) 后台读线程：PTY 输出 → vte 解析更新 Term 网格 + 自己扫 OSC 9/777 通知
-        let mut reader = pair.master.try_clone_reader()?;
+        // 3) 后台读线程：守护转发的 PTY 字节 → vte 解析更新 Term 网格 + 扫 OSC 9/777。
+        //    EOF = shell 退出或守护离线（网格冻结，重开会话即恢复）。
+        let mut reader = writer.try_clone()?;
         let term_reader = Arc::clone(&term);
         let notify_reader = notify.clone();
         thread::spawn(move || {
@@ -315,13 +348,9 @@ impl Terminal {
             }
         });
 
-        let writer = pair.master.take_writer()?;
-        let master = pair.master; // 保留 master 用于 resize
-
         Ok(Self {
             term,
             writer,
-            master,
             size,
             notify,
             title,
@@ -338,7 +367,7 @@ impl Terminal {
         self.title.lock().ok().and_then(|g| g.clone())
     }
 
-    /// 按新行列 resize：同步 alacritty 网格与底层 PTY。无变化则跳过。
+    /// 按新行列 resize：同步 alacritty 网格，并发帧让守护 resize 底层 PTY。无变化则跳过。
     pub fn resize(&mut self, rows: usize, cols: usize) {
         if rows == self.size.rows && cols == self.size.cols {
             return;
@@ -350,18 +379,15 @@ impl Terminal {
         if let Ok(mut term) = self.term.lock() {
             term.resize(self.size);
         }
-        let _ = self.master.resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&(cols as u32).to_be_bytes());
+        payload[4..8].copy_from_slice(&(rows as u32).to_be_bytes());
+        write_frame(&mut self.writer, 1, &payload);
     }
 
-    /// 向 shell 写入字节（键盘输入用）。
+    /// 向 shell 写入字节（键盘输入用）：帧转发给守护。
     pub fn send_input(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        write_frame(&mut self.writer, 0, bytes);
     }
 
     /// 快照当前可视网格 + 光标。用 renderable_content：尊重滚动偏移、带光标，
