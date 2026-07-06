@@ -198,6 +198,13 @@ impl Session {
         collect_leaves(&self.layout, &mut v);
         v.len()
     }
+
+    /// 会话内是否有 pane「需要注意」（某个 agent 响了铃）。
+    fn has_attention(&self, cx: &App) -> bool {
+        let mut v = Vec::new();
+        collect_leaves(&self.layout, &mut v);
+        v.iter().any(|t| t.read(cx).has_attention())
+    }
 }
 
 /// 收集布局树里所有叶子终端（clone 句柄，顺序 = 深度优先遍历序）。
@@ -495,6 +502,8 @@ struct Workspace {
     sidebar_open: bool,
     /// 外观设置面板是否打开（标题栏齿轮切换）。
     settings_open: bool,
+    /// 通知面板是否打开（标题栏铃铛切换）。
+    notifications_open: bool,
     /// 命令面板（Cmd+K）；None 表示未打开。搜索/导航/确认由 ListState 负责。
     palette: Option<Entity<ListState<CmdDelegate>>>,
     /// 命令面板的事件订阅（确认/取消）；随面板关闭一并释放。
@@ -567,6 +576,7 @@ impl Workspace {
             diff_split: false,
             sidebar_open: true,
             settings_open: false,
+            notifications_open: false,
             palette: None,
             _palette_sub: None,
             git_files_scroll: ScrollHandle::new(),
@@ -719,6 +729,8 @@ impl Workspace {
         if let Some(sess) = self.sessions.get_mut(self.active_session) {
             sess.active = e.clone();
         }
+        // 用户聚焦了它 → 清除「需要注意」。
+        e.update(cx, |t, _| t.clear_attention());
         let h = e.read(cx).focus_handle();
         window.focus(&h, cx);
         self.save_state(cx);
@@ -737,6 +749,10 @@ impl Workspace {
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.sessions.len() {
             self.active_session = ix;
+            // 切到的会话的活动 pane 已被查看 → 清除它的「需要注意」。
+            if let Some(sess) = self.sessions.get(ix) {
+                sess.active.update(cx, |t, _| t.clear_attention());
+            }
             self.focus_active(window, cx);
             self.save_state(cx);
             cx.notify();
@@ -800,6 +816,120 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// 收集所有待处理通知：(会话索引, pane 终端, 消息文本)。
+    /// 排除「正在看的那个活动 pane」——用户已在看，不算待处理。
+    fn collect_notifications(&self, cx: &App) -> Vec<(usize, Entity<TerminalView>, String)> {
+        let mut out = Vec::new();
+        for (si, s) in self.sessions.iter().enumerate() {
+            let viewing = (si == self.active_session).then(|| s.active.entity_id());
+            let mut leaves = Vec::new();
+            collect_leaves(&s.layout, &mut leaves);
+            for t in leaves {
+                if Some(t.entity_id()) == viewing {
+                    continue;
+                }
+                if let Some(msg) = t.read(cx).notification() {
+                    out.push((si, t.clone(), msg.to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// 跳到某条通知：切到该会话 + 聚焦该 pane（顺带清除通知）+ 关面板。
+    fn goto_notification(
+        &mut self,
+        session_ix: usize,
+        pane: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate(session_ix, window, cx);
+        self.activate_pane(pane, window, cx);
+        self.notifications_open = false;
+        cx.notify();
+    }
+
+    /// 渲染通知面板浮层（标题栏铃铛打开）：列出所有待处理会话 + 消息，点击跳转。
+    fn render_notifications(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (fg, muted, border, popover) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground, t.border, t.popover)
+        };
+        let items = self.collect_notifications(cx);
+
+        let list: Vec<_> = items
+            .into_iter()
+            .map(|(si, pane, msg)| {
+                let name = self.sessions.get(si).map(|s| s.title(cx)).unwrap_or_default();
+                div()
+                    .id(("notif", pane.entity_id()))
+                    .p_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(border))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size_2().rounded_full().bg(rgb(0x4a9eff)))
+                            .child(div().text_sm().text_color(fg).child(name)),
+                    )
+                    .child(div().text_xs().text_color(muted).child(msg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, window, cx| {
+                            this.goto_notification(si, &pane, window, cx)
+                        }),
+                    )
+            })
+            .collect();
+
+        let empty = list.is_empty();
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _w, cx| {
+                    this.notifications_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(40.))
+                    .right(px(44.))
+                    .w(px(300.))
+                    .bg(popover)
+                    .border_1()
+                    .border_color(border)
+                    .rounded_lg()
+                    .shadow_lg()
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().px_2().py_1().font_bold().text_color(fg).child("通知"))
+                    .children(empty.then(|| {
+                        div()
+                            .px_2()
+                            .py_2()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("没有待处理通知")
+                    }))
+                    .children(list),
+            )
+            .into_any_element()
     }
 
     /// 渲染外观设置浮层（标题栏齿轮打开）：背景色 / 背景图 / 不透明度 / 模糊。
@@ -1150,14 +1280,20 @@ impl Workspace {
                 let active = self
                     .cur()
                     .is_some_and(|s| s.active.entity_id() == t.entity_id());
-                // 叠加层（absolute，不占布局、不挡点击）区分活动 / 非活动：
-                // 活动 pane 用 ring 色描一圈；非活动 pane 整块压暗拉开对比。
+                // 叠加层（absolute，不占布局、不挡点击）区分状态：
+                // 活动 pane 用 ring 色描边；响铃待处理的非活动 pane 描蓝环；其余压暗。
                 let overlay = if active {
                     div()
                         .absolute()
                         .inset_0()
                         .border_2()
                         .border_color(cx.theme().ring)
+                } else if t.read(cx).has_attention() {
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .border_2()
+                        .border_color(rgb(0x4a9eff))
                 } else {
                     div().absolute().inset_0().bg(hsla(0., 0., 0., 0.28))
                 };
@@ -1215,6 +1351,10 @@ impl Render for Workspace {
             .enumerate()
             .map(|(ix, s)| (ix, s.title(cx)))
             .collect();
+        // 各会话是否「需要注意」（预算好，避免在侧栏 map 闭包里借用 cx）。
+        let attentions: Vec<bool> = self.sessions.iter().map(|s| s.has_attention(cx)).collect();
+        // 待处理通知总数（标题栏铃铛用）。
+        let notif_count = self.collect_notifications(cx).len();
         // 当前活动会话的标题：放到标题栏右侧作为上下文提示。
         let active_title = titles
             .iter()
@@ -1250,6 +1390,9 @@ impl Render for Workspace {
                     .iter()
                     .map(|&ix| {
                         let title = titles.get(ix).map(|(_, t)| t.clone()).unwrap_or_default();
+                        // 只在「非活动」会话上亮点：正在看的那个不提醒（但通知仍留着）。
+                        let attention =
+                            attentions.get(ix).copied().unwrap_or(false) && ix != active;
                         let e_act = this.clone();
                         let mut item = SidebarMenuItem::new(title)
                             .icon(IconName::SquareTerminal)
@@ -1257,19 +1400,29 @@ impl Render for Workspace {
                             .on_click(move |_ev, window, cx| {
                                 e_act.update(cx, |ws, cx| ws.activate(ix, window, cx));
                             });
-                        if can_close {
+                        // suffix：「需要注意」蓝点 + 关闭按钮（有其一就挂）。
+                        if attention || can_close {
                             let e_close = this.clone();
                             item = item.suffix(move |_w, _cx| {
                                 let e = e_close.clone();
-                                Button::new(("close-session", ix))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::CircleX)
-                                    .on_click(move |_ev, _w, cx| {
-                                        // 别把点击冒泡成「切换到该会话」
-                                        cx.stop_propagation();
-                                        e.update(cx, |ws, cx| ws.close_session(ix, cx));
-                                    })
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    // agent 响铃 → 蓝点
+                                    .children(attention.then(|| {
+                                        div().size_2().rounded_full().bg(rgb(0x4a9eff))
+                                    }))
+                                    .children(can_close.then(|| {
+                                        Button::new(("close-session", ix))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::CircleX)
+                                            .on_click(move |_ev, _w, cx| {
+                                                // 别把点击冒泡成「切换到该会话」
+                                                cx.stop_propagation();
+                                                e.update(cx, |ws, cx| ws.close_session(ix, cx));
+                                            })
+                                    }))
                             });
                         }
                         item
@@ -1444,26 +1597,57 @@ impl Render for Workspace {
                                 .child(div().font_bold().child("smelt"))
                                 .child(div().text_color(c_muted).child(active_title)),
                         )
-                        // 右侧齿轮：打开外观设置面板。stop_propagation 避免触发标题栏拖拽。
+                        // 右侧：铃铛（通知面板）+ 齿轮（外观设置）。stop_propagation 避免触发拖拽。
                         .child(
-                            div()
-                                .id("settings-gear")
-                                .flex()
+                            h_flex()
                                 .items_center()
-                                .justify_center()
-                                .size_6()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .text_color(c_muted)
-                                .hover(|s| s.bg(c_border))
-                                .child(Icon::new(IconName::Settings))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _w, cx| {
-                                        cx.stop_propagation();
-                                        this.settings_open = !this.settings_open;
-                                        cx.notify();
-                                    }),
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id("notif-bell")
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size_6()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        // 有待处理通知 → 铃铛变蓝
+                                        .text_color(if notif_count > 0 {
+                                            rgb(0x4a9eff).into()
+                                        } else {
+                                            c_muted
+                                        })
+                                        .hover(|s| s.bg(c_border))
+                                        .child(Icon::new(IconName::Bell))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _w, cx| {
+                                                cx.stop_propagation();
+                                                this.notifications_open = !this.notifications_open;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-gear")
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size_6()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_color(c_muted)
+                                        .hover(|s| s.bg(c_border))
+                                        .child(Icon::new(IconName::Settings))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _w, cx| {
+                                                cx.stop_propagation();
+                                                this.settings_open = !this.settings_open;
+                                                cx.notify();
+                                            }),
+                                        ),
                                 ),
                         ),
                 ),
@@ -1553,6 +1737,8 @@ impl Render for Workspace {
             .children(palette_overlay)
             // 外观设置浮层
             .children(self.settings_open.then(|| self.render_settings(cx)))
+            // 通知面板浮层
+            .children(self.notifications_open.then(|| self.render_notifications(cx)))
     }
 }
 

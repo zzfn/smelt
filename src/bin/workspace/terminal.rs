@@ -141,12 +141,82 @@ impl Dimensions for TermSize {
     }
 }
 
-/// 事件代理：alacritty 需要一个 EventListener；这里先忽略事件（重绘走 UI 定时快照）。
+/// 通知消息的共享槽：EventProxy（响铃 Bell）与 reader 线程（OSC 9/777）都往这写，
+/// UI 侧轮询 take_notification 取走，用作「agent 需要注意」提示。
+type NotifySlot = Arc<Mutex<Option<String>>>;
+
+/// 事件代理：alacritty 的 EventListener。终端响铃 Event::Bell → 写入一条默认通知；
+/// 其余事件暂忽略（重绘走 UI 定时快照）。
 #[derive(Clone)]
-struct EventProxy;
+struct EventProxy {
+    notify: NotifySlot,
+}
 
 impl EventListener for EventProxy {
-    fn send_event(&self, _event: Event) {}
+    fn send_event(&self, event: Event) {
+        if matches!(event, Event::Bell) {
+            if let Ok(mut g) = self.notify.lock() {
+                *g = Some("🔔 响铃".to_string());
+            }
+        }
+    }
+}
+
+/// OSC 9 / 777 通知扫描：alacritty 不解析这两个序列，我们在 reader 线程自己扫字节流
+/// 提取 `ESC ] 9 ; 消息 (BEL|ST)`（跟 cmux 同协议），跨 read 边界保持状态。
+#[derive(Default)]
+struct OscScan {
+    prev_esc: bool,
+    in_osc: bool,
+    buf: Vec<u8>,
+}
+
+impl OscScan {
+    fn feed(&mut self, b: u8, notify: &Mutex<Option<String>>) {
+        if self.in_osc {
+            if b == 0x07 {
+                self.finish(notify); // BEL 结束
+            } else if self.prev_esc && b == 0x5c {
+                self.buf.pop(); // 去掉刚推入的 ESC，ST（ESC \）结束
+                self.finish(notify);
+            } else {
+                self.buf.push(b);
+                self.prev_esc = b == 0x1b;
+                if self.buf.len() > 4096 {
+                    self.reset(); // 异常超长，丢弃
+                }
+            }
+        } else if self.prev_esc && b == 0x5d {
+            self.in_osc = true; // ESC ] 进入 OSC
+            self.buf.clear();
+            self.prev_esc = false;
+        } else {
+            self.prev_esc = b == 0x1b;
+        }
+    }
+
+    fn finish(&mut self, notify: &Mutex<Option<String>>) {
+        if let Ok(s) = std::str::from_utf8(&self.buf) {
+            if let Some((ps, pt)) = s.split_once(';') {
+                if ps == "9" || ps == "777" {
+                    // OSC 777 常见格式 `777;notify;title;body`，取最后一段作正文。
+                    let msg = pt.rsplit(';').next().unwrap_or(pt).trim().to_string();
+                    if !msg.is_empty() {
+                        if let Ok(mut g) = notify.lock() {
+                            *g = Some(msg);
+                        }
+                    }
+                }
+            }
+        }
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.in_osc = false;
+        self.prev_esc = false;
+        self.buf.clear();
+    }
 }
 
 /// 一个内嵌终端：alacritty 的 Term（后台线程写、UI 线程读）+ PTY 写端。
@@ -155,6 +225,8 @@ pub struct Terminal {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     size: TermSize,
+    /// 通知消息槽（响铃 / OSC 9 写入，UI 轮询 take_notification 取走）。
+    notify: NotifySlot,
 }
 
 impl Terminal {
@@ -189,21 +261,28 @@ impl Terminal {
         }
         let _child = pair.slave.spawn_command(cmd)?;
 
-        // 2) alacritty 终端状态机
-        let term = Term::new(Config::default(), &size, EventProxy);
+        // 2) alacritty 终端状态机（EventProxy 把响铃写入通知槽）
+        let notify: NotifySlot = Arc::new(Mutex::new(None));
+        let term = Term::new(Config::default(), &size, EventProxy { notify: notify.clone() });
         let term = Arc::new(Mutex::new(term));
 
-        // 3) 后台读线程：PTY 输出 → vte 解析 → 更新 Term 网格
+        // 3) 后台读线程：PTY 输出 → vte 解析更新 Term 网格 + 自己扫 OSC 9/777 通知
         let mut reader = pair.master.try_clone_reader()?;
         let term_reader = Arc::clone(&term);
+        let notify_reader = notify.clone();
         thread::spawn(move || {
             // Processor<T = StdSyncHandler>：默认类型参数不参与 ::new() 推断，需显式标注。
             let mut parser: Processor = Processor::new();
+            let mut osc = OscScan::default();
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF：shell 退出
                     Ok(n) => {
+                        // OSC 9/777 通知：alacritty 不解析，自己扫字节提取
+                        for &b in &buf[..n] {
+                            osc.feed(b, &notify_reader);
+                        }
                         if let Ok(mut term) = term_reader.lock() {
                             parser.advance(&mut *term, &buf[..n]);
                         }
@@ -221,7 +300,13 @@ impl Terminal {
             writer,
             master,
             size,
+            notify,
         })
+    }
+
+    /// 取走最新通知消息（读并清）：响铃或 OSC 9/777 上报的「需要注意」文本。
+    pub fn take_notification(&self) -> Option<String> {
+        self.notify.lock().ok().and_then(|mut g| g.take())
     }
 
     /// 按新行列 resize：同步 alacritty 网格与底层 PTY。无变化则跳过。

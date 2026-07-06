@@ -57,6 +57,9 @@ pub struct TerminalView {
     hover_url: Option<(usize, usize, usize)>,
     /// 最近一帧的光标位置 (行, 列)，供 IME 定位候选窗（bounds_for_range）。
     cursor: Option<(usize, usize)>,
+    /// 「需要注意」通知消息：响铃 / OSC 9 上报且尚未被查看（供侧栏蓝点 / pane 蓝环 /
+    /// 通知面板）；None = 无待处理通知。
+    notification: Option<String>,
 }
 
 impl TerminalView {
@@ -64,9 +67,16 @@ impl TerminalView {
         let terminal = Terminal::spawn(24, 80, cwd.as_deref()).expect("启动内嵌终端失败");
 
         // 定时重绘：后台读线程更新 Term 网格，这里每 30ms 通知 UI 刷新。
+        // 顺便检查响铃：非活动会话也在跑此循环，故能在后台标记「需要注意」。
         cx.spawn(async move |this, cx| loop {
             Timer::after(REFRESH).await;
-            if this.update(cx, |_, cx| cx.notify()).is_err() {
+            let r = this.update(cx, |this, cx| {
+                if let Some(msg) = this.terminal.take_notification() {
+                    this.notification = Some(msg);
+                }
+                cx.notify();
+            });
+            if r.is_err() {
                 break; // 视图已销毁
             }
         })
@@ -93,7 +103,23 @@ impl TerminalView {
             grid_size: Rc::new(StdCell::new((0.0, 0.0))),
             hover_url: None,
             cursor: None,
+            notification: None,
         }
+    }
+
+    /// 是否有待处理通知（agent 需要注意）。
+    pub fn has_attention(&self) -> bool {
+        self.notification.is_some()
+    }
+
+    /// 通知消息文本（供通知面板显示）。
+    pub fn notification(&self) -> Option<&str> {
+        self.notification.as_deref()
+    }
+
+    /// 清除通知（用户切到 / 聚焦该终端时调用）。
+    pub fn clear_attention(&mut self) {
+        self.notification = None;
     }
 
     pub fn title(&self) -> &str {
