@@ -418,6 +418,17 @@ struct GitDiff {
     lines: Rc<Vec<DiffLine>>,
 }
 
+/// 一次 `git status` 的缓存结果（后台跑、render 只读，绝不在 render 同步跑 git）。
+#[derive(Clone, Default)]
+struct GitStatusData {
+    /// git 命令是否成功（false = 不是 git 仓库 / git 不可用）。
+    ok: bool,
+    /// 当前分支名。
+    branch: String,
+    /// 改动文件：(porcelain 两位状态码, 路径)。
+    files: Vec<(String, String)>,
+}
+
 /// 工作台的持久化状态：主区分屏布局树 + 活动叶子 + 侧栏宽度。
 /// 存 ~/.smelt/workspace.json，启动时据此重建分屏（结构 / 嵌套 / 方向完整恢复）。
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -659,6 +670,17 @@ struct Workspace {
     llm_inputs: Option<LlmInputs>,
     /// 上面几个输入框的变更订阅（保活；随视图存活）。
     llm_subs: Vec<Subscription>,
+    /// git status 缓存（root → (取得时刻, 数据)）。Git 页后台刷新，render 只读，
+    /// 避免每帧同步跑 git status（大仓要 ~90ms，是掉帧元凶）。
+    git_status: HashMap<String, (Instant, GitStatusData)>,
+    /// 正在后台刷新 status 的 root（防重复并发 spawn）。
+    git_status_inflight: HashSet<String>,
+    /// 调试 HUD 开关（Cmd+Shift+F 切换）：开启时右上角显示帧率 + 帧耗时。
+    debug_hud: bool,
+    /// 上一帧渲染时刻（算帧间隔用）。
+    last_frame: Option<Instant>,
+    /// 平滑后的帧率（EMA）。
+    fps_ema: f32,
 }
 
 /// 宠物大脑配置的四个输入框（base_url / api_key / model / persona）。
@@ -734,8 +756,13 @@ impl Workspace {
             sidebar_w,
             _resize_sub,
             git_cache: HashMap::new(),
+            git_status: HashMap::new(),
+            git_status_inflight: HashSet::new(),
             llm_inputs: None,
             llm_subs: Vec::new(),
+            debug_hud: false,
+            last_frame: None,
+            fps_ema: 0.0,
         };
         // 立即写盘：把本次启动生成/沿用的会话 id 落到存档。否则首启（或旧存档迁移）
         // 生成的新 id 只在内存里，若用户不做任何布局操作就退出，重开会因无 id 而
@@ -1811,6 +1838,52 @@ impl Workspace {
 
     /// Git 视图：查看某个改动文件的 diff。已跟踪文件用 `git diff HEAD`，
     /// 未跟踪文件（??）用 `git diff --no-index` 展示全文（整体当作新增）。
+    /// 确保某 root 的 git status 缓存新鲜（>1.5s 或缺失就后台刷新）。
+    /// 绝不阻塞 render：git status 在大仓要 ~90ms，同步跑就是掉帧元凶。
+    fn ensure_git_status(&mut self, root: String, cx: &mut Context<Self>) {
+        let fresh = self
+            .git_status
+            .get(&root)
+            .is_some_and(|(t, _)| t.elapsed() < std::time::Duration::from_millis(1500));
+        if fresh || self.git_status_inflight.contains(&root) {
+            return;
+        }
+        self.git_status_inflight.insert(root.clone());
+        cx.spawn(async move |this, cx| {
+            let r = root.clone();
+            let data = cx
+                .background_executor()
+                .spawn(async move {
+                    let out = std::process::Command::new("git")
+                        .args(["-C", &r, "status", "--porcelain=v1", "-b"])
+                        .output();
+                    let mut d = GitStatusData::default();
+                    if let Ok(o) = out {
+                        if o.status.success() {
+                            d.ok = true;
+                            let text = String::from_utf8_lossy(&o.stdout);
+                            for line in text.lines() {
+                                if let Some(b) = line.strip_prefix("## ") {
+                                    d.branch =
+                                        b.split("...").next().unwrap_or("").trim().to_string();
+                                } else if line.len() >= 3 {
+                                    d.files.push((line[..2].to_string(), line[3..].to_string()));
+                                }
+                            }
+                        }
+                    }
+                    d
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.git_status_inflight.remove(&root);
+                this.git_status.insert(root, (Instant::now(), data));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 跑 git + 着色放后台，用 file_gen 丢弃过期结果。
     fn open_diff(&mut self, root: String, path: String, untracked: bool, cx: &mut Context<Self>) {
         self.diff_gen = self.diff_gen.wrapping_add(1);
@@ -1980,6 +2053,31 @@ impl Render for Workspace {
         // 首次打开设置面板时懒创建宠物大脑配置的输入框（需要 window）。
         if self.settings_open && self.llm_inputs.is_none() {
             self.init_llm_inputs(window, cx);
+        }
+
+        // Git 页：后台刷新改动列表（git status 慢，绝不在 render 里同步跑）。
+        if self.view == MainView::Git {
+            if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
+                self.ensure_git_status(root, cx);
+            }
+        }
+
+        // 调试 HUD：开启时用 request_animation_frame 驱动连续渲染，测真实帧率
+        // （连续重绘会重跑整窗布局/绘制，diff 面板卡不卡直接反映到帧耗时上）。
+        if self.debug_hud {
+            let now = Instant::now();
+            if let Some(prev) = self.last_frame {
+                let dt = now.duration_since(prev).as_secs_f32();
+                if dt > 0.0 {
+                    let inst = 1.0 / dt;
+                    self.fps_ema =
+                        if self.fps_ema <= 0.0 { inst } else { self.fps_ema * 0.9 + inst * 0.1 };
+                }
+            }
+            self.last_frame = Some(now);
+            window.request_animation_frame();
+        } else {
+            self.last_frame = None;
         }
 
         // 主题色 token（跟随 gpui-component 主题，替代硬编码）
@@ -2271,6 +2369,13 @@ impl Render for Workspace {
                     }
                     // Cmd+W 关闭当前 pane；会话只剩一个 pane 时关掉整个会话（至少留一个会话）
                     "w" => this.close_active(window, cx),
+                    // Cmd+Shift+F 切换调试 HUD（右上角帧率）
+                    "f" if ks.modifiers.shift => {
+                        this.debug_hud = !this.debug_hud;
+                        this.fps_ema = 0.0;
+                        this.last_frame = None;
+                        cx.notify();
+                    }
                     // Cmd+Q 退出交给应用菜单的 Quit action（全局绑定，见 main）
                     _ => {}
                 }
@@ -2419,8 +2524,11 @@ impl Render for Workspace {
                         }
                         MainView::Git => {
                             let cwd = self.cur().and_then(|s| s.cwd(cx));
+                            let status =
+                                cwd.as_ref().and_then(|r| self.git_status.get(r).map(|(_, d)| d));
                             git_view(
-                                cwd,
+                                cwd.clone(),
+                                status,
                                 &self.git_diff,
                                 self.diff_split,
                                 &self.git_files_scroll,
@@ -2438,6 +2546,33 @@ impl Render for Workspace {
             .children(self.settings_open.then(|| self.render_settings(cx)))
             // 通知面板浮层
             .children(self.notifications_open.then(|| self.render_notifications(cx)))
+            // 调试 HUD：右上角帧率 + 帧耗时（Cmd+Shift+F 切换）
+            .children(self.debug_hud.then(|| {
+                let fps = self.fps_ema;
+                let ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+                // 帧率健康度着色：≥55 绿、≥30 黄、否则红。
+                let color = if fps >= 55.0 {
+                    rgb(0x22c55e)
+                } else if fps >= 30.0 {
+                    rgb(0xf59e0b)
+                } else {
+                    rgb(0xef4444)
+                };
+                div()
+                    .absolute()
+                    .top(px(40.))
+                    .right(px(12.))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgba(0x000000cc))
+                    .border_1()
+                    .border_color(rgba(0xffffff22))
+                    .font_family(terminal_view::FONT_FAMILY)
+                    .text_xs()
+                    .text_color(color)
+                    .child(format!("{fps:.0} FPS · {ms:.1} ms"))
+            }))
     }
 }
 
@@ -2563,6 +2698,7 @@ fn walk_dir(
 /// Git 视图：左侧分支 + 改动文件列表（可点击），右侧显示选中文件的 diff。
 fn git_view(
     cwd: Option<String>,
+    status: Option<&GitStatusData>,
     git_diff: &Option<GitDiff>,
     split: bool,
     files_scroll: &ScrollHandle,
@@ -2576,23 +2712,15 @@ fn git_view(
     let Some(root) = cwd else {
         return placeholder_view("无项目目录", muted);
     };
-    let output = std::process::Command::new("git")
-        .args(["-C", &root, "status", "--porcelain=v1", "-b"])
-        .output();
-    let text = match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return placeholder_view("不是 git 仓库，或 git 不可用", muted),
+    // 只读后台缓存（ensure_git_status 负责刷新）：缺失=首次加载中，ok=false=非 git 仓库。
+    let Some(data) = status else {
+        return placeholder_view("加载改动中…", muted);
     };
-
-    let mut branch = String::from("?");
-    let mut files: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
-        if let Some(b) = line.strip_prefix("## ") {
-            branch = b.split("...").next().unwrap_or("").trim().to_string();
-        } else if line.len() >= 3 {
-            files.push((line[..2].to_string(), line[3..].to_string()));
-        }
+    if !data.ok {
+        return placeholder_view("不是 git 仓库，或 git 不可用", muted);
     }
+    let branch = data.branch.clone();
+    let files = data.files.clone();
 
     let selected = git_diff.as_ref().map(|d| d.path.clone());
     let file_list = if files.is_empty() {
