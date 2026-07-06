@@ -759,21 +759,53 @@ fn sel_range_for_row(
 /// 副标题为「会话名 · agent 任务名」、正文为通知消息（对齐 cmux 的信息量）。
 /// 失败静默忽略（未签名 / 无权限时可能不显示）。
 fn system_notify(session: &str, task: Option<&str>, body: &str) {
-    // AppleScript 字符串转义：反斜杠、双引号。
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let subtitle = match task {
         Some(t) if !t.trim().is_empty() => format!("{session} · {t}"),
         _ => session.to_string(),
     };
-    let script = format!(
-        "display notification \"{}\" with title \"smelt\" subtitle \"{}\"",
-        esc(body),
-        esc(&subtitle)
-    );
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .spawn();
+    // 只走原生通知：打包成 smelt.app（有 bundle id）时用 smelt 名字 + 图标显示；
+    // 开发版（cargo run 无 bundle）自动静默不打扰，不再回落 osascript。
+    #[cfg(target_os = "macos")]
+    deliver_native_notification("smelt", &subtitle, body);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (subtitle, body);
+}
+
+/// 原生 `NSUserNotification`：仅在已打包（有 bundle identifier）时投递，用宿主 .app 图标。
+/// 未打包 / 不可用则直接返回（开发版静默）。
+#[cfg(target_os = "macos")]
+fn deliver_native_notification(title: &str, subtitle: &str, body: &str) {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        // 无 bundle identifier（cargo run 直接跑）→ 原生通知不会投递，静默返回。
+        let bundle: *mut Object = msg_send![class!(NSBundle), mainBundle];
+        if bundle.is_null() {
+            return;
+        }
+        let ident: *mut Object = msg_send![bundle, bundleIdentifier];
+        if ident.is_null() {
+            return;
+        }
+        let center: *mut Object =
+            msg_send![class!(NSUserNotificationCenter), defaultUserNotificationCenter];
+        if center.is_null() {
+            return;
+        }
+        let nsstr = |s: &str| -> *mut Object {
+            let obj: *mut Object = msg_send![class!(NSString), alloc];
+            let ptr = s.as_ptr() as *const std::ffi::c_void;
+            // encoding 4 = NSUTF8StringEncoding。
+            msg_send![obj, initWithBytes: ptr length: s.len() encoding: 4usize]
+        };
+        let n: *mut Object = msg_send![class!(NSUserNotification), alloc];
+        let n: *mut Object = msg_send![n, init];
+        let _: () = msg_send![n, setTitle: nsstr(title)];
+        let _: () = msg_send![n, setSubtitle: nsstr(subtitle)];
+        let _: () = msg_send![n, setInformativeText: nsstr(body)];
+        let _: () = msg_send![center, deliverNotification: n];
+    }
 }
 
 /// 在一行里找出所有 URL，返回 (起列, 止列含, url)。

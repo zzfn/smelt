@@ -1161,24 +1161,36 @@ impl Workspace {
 
     /// 总览页：所有会话的卡片网格（状态徽章 + 任务名 + cwd + 窗格数），点击跳转。
     fn render_overview(&self, cx: &mut Context<Self>) -> Div {
-        let (fg, muted, border, popover) = {
+        let (fg, muted) = {
             let t = cx.theme();
-            (t.foreground, t.muted_foreground, t.border, t.popover)
+            (t.foreground, t.muted_foreground)
         };
+        // 果冻感配色：柔和卡片底、细白边、状态色 + 半透明底做胶囊（统一 Hsla）。
+        let card_bg = rgb(0x17181d);
+        let card_border = rgba(0xffffff12);
+        let soft_bg: Hsla = rgba(0xffffff0d).into();
+        let c_red: Hsla = rgb(0xef4444).into();
+        let c_blue: Hsla = rgb(0x4a9eff).into();
+        let c_green: Hsla = rgb(0x22c55e).into();
+        let c_amber: Hsla = rgb(0xf59e0b).into();
+        let red_tint: Hsla = rgba(0xef444422).into();
+        let blue_tint: Hsla = rgba(0x4a9eff22).into();
+        let green_tint: Hsla = rgba(0x22c55e22).into();
 
-        // 顶部汇总。
+        // 顶部汇总：标题 + 胶囊统计。
         let need = self.sessions.iter().filter(|s| s.status(cx) == AgentStatus::NeedsAttention).count();
         let running = self.sessions.iter().filter(|s| s.status(cx) == AgentStatus::Running).count();
+        let pill = |text: String, color: Hsla, bg: Hsla| {
+            div().px(px(11.)).py(px(4.)).rounded_full().bg(bg).text_sm().text_color(color).child(text)
+        };
         let summary = div()
             .flex()
             .items_center()
-            .gap_4()
-            .px_1()
-            .py_1()
-            .text_sm()
-            .child(div().text_color(fg).child(format!("{} 个会话", self.sessions.len())))
-            .child(div().text_color(rgb(0xef4444)).child(format!("{need} 需要处理")))
-            .child(div().text_color(rgb(0x4a9eff)).child(format!("{running} 运行中")));
+            .gap_2()
+            .child(div().text_xl().font_bold().text_color(fg).mr_2().child("总览"))
+            .child(pill(format!("{} 会话", self.sessions.len()), fg, soft_bg))
+            .child(pill(format!("{need} 需要处理"), c_red, red_tint))
+            .child(pill(format!("{running} 运行中"), c_blue, blue_tint));
 
         // 按状态排序：需要处理 > 运行中 > 空闲（同级保持原顺序）。
         let mut order: Vec<usize> = (0..self.sessions.len()).collect();
@@ -1202,10 +1214,10 @@ impl Workspace {
                     .next()
                     .unwrap_or("")
                     .to_string();
-                let (dot, label) = match s.status(cx) {
-                    AgentStatus::NeedsAttention => (rgb(0xef4444), "需要处理"),
-                    AgentStatus::Running => (rgb(0x4a9eff), "运行中"),
-                    AgentStatus::Idle => (rgb(0x22c55e), "空闲"),
+                let (dot, label, tint) = match s.status(cx) {
+                    AgentStatus::NeedsAttention => (c_red, "需要处理", red_tint),
+                    AgentStatus::Running => (c_blue, "运行中", blue_tint),
+                    AgentStatus::Idle => (c_green, "空闲", green_tint),
                 };
                 let panes = s.pane_count();
                 let notif = s.notification_msg(cx);
@@ -1215,17 +1227,19 @@ impl Workspace {
 
                 div()
                     .id(("ov-card", ix))
-                    .w(px(260.))
-                    .p_3()
-                    .rounded_lg()
+                    .w(px(300.))
+                    .p_4()
+                    .rounded(px(18.))
                     .border_1()
-                    .border_color(border)
-                    .bg(popover)
+                    .border_color(card_border)
+                    .bg(card_bg)
+                    .shadow_sm()
                     .cursor_pointer()
-                    .hover(|d| d.border_color(dot))
+                    // hover：边框亮起 + 抬起阴影 + 底色微亮，做出「果冻浮起」感。
+                    .hover(|d| d.border_color(dot).shadow_lg().bg(rgb(0x1c1e24)))
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_3()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, window, cx| this.activate(ix, window, cx)),
@@ -1237,13 +1251,13 @@ impl Workspace {
                             .items_center()
                             .gap_2()
                             .min_w_0()
-                            .child(div().size_2().rounded_full().bg(dot).flex_shrink_0())
+                            .child(div().size(px(9.)).rounded_full().bg(dot).flex_shrink_0())
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .font_bold()
+                                    .font_semibold()
                                     .text_color(fg)
                                     .child(name),
                             )
@@ -1258,8 +1272,16 @@ impl Workspace {
                             .items_center()
                             .gap_2()
                             .text_xs()
+                            .child(
+                                div()
+                                    .px(px(8.))
+                                    .py(px(2.))
+                                    .rounded_full()
+                                    .bg(tint)
+                                    .text_color(dot)
+                                    .child(label),
+                            )
                             .child(div().text_color(muted).child(cwd))
-                            .child(div().text_color(dot).child(label))
                             .child(div().text_color(muted).child(format!("· {panes} 窗格"))),
                     )
                     // git 分支 + 改动数
@@ -1272,19 +1294,26 @@ impl Workspace {
                             .text_color(muted)
                             .child(format!("⎇ {branch}"))
                             .children((changed > 0).then(|| {
-                                div().text_color(rgb(0xf59e0b)).child(format!("● {changed} 改动"))
+                                div().text_color(c_amber).child(format!("● {changed} 改动"))
                             }))
                     }))
-                    // 需要处理时显示通知消息
+                    // 需要处理时显示通知消息（红底胶囊，更醒目）
                     .children(notif.map(|m| {
-                        div().text_xs().text_color(rgb(0xef4444)).truncate().child(m)
+                        div()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded_lg()
+                            .bg(rgba(0xef444418))
+                            .text_xs()
+                            .text_color(c_red)
+                            .truncate()
+                            .child(m)
                     }))
                     // 迷你终端预览（末尾几行）
                     .children((!preview.is_empty()).then(|| {
                         div()
-                            .mt_1()
                             .p_2()
-                            .rounded_md()
+                            .rounded_lg()
                             .bg(rgb(0x0d0d10))
                             .font_family(terminal_view::FONT_FAMILY)
                             .text_xs()
@@ -1307,12 +1336,12 @@ impl Workspace {
                 .id("overview-scroll")
                 .size_full()
                 .overflow_y_scroll()
-                .p_4()
+                .p_5()
                 .flex()
                 .flex_col()
-                .gap_4()
+                .gap_5()
                 .child(summary)
-                .child(div().flex().flex_wrap().gap_3().children(cards)),
+                .child(div().flex().flex_wrap().gap_4().children(cards)),
         )
     }
 
