@@ -62,7 +62,24 @@ pub struct TerminalView {
     notification: Option<String>,
     /// 最近收到通知的时刻（总览页显示「N 分钟前」）。
     notified_at: Option<Instant>,
+    /// 上一帧该终端是否在「运行中」（标题以 braille spinner 开头）；用于检测完成边沿。
+    was_running: bool,
+    /// 已连续运行的帧数（REFRESH 为单位）；超阈值判为「卡住」，提醒一次。
+    running_frames: u32,
+    /// 是否已就「卡住」提醒过（同一段运行只提醒一次）。
+    stuck_notified: bool,
 }
+
+/// 标题是否以 braille spinner（U+2801–U+28FF）开头 —— 与 Session::status 的 Running 判定一致。
+fn title_is_running(title: Option<String>) -> bool {
+    title
+        .and_then(|t| t.chars().next())
+        .map(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+        .unwrap_or(false)
+}
+
+/// 「卡住」阈值：REFRESH≈30ms → ~33fps，约 8 分钟。
+const STUCK_FRAMES: u32 = 8 * 60 * 1000 / 30;
 
 impl TerminalView {
     pub fn new(cx: &mut Context<Self>, cwd: Option<String>) -> Self {
@@ -86,6 +103,29 @@ impl TerminalView {
                     this.notification = Some(msg);
                     this.notified_at = Some(Instant::now());
                 }
+
+                // 运行状态边沿检测（标题 spinner）：完成提醒 + 卡住提醒。
+                let running = title_is_running(this.terminal.current_title());
+                let name = this.title.clone();
+                if this.was_running && !running {
+                    // Running → Idle：该会话的 agent 干完了。
+                    crate::pet::push_pet_message(cx, format!("「{name}」任务完成啦，来看看结果吧"));
+                }
+                if running {
+                    this.running_frames += 1;
+                    if this.running_frames == STUCK_FRAMES && !this.stuck_notified {
+                        this.stuck_notified = true;
+                        crate::pet::push_pet_message(
+                            cx,
+                            format!("「{name}」已经跑了好久，要不去瞅一眼？"),
+                        );
+                    }
+                } else {
+                    this.running_frames = 0;
+                    this.stuck_notified = false;
+                }
+                this.was_running = running;
+
                 cx.notify();
             });
             if r.is_err() {
@@ -117,6 +157,9 @@ impl TerminalView {
             cursor: None,
             notification: None,
             notified_at: None,
+            was_running: false,
+            running_frames: 0,
+            stuck_notified: false,
         }
     }
 

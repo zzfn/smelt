@@ -5,6 +5,7 @@
 //!
 //! 运行： cargo run --bin workspace
 
+mod agent;
 mod pet;
 mod terminal;
 mod terminal_view;
@@ -23,6 +24,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenu, SidebarMenuItem,
 };
+use gpui_component::input::Input;
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_component::resizable::{
     h_resizable, resizable_panel, v_resizable, ResizablePanelEvent, ResizableState,
@@ -614,6 +616,18 @@ struct Workspace {
     _resize_sub: Subscription,
     /// git 信息缓存（cwd → (分支, 改动数)），总览页后台刷新、渲染读缓存。
     git_cache: HashMap<String, (String, usize)>,
+    /// 宠物大脑（LLM）配置的输入框；首次打开设置面板时懒创建（需要 window）。
+    llm_inputs: Option<LlmInputs>,
+    /// 上面几个输入框的变更订阅（保活；随视图存活）。
+    llm_subs: Vec<Subscription>,
+}
+
+/// 宠物大脑配置的四个输入框（base_url / api_key / model / persona）。
+struct LlmInputs {
+    base_url: Entity<gpui_component::input::InputState>,
+    api_key: Entity<gpui_component::input::InputState>,
+    model: Entity<gpui_component::input::InputState>,
+    persona: Entity<gpui_component::input::InputState>,
 }
 
 impl Workspace {
@@ -681,7 +695,68 @@ impl Workspace {
             sidebar_w,
             _resize_sub,
             git_cache: HashMap::new(),
+            llm_inputs: None,
+            llm_subs: Vec::new(),
         }
+    }
+
+    /// 懒创建宠物大脑配置的输入框（需要 window，故在首次渲染设置面板时调）。
+    /// 每个框预填当前配置值，变更时写回 LlmConfig 并存盘。
+    fn init_llm_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::input::{InputEvent, InputState};
+        let lc = cx.global::<agent::LlmConfig>().clone();
+
+        let base_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://api.deepseek.com/chat/completions")
+                .default_value(lc.base_url.clone())
+        });
+        let api_key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("sk-...（留空则用 config.toml/env）")
+                .masked(true)
+                .default_value(lc.api_key.clone())
+        });
+        let model = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("deepseek-chat").default_value(lc.model.clone())
+        });
+        let persona = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(2, 5)
+                .placeholder("人设 / system prompt")
+                .default_value(lc.persona.clone())
+        });
+
+        // 变更即写回对应字段（Change 覆盖键入，Blur 兜底）。
+        let save_on = |ev: &InputEvent| matches!(ev, InputEvent::Change | InputEvent::Blur);
+        self.llm_subs.clear();
+        self.llm_subs.push(cx.subscribe(&base_url, move |this, s, ev: &InputEvent, cx| {
+            if save_on(ev) {
+                let v = s.read(cx).value().to_string();
+                this.update_llm_config(|c| c.base_url = v, cx);
+            }
+        }));
+        self.llm_subs.push(cx.subscribe(&api_key, move |this, s, ev: &InputEvent, cx| {
+            if save_on(ev) {
+                let v = s.read(cx).value().to_string();
+                this.update_llm_config(|c| c.api_key = v, cx);
+            }
+        }));
+        self.llm_subs.push(cx.subscribe(&model, move |this, s, ev: &InputEvent, cx| {
+            if save_on(ev) {
+                let v = s.read(cx).value().to_string();
+                this.update_llm_config(|c| c.model = v, cx);
+            }
+        }));
+        self.llm_subs.push(cx.subscribe(&persona, move |this, s, ev: &InputEvent, cx| {
+            if save_on(ev) {
+                let v = s.read(cx).value().to_string();
+                this.update_llm_config(|c| c.persona = v, cx);
+            }
+        }));
+
+        self.llm_inputs = Some(LlmInputs { base_url, api_key, model, persona });
     }
 
     /// 后台刷新所有会话 cwd 的 git 信息（分支 + 改动数）到缓存，进总览时调用。
@@ -928,6 +1003,15 @@ impl Workspace {
         let mut c = cx.global::<pet::PetConfig>().clone();
         f(&mut c);
         pet::save_pet_config(&c);
+        cx.set_global(c);
+        cx.notify();
+    }
+
+    /// 修改宠物大脑（LLM）配置：改全局 + 存盘 + 重绘。
+    fn update_llm_config(&mut self, f: impl FnOnce(&mut agent::LlmConfig), cx: &mut Context<Self>) {
+        let mut c = cx.global::<agent::LlmConfig>().clone();
+        f(&mut c);
+        agent::save_llm_config(&c);
         cx.set_global(c);
         cx.notify();
     }
@@ -1429,6 +1513,44 @@ impl Workspace {
             })
             .collect();
 
+        // 宠物大脑（LLM）开关。key/model 暂存 ~/.smelt/llm.json（后续做面板内编辑）。
+        let lc = cx.global::<agent::LlmConfig>().clone();
+        let llm_on = lc.enabled;
+        let llm_chip = div()
+            .id("pet-brain")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(if llm_on { fg } else { muted })
+            .bg(if llm_on { border } else { popover })
+            .hover(|s| s.bg(border))
+            .child(if llm_on { "大脑 · 开" } else { "大脑 · 关" }.to_string())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _w, cx| this.update_llm_config(|c| c.enabled = !c.enabled, cx)),
+            );
+        // 大脑配置输入框（base_url / key / model / persona）；输入框已懒创建时才渲染。
+        let llm_fields = self.llm_inputs.as_ref().map(|inp| {
+            let field = |label: &str, state: &Entity<gpui_component::input::InputState>| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xs().text_color(muted).child(label.to_string()))
+                    .child(Input::new(state).small())
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(field("接口地址 base_url", &inp.base_url))
+                .child(field("API Key", &inp.api_key))
+                .child(field("模型 model", &inp.model))
+                .child(field("人设 persona", &inp.persona))
+        });
+
         // 点背景空白关闭；面板停在右上（齿轮下方）。
         div()
             .absolute()
@@ -1518,9 +1640,18 @@ impl Workspace {
                                     .flex()
                                     .gap_2()
                                     .items_center()
+                                    .flex_wrap()
                                     .child(pet_show_chip)
-                                    .child(pet_notify_chip),
+                                    .child(pet_notify_chip)
+                                    .child(llm_chip),
                             )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("大脑：接 DeepSeek 等，点击/通知/空闲用 LLM 说话"),
+                            )
+                            .children(llm_fields)
                             .child(
                                 div()
                                     .flex()
@@ -1748,9 +1879,14 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_session;
         let can_close = self.sessions.len() > 1;
+
+        // 首次打开设置面板时懒创建宠物大脑配置的输入框（需要 window）。
+        if self.settings_open && self.llm_inputs.is_none() {
+            self.init_llm_inputs(window, cx);
+        }
 
         // 主题色 token（跟随 gpui-component 主题，替代硬编码）
         let (c_bg, c_border, c_popover, c_muted, c_fg) = {
@@ -3028,9 +3164,10 @@ fn main() {
         let window_bg = appearance.window_bg();
         cx.set_global(appearance);
 
-        // 桌面宠物：配置 + 播报邮箱（跨窗口全局单例），再开独立透明置顶浮窗。
+        // 桌面宠物：配置 + 播报邮箱 + LLM 大脑配置（跨窗口全局单例），再开独立透明浮窗。
         cx.set_global(pet::load_pet_config());
         cx.set_global(pet::PetMailbox::default());
+        cx.set_global(agent::load_llm_config());
         pet::open_pet_window(cx);
 
         cx.spawn(async move |cx| {

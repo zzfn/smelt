@@ -17,6 +17,7 @@ use std::f32::consts::TAU;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::Timelike;
 use gpui::*;
 use smol::Timer;
 
@@ -32,6 +33,10 @@ const WIN_H: f32 = 300.0;
 const SPEECH_FRAMES: f32 = 90.0;
 /// 瞳孔朝鼠标偏移的最大像素。
 const EYE_LOOK_MAX: f32 = 4.0;
+/// 空闲多少帧后主动搭话（20fps × ~160s）。
+const IDLE_CHAT_FRAMES: f32 = 20.0 * 160.0;
+/// 光标静止多少帧判为「用户离开」（20fps × ~600s = 10 分钟）。
+const AFK_FRAMES: f32 = 20.0 * 600.0;
 
 /// 点一下宠物轮换的台词。
 const LINES: &[&str] = &[
@@ -121,7 +126,7 @@ pub struct PetView {
     dragging: bool,
     /// 点击互动余韵：按下时置 1.0，逐帧衰减到 0，期间宠物向上蹦并被拉长。
     bounce: f32,
-    /// 连点鼓大值：每次戳 +0.2 并缓慢衰减；累到阈值就「噗」地弹回。驱动临时放大。
+    /// 连点鼓大值：每次戳 +0.2（封顶 1.0）并缓慢衰减，驱动临时放大；停手会慢慢缩回。
     poke: f32,
     /// 眨眼计时：逐帧递增，按周期取模决定何时闭眼。
     blink: f32,
@@ -140,6 +145,18 @@ pub struct PetView {
     /// 瞳孔当前平滑偏移（每帧缓动逼近鼠标目标方向，避免瞬移的生硬感）。
     eye_x: f32,
     eye_y: f32,
+    /// LLM 请求自增序号：只认最新一次的回复，丢弃过期结果（用户连点防竞态）。
+    req_gen: u64,
+    /// 空闲帧计数：说话 / 交互清零，累到阈值且开了大脑就主动搭话。
+    idle_frames: f32,
+    /// 上次报时的小时（整点报时用）。
+    last_hour: Option<u32>,
+    /// 上一帧全屏光标位置（检测久未移动 = 用户离开）。
+    last_mouse: Option<(f32, f32)>,
+    /// 光标静止累计帧数。
+    still_frames: f32,
+    /// 是否已就本次「离开」提醒过（光标一动就复位）。
+    afk_notified: bool,
 }
 
 impl PetView {
@@ -169,15 +186,51 @@ impl PetView {
                             this.speech = None;
                         }
                     }
-                    // 播报：气泡空闲且开启通知时，从邮箱取一条说出来。
+                    // 播报 / 主动搭话。
+                    let agent_on = Self::agent_on(cx);
                     let notify = cx.try_global::<PetConfig>().map(|c| c.notify).unwrap_or(true);
                     if this.speech.is_none() && notify {
                         let next = cx
                             .try_global::<PetMailbox>()
                             .and_then(|mb| mb.0.lock().ok().and_then(|mut q| q.pop_front()));
                         if let Some(text) = next {
-                            this.say(text);
+                            if agent_on {
+                                // 开了大脑 → 用宠物口吻转述这条通知。
+                                this.ask_agent(
+                                    format!("主人收到一条开发通知：「{text}」。用你的口吻简短提醒他。"),
+                                    cx,
+                                );
+                            } else {
+                                this.say(text);
+                            }
                         }
+                    }
+                    // 空闲主动搭话（需开播报 + 大脑；AI 生成）。
+                    this.idle_frames += 1.0;
+                    if notify
+                        && agent_on
+                        && this.speech.is_none()
+                        && this.idle_frames > IDLE_CHAT_FRAMES
+                    {
+                        this.idle_frames = 0.0;
+                        this.ask_agent("你有点无聊了，主动跟主人搭一句家常。".into(), cx);
+                    }
+
+                    // 整点报时（9–22 点；跨过整点时报一次）。
+                    let hour = chrono::Local::now().hour();
+                    match this.last_hour {
+                        Some(h) if h != hour => {
+                            this.last_hour = Some(hour);
+                            if (9..=22).contains(&hour) {
+                                this.proactive_say(
+                                    format!("现在{hour}点整了，愉快地跟主人报个时、提醒他注意节奏。"),
+                                    format!("🕐 {hour} 点整啦"),
+                                    cx,
+                                );
+                            }
+                        }
+                        None => this.last_hour = Some(hour),
+                        _ => {}
                     }
                     cx.notify();
                 })
@@ -203,13 +256,89 @@ impl PetView {
             click_through: None,
             eye_x: 0.0,
             eye_y: 0.0,
+            req_gen: 0,
+            idle_frames: 0.0,
+            last_hour: None,
+            last_mouse: None,
+            still_frames: 0.0,
+            afk_notified: false,
         }
     }
 
-    /// 让宠物说一句话，气泡停留 `SPEECH_FRAMES` 帧。
+    /// 主动开口（受「播报开关」总控，且当前没在说话时才说）：
+    /// 开了大脑走 AI（`ai_prompt`），否则用固定话术 `canned`。
+    fn proactive_say(
+        &mut self,
+        ai_prompt: String,
+        canned: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let notify = cx.try_global::<PetConfig>().map(|c| c.notify).unwrap_or(true);
+        if !notify || self.speech.is_some() {
+            return;
+        }
+        if Self::agent_on(cx) {
+            self.ask_agent(ai_prompt, cx);
+        } else {
+            self.say(canned);
+        }
+    }
+
+    /// 让宠物说一句话，气泡停留 `SPEECH_FRAMES` 帧；顺便清空闲计时。
     fn say(&mut self, text: impl Into<SharedString>) {
         self.speech = Some(text.into());
         self.speech_ttl = SPEECH_FRAMES;
+        self.idle_frames = 0.0;
+    }
+
+    /// 是否开启了 LLM 大脑。
+    fn agent_on(cx: &App) -> bool {
+        cx.try_global::<crate::agent::LlmConfig>()
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    /// 让宠物「大脑」回一句：先显示「…」思考，异步拿到 LLM 回复后替换；过期结果丢弃。
+    fn ask_agent(&mut self, user: String, cx: &mut Context<Self>) {
+        let Some(cfg) = cx.try_global::<crate::agent::LlmConfig>().cloned() else {
+            return;
+        };
+        if !cfg.enabled {
+            return;
+        }
+        self.req_gen += 1;
+        let gen = self.req_gen;
+        self.say("…"); // 思考中
+        cx.spawn(async move |this, cx| {
+            // 网络请求放后台执行器，别卡 UI。注意：reqwest 依赖 tokio 运行时，而 GPUI 的
+            // executor 不是 tokio，直接跑会 panic「no reactor running」。故在后台线程里起一个
+            // 临时 current-thread 运行时 block_on 跑请求。
+            let reply = cx
+                .background_executor()
+                .spawn(async move {
+                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(rt) => rt.block_on(crate::agent::complete(cfg, user)),
+                        Err(e) => Err(anyhow::Error::from(e)),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.req_gen != gen {
+                    return; // 已有更新的请求，丢弃这次
+                }
+                match reply {
+                    Ok(t) => this.say(t),
+                    // 失败：收起「…」，不打扰。
+                    Err(_) => {
+                        if this.speech.as_deref() == Some("…") {
+                            this.speech = None;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -235,8 +364,8 @@ impl Render for PetView {
         let s = cfg.scale * (1.0 + self.poke);
         let p = |v: f32| px(v * s);
 
-        // 一次原生取值：眼睛朝鼠标的目标偏移 + 光标是否落在宠物身体内（决定点击穿透）。
-        let (eye_tx, eye_ty, over_pet) = mouse_state(window, s);
+        // 一次原生取值：眼睛朝鼠标的目标偏移 + 是否落在身体内（点击穿透）+ 全屏光标坐标。
+        let (eye_tx, eye_ty, over_pet, mx, my) = mouse_state(window, s);
         // 缓动：当前瞳孔偏移逐帧逼近目标，避免瞬移的生硬感（≈0.2/帧，约 0.5s 到位）。
         self.eye_x += (eye_tx - self.eye_x) * 0.2;
         self.eye_y += (eye_ty - self.eye_y) * 0.2;
@@ -245,6 +374,27 @@ impl Render for PetView {
         if self.click_through != Some(!over_pet) {
             set_click_through(window, !over_pet);
             self.click_through = Some(!over_pet);
+        }
+
+        // 用户离开检测：光标长时间不动 → 关心一句；一动就复位。
+        let moved = self
+            .last_mouse
+            .map(|(lx, ly)| (mx - lx).abs() > 2.0 || (my - ly).abs() > 2.0)
+            .unwrap_or(true);
+        if moved {
+            self.still_frames = 0.0;
+            self.afk_notified = false;
+        } else {
+            self.still_frames += 1.0;
+        }
+        self.last_mouse = Some((mx, my));
+        if self.still_frames > AFK_FRAMES && !self.afk_notified {
+            self.afk_notified = true;
+            self.proactive_say(
+                "主人好像离开挺久了，温柔地提醒他回来时注意休息眼睛。".into(),
+                "🍵 歇会儿，记得喝水呀～",
+                cx,
+            );
         }
 
         // 呼吸相位 [-1, 1]：正为「吸气」（拉高变窄），负为「呼气」（压扁变宽）。
@@ -379,14 +529,13 @@ impl Render for PetView {
                     // 未发生移动就抬起 = 一次轻点。
                     if this.dragging {
                         this.dragging = false;
-                        // 连点鼓大：每戳一下鼓一点，累到阈值就「噗」地弹回。
-                        this.poke += 0.2;
-                        if this.poke >= 1.0 {
-                            this.poke = 0.0;
-                            this.bounce = 1.6; // 大蹦一下
-                            this.say("噗——！");
+                        // 连点鼓大：每戳一下鼓一点、封顶不鼓破，停手会慢慢缩回。
+                        this.poke = (this.poke + 0.2).min(1.0);
+                        this.bounce = 1.0;
+                        if Self::agent_on(cx) {
+                            // 开了大脑 → LLM 即兴回应，替代写死台词。
+                            this.ask_agent("主人戳了戳你，俏皮地回应一句。".into(), cx);
                         } else {
-                            this.bounce = 1.0;
                             this.line_idx = (this.line_idx + 1) % LINES.len();
                             this.say(LINES[this.line_idx]);
                         }
@@ -541,12 +690,12 @@ struct NSRect {
 ///
 /// 返回 `(瞳孔x偏移, 瞳孔y偏移, 是否在身体内)`。
 #[cfg(target_os = "macos")]
-fn mouse_state(window: &Window, s: f32) -> (f32, f32, bool) {
+fn mouse_state(window: &Window, s: f32) -> (f32, f32, bool, f32, f32) {
     use objc::{class, msg_send, sel, sel_impl};
 
     let ns_window = ns_window_of(window);
     if ns_window.is_null() {
-        return (0.0, 0.0, true);
+        return (0.0, 0.0, true, 0.0, 0.0);
     }
     let s = s as f64;
     unsafe {
@@ -573,13 +722,13 @@ fn mouse_state(window: &Window, s: f32) -> (f32, f32, bool) {
         let hy = (mouse.y - body_cy) / ry;
         let inside = hx * hx + hy * hy <= 1.0;
 
-        (ox, oy, inside)
+        (ox, oy, inside, mouse.x as f32, mouse.y as f32)
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn mouse_state(_window: &Window, _s: f32) -> (f32, f32, bool) {
-    (0.0, 0.0, true)
+fn mouse_state(_window: &Window, _s: f32) -> (f32, f32, bool, f32, f32) {
+    (0.0, 0.0, true, 0.0, 0.0)
 }
 
 /// 设置窗口是否「点击穿透」：`passthrough=true` 时整窗放行鼠标事件到下层。

@@ -3,6 +3,11 @@ name = "smelt"
 version = "0.1.0"
 edition = "2021"
 
+# 老版 objc 0.2 的 msg_send!/class! 宏展开带 cfg(feature="cargo-clippy")，新 Rust 的
+# check-cfg 会刷 unexpected_cfgs 警告；宏来自依赖无法改，这里整包放行。
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
