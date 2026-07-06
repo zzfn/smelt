@@ -16,7 +16,7 @@ run: ## 本地直接跑 GUI（开发用）
 icon: ## 生成 app 图标（assets/AppIcon.icns）
 	./scripts/make-icon.sh
 
-dist: ## 用已有 release 产物打包 app + dmg + zip
+dist: ## 用已有 release 产物打包 app + dmg
 	./scripts/package-mac.sh
 
 dist-build: ## 先编译再打包（一步到位）

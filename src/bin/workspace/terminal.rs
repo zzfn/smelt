@@ -16,7 +16,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 /// 默认前景 / 背景色（与窗口底色一致，Tokyo Night 风格）。
 const DEFAULT_FG: u32 = 0x00c0_caf5;
-const DEFAULT_BG: u32 = 0x001a_1b26;
+pub const DEFAULT_BG: u32 = 0x001a_1b26;
 
 /// 16 色 ANSI 调色板（Tokyo Night）。索引 0-7 常规、8-15 明亮。
 const PALETTE: [u32; 16] = [
@@ -38,6 +38,26 @@ pub struct Cell {
 pub struct Frame {
     pub rows: Vec<Vec<Cell>>,
     pub cursor: Option<(usize, usize)>,
+}
+
+/// 是否东方全角文字（等宽字体里字形精确占两格）：CJK / 假名 / 谚文 / 全角符号等。
+/// 用于决定宽字符占位格跳过（这些）还是保留空格（emoji / 其它符号）。
+fn is_wide_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x115F      // 谚文字母
+        | 0x2E80..=0x303E    // CJK 部首 / 康熙 / 符号
+        | 0x3041..=0x33FF    // 假名 / 注音 / CJK 兼容
+        | 0x3400..=0x4DBF    // CJK 扩展 A
+        | 0x4E00..=0x9FFF    // CJK 统一表意
+        | 0xA000..=0xA4CF    // 彝文
+        | 0xAC00..=0xD7A3    // 谚文音节
+        | 0xF900..=0xFAFF    // CJK 兼容表意
+        | 0xFE30..=0xFE4F    // CJK 兼容形式
+        | 0xFF00..=0xFF60    // 全角 ASCII
+        | 0xFFE0..=0xFFE6    // 全角符号
+        | 0x2_0000..=0x3_FFFD // CJK 扩展 B+
+    )
 }
 
 /// 把 alacritty 的 Color 解析成 0xRRGGBB。is_fg 决定「默认色」取前景还是背景。
@@ -160,6 +180,13 @@ impl Terminal {
             cmd.cwd(dir);
         }
         cmd.env("TERM", "xterm-256color");
+        // UTF-8 locale（对齐 Zed terminal 的做法）：双击 .app 启动时系统环境极简、
+        // 没有 LANG，zsh 会落到 C/POSIX locale，把 starship 输出的多字节 UTF-8 续字节
+        // 当成一个个 C1 控制符转义成 <009a> 之类，满屏乱码。父环境没设 LANG 才补
+        // en_US.UTF-8（尊重用户已设的 locale），保证 .app 双击也能正常显示中文/图标。
+        if std::env::var("LANG").is_err() {
+            cmd.env("LANG", "en_US.UTF-8");
+        }
         let _child = pair.slave.spawn_command(cmd)?;
 
         // 2) alacritty 终端状态机
@@ -251,8 +278,23 @@ impl Terminal {
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            // 宽字符占两格：第二格是 WIDE_CHAR_SPACER 占位，怎么处理取决于前一个宽字符：
+            // - 东方全角文字（CJK / 假名 / 谚文 / 全角）：等宽字体里字形精确占两格，
+            //   占位格用 '\0' 跳过，否则多画一格空格 → 中文字距过大。
+            // - emoji / 符号：走系统彩色字体 fallback，字形宽度不足两格，占位格保留
+            //   空格补齐，否则少半格导致光标 / prompt 错位。
+            let ch = if flags.contains(Flags::WIDE_CHAR_SPACER) {
+                let prev = row.last().map(|c| c.ch).unwrap_or(' ');
+                if is_wide_cjk(prev) {
+                    '\0'
+                } else {
+                    ' '
+                }
+            } else {
+                cell.c
+            };
             row.push(Cell {
-                ch: cell.c,
+                ch,
                 fg,
                 bg,
                 bold: flags.contains(Flags::BOLD),

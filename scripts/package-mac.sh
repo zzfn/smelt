@@ -7,7 +7,7 @@
 #
 # 产物：
 #   dist/Smelt.app     —— 可双击运行的应用
-#   dist/Smelt.zip     —— 发给同事的分发件（含 app + 安装说明）
+#   dist/Smelt.dmg     —— 发给同事的分发件（定制拖拽安装窗口）
 set -euo pipefail
 
 APP_NAME="Smelt"
@@ -83,43 +83,66 @@ PLIST
 # 去掉本机 quarantine，方便自测双击打开
 xattr -cr "$APP" || true
 
-echo "▶ 生成安装说明 …"
-cat > "$DIST/INSTALL.txt" <<'TXT'
-Smelt 安装说明（Apple Silicon Mac）
-====================================
-
-这个 app 没有做苹果签名，首次打开会提示「无法验证开发者」，属正常。
-二选一放行：
-
-方式 A（推荐，最快）：
-  1. 把 Smelt.app 拖进「应用程序」文件夹
-  2. 打开「终端」，粘贴执行：
-       xattr -dr com.apple.quarantine /Applications/Smelt.app
-  3. 之后双击正常打开
-
-方式 B（不想用终端）：
-  1. 右键点 Smelt.app → 选「打开」
-  2. 弹窗里再点一次「打开」
-  （只需这样做一次，之后可正常双击）
-TXT
-
-echo "▶ 打 zip …"
-( cd "$DIST" && rm -f "$APP_NAME.zip" && zip -q -r -X "$APP_NAME.zip" "$APP_NAME.app" "INSTALL.txt" )
-
-echo "▶ 打 dmg …"
-# staging 里放 app + 一个指向 /Applications 的软链接：挂载后同事把 app
-# 图标拖到 Applications 文件夹即完成安装（经典 Mac 拖拽安装体验）。
+echo "▶ 打 dmg（定制安装窗口）…"
+# staging：app + 指向 /Applications 的软链 + 隐藏背景图。挂载后是一个固定尺寸、
+# 带背景箭头的窗口，把 app 拖到「应用程序」即完成安装（精致拖拽安装体验）。
 STAGE="$DIST/.dmg_stage"
-rm -rf "$STAGE"; mkdir -p "$STAGE"
+rm -rf "$STAGE"; mkdir -p "$STAGE/.background"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-cp "$DIST/INSTALL.txt" "$STAGE/"
+
+# 背景图（@1x + @2x 合成 retina 多分辨率 tiff）；缺 Pillow 则退化为无背景。
+BG1="$DIST/.dmgbg.png"; BG2="$DIST/.dmgbg@2x.png"
+if python3 "$ROOT/scripts/make-dmg-bg.py" "$BG1" "$BG2" >/dev/null 2>&1; then
+  tiffutil -cathidpicheck "$BG1" "$BG2" -out "$STAGE/.background/bg.tiff" >/dev/null 2>&1 || true
+fi
+rm -f "$BG1" "$BG2"
+
+VOL="$APP_NAME"
+RW="$DIST/.rw.dmg"
+rm -f "$RW"
+hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RW" >/dev/null
+
+DEV="$(hdiutil attach -readwrite -noverify -noautoopen "$RW" | grep -E '^/dev/' | head -1 | awk '{print $1}')"
+sleep 1
+
+# 有背景 tiff 才设背景，否则只做布局定制。
+if [[ -f "$STAGE/.background/bg.tiff" ]]; then
+  BG_CMD='set background picture of theViewOptions to file ".background:bg.tiff"'
+else
+  BG_CMD=''
+fi
+
+# AppleScript 定制挂载窗口：隐藏工具栏/状态栏、固定尺寸、图标摆位（app 左 / 应用程序 右）。
+osascript <<EOA || echo "  ⚠ Finder 定制被跳过（首次可能需在「系统设置→隐私与安全性→自动化」允许终端控制 Finder）；dmg 仍可用"
+tell application "Finder"
+  tell disk "$VOL"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {200, 120, 840, 548}
+    set theViewOptions to the icon view options of container window
+    set arrangement of theViewOptions to not arranged
+    set icon size of theViewOptions to 128
+    $BG_CMD
+    set position of item "$APP_NAME.app" of container window to {160, 210}
+    set position of item "Applications" of container window to {480, 210}
+    update without registering applications
+    delay 1
+    close
+  end tell
+end tell
+EOA
+sync
+
+hdiutil detach "$DEV" >/dev/null 2>&1 || { sleep 2; hdiutil detach "$DEV" -force >/dev/null 2>&1 || true; }
+
 rm -f "$DIST/$APP_NAME.dmg"
-hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DIST/$APP_NAME.dmg" >/dev/null
-rm -rf "$STAGE"
+hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$DIST/$APP_NAME.dmg" >/dev/null
+rm -f "$RW"; rm -rf "$STAGE"
 
 echo ""
 echo "✅ 完成"
 echo "   应用：   $APP"
 echo "   分发件： $DIST/$APP_NAME.dmg  （发这个给同事，双击挂载后拖进 Applications）"
-echo "            $DIST/$APP_NAME.zip  （zip 备选，解压后自行拖入 Applications）"

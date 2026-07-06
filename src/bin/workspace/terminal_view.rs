@@ -136,7 +136,10 @@ impl TerminalView {
                 let mut line = String::new();
                 if lo <= hi {
                     for c in lo..=hi {
-                        line.push(row[c].ch);
+                        // 跳过宽字符占位（'\0'），避免复制出空字符。
+                        if row[c].ch != '\0' {
+                            line.push(row[c].ch);
+                        }
                     }
                 }
                 out.push_str(line.trim_end());
@@ -323,10 +326,14 @@ impl Render for TerminalView {
                 FONT_PX * CELL_W_RATIO
             };
             self.cell_w = cell_w; // 供鼠标坐标换算
-            // 可用网格区 = 自身尺寸减去左右 / 上下各一份内边距。
-            let cols = (((w - 2.0 * PAD_X).max(0.0) / cell_w).floor() as usize).clamp(4, 1000);
-            let grid_rows = (((h - 2.0 * PAD_Y).max(0.0) / LINE_PX).floor() as usize).clamp(2, 1000);
-            self.terminal.resize(grid_rows, cols);
+            // grid_size 未就绪（首帧为 0）时跳过 resize：保持 spawn 的默认 80 列，
+            // 等 canvas 量到真实尺寸再调（避免 w=0 把终端缩成最小 4 列）。
+            if w > 1.0 && h > 1.0 {
+                // 可用网格区 = 自身尺寸减去左右 / 上下各一份内边距。
+                let cols = (((w - 2.0 * PAD_X) / cell_w).floor() as usize).clamp(4, 1000);
+                let grid_rows = (((h - 2.0 * PAD_Y) / LINE_PX).floor() as usize).clamp(2, 1000);
+                self.terminal.resize(grid_rows, cols);
+            }
         }
 
         let frame = self.terminal.snapshot();
@@ -341,6 +348,21 @@ impl Render for TerminalView {
         let origin_cell = self.grid_origin.clone();
         let size_cell = self.grid_size.clone();
 
+        // 背景层：底色（带透明度）+ 可选背景图，铺在终端内容之下。
+        // 终端「默认底色」格子渲染时留空（见 render_row），故背景层能透出。
+        let ap = cx.global::<crate::Appearance>().clone();
+        let mut bg_layer = div().absolute().inset_0().bg(rgb(ap.bg_color));
+        if let Some(path) = &ap.bg_image {
+            bg_layer = bg_layer.child(
+                img(std::path::PathBuf::from(path))
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .object_fit(ObjectFit::Cover),
+            );
+        }
+        let bg_layer = bg_layer.opacity(ap.opacity);
+
         div()
             .relative()
             .track_focus(&self.focus_handle)
@@ -350,7 +372,6 @@ impl Render for TerminalView {
             .overflow_hidden()
             .min_w_0()
             .min_h_0()
-            .bg(rgb(0x1a1b26))
             .text_color(rgb(0xc0caf5))
             .font_family(FONT_FAMILY)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
@@ -462,6 +483,8 @@ impl Render for TerminalView {
                     }
                 }),
             )
+            // 背景层（最底）：底色 / 背景图 / 透明度
+            .child(bg_layer)
             // 终端主体：逐行渲染 alacritty 网格快照（带颜色 / 光标）
             .child(
                 div()
@@ -519,12 +542,24 @@ impl Render for TerminalView {
 /// 渲染一行：整行作为一个 StyledText，逐段用 TextRun 上色（前景+背景+粗体+下划线）。
 /// 整行只整形一次 —— 拖选拆分不抖、宽度精确不截断。光标单元反色、选区单元高亮。
 fn render_row(
-    row: Vec<terminal::Cell>,
+    mut row: Vec<terminal::Cell>,
     cursor_col: Option<usize>,
     sel: Option<(usize, usize)>,
     base_font: &Font,
     hover_link: Option<(usize, usize)>,
 ) -> Div {
+    // 去掉行尾的填充空格 / 宽字符占位：终端每行都被补空格到满列宽（如 167 格），
+    // 整行丢给 StyledText 会因字体自由排版累计宽度超容器而「自动折行」。只渲染到
+    // 内容末尾（或光标处）即可，宽度远小于容器，不再折行。
+    let mut end = row
+        .iter()
+        .rposition(|c| c.ch != ' ' && c.ch != '\0')
+        .map_or(0, |i| i + 1);
+    if let Some(cc) = cursor_col {
+        end = end.max(cc + 1);
+    }
+    row.truncate(end.min(row.len()));
+
     let is_sel = |i: usize| sel.map_or(false, |(lo, hi)| i >= lo && i <= hi);
     let is_link = |i: usize| hover_link.map_or(false, |(a, b)| i >= a && i <= b);
     // 悬停链接：高亮色 + 下划线；再叠加光标反色 / 选区背景。
@@ -554,8 +589,11 @@ fn render_row(
         let mut seg_len = 0usize;
         while i < row.len() && style_of(i) == style {
             let ch = row[i].ch;
-            line.push(ch);
-            seg_len += ch.len_utf8();
+            // 宽字符占位（'\0'）不输出：让前一个全角字形自然占满两格。
+            if ch != '\0' {
+                line.push(ch);
+                seg_len += ch.len_utf8();
+            }
             i += 1;
         }
         let mut fnt = base_font.clone();
@@ -566,7 +604,8 @@ fn render_row(
             len: seg_len,
             font: fnt,
             color: Hsla::from(rgb(fg)),
-            background_color: Some(Hsla::from(rgb(bg))),
+            // 默认底色格子留空（不画背景），让下面的背景层 / 图片 / 桌面透出。
+            background_color: (bg != terminal::DEFAULT_BG).then(|| Hsla::from(rgb(bg))),
             underline: underline.then(|| UnderlineStyle {
                 thickness: px(1.0),
                 color: Some(Hsla::from(rgb(fg))),

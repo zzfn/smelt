@@ -32,6 +32,9 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 use terminal_view::TerminalView;
 
+// Cmd+Q 退出的应用级 action（gpui 无默认菜单栏，需自建菜单栏 + 键位绑定）。
+gpui::actions!(smelt, [Quit]);
+
 /// 命令面板里的一个可执行动作。
 #[derive(Clone)]
 enum Cmd {
@@ -166,16 +169,45 @@ enum Pane {
     },
 }
 
-/// 由一组终端建初始布局：单个即叶子，多个横向并排（后续可拖拽 / 再切分）。
-fn build_layout(tabs: &[Entity<TerminalView>], cx: &mut Context<Workspace>) -> Pane {
-    if tabs.len() == 1 {
-        Pane::Leaf(tabs[0].clone())
-    } else {
-        let state = cx.new(|_| ResizableState::default());
-        Pane::Split {
-            axis: Axis::Horizontal,
-            state,
-            children: tabs.iter().map(|t| Pane::Leaf(t.clone())).collect(),
+/// 一个会话 = 一棵独立分屏树 + 会话内当前活动 pane（终端）。
+/// 侧栏每条对应一个会话；主区显示当前会话的分屏树。
+struct Session {
+    layout: Pane,
+    active: Entity<TerminalView>,
+}
+
+impl Session {
+    /// 单终端会话。
+    fn single(view: Entity<TerminalView>) -> Self {
+        Self { layout: Pane::Leaf(view.clone()), active: view }
+    }
+
+    /// 会话标题：取活动终端标题（cwd 末段）。
+    fn title(&self, cx: &App) -> String {
+        self.active.read(cx).title().to_string()
+    }
+
+    /// 会话工作目录：活动终端的 cwd（侧栏分组用）。
+    fn cwd(&self, cx: &App) -> Option<String> {
+        self.active.read(cx).cwd()
+    }
+
+    /// 会话内 pane 数（判断 Cmd+W 是关 pane 还是关整会话）。
+    fn pane_count(&self) -> usize {
+        let mut v = Vec::new();
+        collect_leaves(&self.layout, &mut v);
+        v.len()
+    }
+}
+
+/// 收集布局树里所有叶子终端（clone 句柄，顺序 = 深度优先遍历序）。
+fn collect_leaves(pane: &Pane, out: &mut Vec<Entity<TerminalView>>) {
+    match pane {
+        Pane::Leaf(t) => out.push(t.clone()),
+        Pane::Split { children, .. } => {
+            for c in children {
+                collect_leaves(c, out);
+            }
         }
     }
 }
@@ -264,17 +296,32 @@ struct GitDiff {
 /// 存 ~/.smelt/workspace.json，启动时据此重建分屏（结构 / 嵌套 / 方向完整恢复）。
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct WsState {
-    /// 主区分屏布局树（None = 旧存档 / 无，回退用 tabs 重建）。
+    /// 所有会话（每个 = 一棵分屏树 + 会话内活动叶子遍历序）。
     #[serde(default)]
-    layout: Option<PaneState>,
-    /// 活动叶子在布局树「深度优先遍历序」中的序号。
-    active: usize,
+    sessions: Vec<SessionState>,
+    /// 当前活动会话索引。
+    #[serde(default)]
+    active_session: usize,
     /// 会话侧栏拖出的宽度（px）；None = 用默认值。
     #[serde(default)]
     sidebar_w: Option<f32>,
-    /// 兼容旧存档：仅有终端 cwd 列表时据此重建（横向并排）。
+    // --- 以下为旧存档兼容字段（读到就迁移，不再写出）---
+    /// 旧格式：单棵分屏树。
+    #[serde(default)]
+    layout: Option<PaneState>,
+    /// 更旧格式：终端 cwd 列表（每个迁移成一个独立会话）。
     #[serde(default)]
     tabs: Vec<Option<String>>,
+    /// 旧格式的活动索引。
+    #[serde(default)]
+    active: usize,
+}
+
+/// 单个会话的持久化镜像：分屏树 + 会话内活动叶子（遍历序）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionState {
+    layout: PaneState,
+    active: usize,
 }
 
 /// 可序列化的分屏布局镜像：叶子存该终端 cwd，Split 存方向 + 子节点。
@@ -355,6 +402,64 @@ fn collect_leaf_ids(pane: &Pane, out: &mut Vec<EntityId>) {
     }
 }
 
+/// 终端外观设置（全局单例，供所有终端渲染读取；存 ~/.smelt/appearance.json）。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Appearance {
+    /// 终端底色（0xRRGGBB）。
+    bg_color: u32,
+    /// 背景图片绝对路径（None = 无）。
+    bg_image: Option<String>,
+    /// 不透明度 0.3–1.0；<1 时窗口转透明/模糊，桌面透出。
+    opacity: f32,
+    /// 毛玻璃模糊（macOS vibrancy，配合透明使用）。
+    blur: bool,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self { bg_color: 0x1a1b26, bg_image: None, opacity: 1.0, blur: false }
+    }
+}
+
+impl Global for Appearance {}
+
+impl Appearance {
+    /// 据当前设置推导窗口背景外观。
+    fn window_bg(&self) -> WindowBackgroundAppearance {
+        if self.blur {
+            WindowBackgroundAppearance::Blurred
+        } else if self.opacity < 1.0 {
+            WindowBackgroundAppearance::Transparent
+        } else {
+            WindowBackgroundAppearance::Opaque
+        }
+    }
+}
+
+/// 外观设置文件路径：~/.smelt/appearance.json。
+fn appearance_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".smelt").join("appearance.json"))
+}
+
+/// 读取外观设置；缺失/损坏回退默认。
+fn load_appearance() -> Appearance {
+    appearance_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 写回外观设置（失败静默忽略）。
+fn save_appearance(a: &Appearance) {
+    let Some(path) = appearance_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(a) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 /// 存档文件路径：~/.smelt/workspace.json。
 fn ws_state_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".smelt").join("workspace.json"))
@@ -368,10 +473,10 @@ fn load_ws_state() -> Option<WsState> {
 
 /// 工作台根视图：多标签终端管理器。
 struct Workspace {
-    tabs: Vec<Entity<TerminalView>>,
-    active: usize,
-    /// 主区终端分屏布局树（叶子引用 tabs 里的终端；与 tabs 保持同步）。
-    layout: Pane,
+    /// 所有会话；每个会话 = 一棵独立分屏树 + 会话内活动 pane。
+    sessions: Vec<Session>,
+    /// 当前活动会话索引（主区显示它、侧栏高亮它）。
+    active_session: usize,
     /// 主区当前视图：终端 / 文件树 / Git。
     view: MainView,
     /// 文件树里已展开的文件夹绝对路径。
@@ -388,6 +493,8 @@ struct Workspace {
     diff_split: bool,
     /// 左侧会话侧栏是否展开（Cmd+B 切换）。
     sidebar_open: bool,
+    /// 外观设置面板是否打开（标题栏齿轮切换）。
+    settings_open: bool,
     /// 命令面板（Cmd+K）；None 表示未打开。搜索/导航/确认由 ListState 负责。
     palette: Option<Entity<ListState<CmdDelegate>>>,
     /// 命令面板的事件订阅（确认/取消）；随面板关闭一并释放。
@@ -407,35 +514,40 @@ struct Workspace {
 
 impl Workspace {
     fn new(cx: &mut Context<Self>) -> Self {
-        // 优先按存档的布局树重建分屏；旧存档（仅 tabs 列表）或无存档则回退横向并排。
+        // 优先按存档的会话列表重建；旧存档（单树 / cwd 列表）迁移，无存档则默认单会话。
         let saved = load_ws_state();
         let sidebar_w = saved.as_ref().and_then(|s| s.sidebar_w).unwrap_or(230.);
 
-        let mut tabs: Vec<Entity<TerminalView>> = Vec::new();
-        let mut layout;
-        let mut active;
-        match saved.as_ref().and_then(|s| s.layout.as_ref()) {
-            Some(ps) => {
-                layout = rebuild_pane(ps, &mut tabs, cx);
-                active = saved.as_ref().map_or(0, |s| s.active);
-            }
-            None => {
-                for cwd in saved.as_ref().map(|s| s.tabs.clone()).unwrap_or_default() {
-                    tabs.push(cx.new(|cx| TerminalView::new(cx, cwd)));
+        let mut sessions: Vec<Session> = Vec::new();
+        let mut active_session = 0;
+        if let Some(s) = saved.as_ref() {
+            if !s.sessions.is_empty() {
+                for ss in &s.sessions {
+                    let mut leaves = Vec::new();
+                    let layout = rebuild_pane(&ss.layout, &mut leaves, cx);
+                    if let Some(active) = leaves.get(ss.active).or_else(|| leaves.first()).cloned() {
+                        sessions.push(Session { layout, active });
+                    }
                 }
-                active = saved.as_ref().map_or(0, |s| s.active);
-                if tabs.is_empty() {
-                    tabs.push(cx.new(|cx| TerminalView::new(cx, current_dir())));
+                active_session = s.active_session;
+            } else if let Some(ps) = &s.layout {
+                // 旧格式：单棵树 → 一个会话。
+                let mut leaves = Vec::new();
+                let layout = rebuild_pane(ps, &mut leaves, cx);
+                if let Some(active) = leaves.get(s.active).or_else(|| leaves.first()).cloned() {
+                    sessions.push(Session { layout, active });
                 }
-                layout = build_layout(&tabs, cx);
+            } else {
+                // 更旧格式：cwd 列表 → 每个 cwd 一个独立会话。
+                for cwd in s.tabs.clone() {
+                    let v = cx.new(|cx| TerminalView::new(cx, cwd));
+                    sessions.push(Session::single(v));
+                }
+                active_session = s.active;
             }
         }
-        // 兜底（理论不会触发）+ 夹紧活动索引。
-        if tabs.is_empty() {
-            tabs.push(cx.new(|cx| TerminalView::new(cx, current_dir())));
-            layout = Pane::Leaf(tabs[0].clone());
-        }
-        active = active.min(tabs.len() - 1);
+        // 默认零会话：由用户自行「+ / 打开项目」创建，不再兜底建默认终端。
+        active_session = active_session.min(sessions.len().saturating_sub(1));
 
         // 订阅侧栏 resize：拖动完 emit Resized，写回存档以持久化宽度。
         let root_resize = cx.new(|_| ResizableState::default());
@@ -444,9 +556,8 @@ impl Workspace {
         });
 
         Self {
-            tabs,
-            active,
-            layout,
+            sessions,
+            active_session,
             view: MainView::Terminal,
             expanded: HashSet::new(),
             open_file: None,
@@ -455,6 +566,7 @@ impl Workspace {
             diff_gen: 0,
             diff_split: false,
             sidebar_open: true,
+            settings_open: false,
             palette: None,
             _palette_sub: None,
             git_files_scroll: ScrollHandle::new(),
@@ -466,60 +578,58 @@ impl Workspace {
         }
     }
 
-    /// 在指定目录新建终端，并在当前活动 pane 上横向切一刀放进布局树。
-    fn add_tab(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| TerminalView::new(cx, cwd));
-        self.insert_terminal(view, Axis::Horizontal, cx);
+    /// 当前活动会话（不可变引用）。
+    fn cur(&self) -> Option<&Session> {
+        self.sessions.get(self.active_session)
     }
 
-    /// 把新终端登记进 tabs，并在当前活动 pane 上按 axis 切一刀（保持 tabs 与布局树同步）。
-    fn insert_terminal(
-        &mut self,
-        view: Entity<TerminalView>,
-        axis: Axis,
-        cx: &mut Context<Self>,
-    ) {
-        let old = self.tabs.get(self.active).cloned();
-        self.tabs.push(view.clone());
-        self.active = self.tabs.len() - 1;
-        match old {
-            Some(old) => {
-                let state = cx.new(|_| ResizableState::default());
-                split_leaf(&mut self.layout, old.entity_id(), axis, state, view);
-            }
-            // tabs 原本为空（理论不会发生）：布局退化为单叶子。
-            None => self.layout = Pane::Leaf(view),
-        }
+    /// 「+」/新建：开一个独立新会话（单终端），并切过去。
+    fn add_session(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| TerminalView::new(cx, cwd));
+        self.sessions.push(Session::single(view));
+        self.active_session = self.sessions.len() - 1;
         self.save_state(cx);
         cx.notify();
     }
 
-    /// 在当前活动 pane 上分屏：Horizontal=右侧并排，Vertical=下方堆叠。
+    /// 在当前会话的活动 pane 上分屏：Horizontal=右侧并排，Vertical=下方堆叠。
     fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
-        let cwd = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.read(cx).cwd())
-            .or_else(current_dir);
+        let Some(sess) = self.cur() else { return };
+        let cwd = sess.active.read(cx).cwd().or_else(current_dir);
+        let old = sess.active.entity_id();
         let view = cx.new(|cx| TerminalView::new(cx, cwd));
-        self.insert_terminal(view, axis, cx);
+        let state = cx.new(|_| ResizableState::default());
+        let sess = &mut self.sessions[self.active_session];
+        split_leaf(&mut sess.layout, old, axis, state, view.clone());
+        sess.active = view;
+        self.save_state(cx);
+        cx.notify();
     }
 
-    /// 把分屏布局树 + 活动叶子（遍历序）+ 侧栏宽度写入 ~/.smelt/workspace.json（失败静默忽略）。
+    /// 把所有会话（各自分屏树 + 活动叶子遍历序）+ 侧栏宽度写入 workspace.json（失败静默忽略）。
     fn save_state(&self, cx: &mut Context<Self>) {
         let Some(path) = ws_state_path() else { return };
-        let layout = pane_to_state(&self.layout, cx);
-        // 活动索引按布局树遍历序存（与 rebuild_pane 的 push 顺序对齐）。
-        let mut ids = Vec::new();
-        collect_leaf_ids(&self.layout, &mut ids);
-        let active = self
-            .tabs
-            .get(self.active)
-            .map(|t| t.entity_id())
-            .and_then(|id| ids.iter().position(|x| *x == id))
-            .unwrap_or(0);
+        let sessions: Vec<SessionState> = self
+            .sessions
+            .iter()
+            .map(|s| {
+                let layout = pane_to_state(&s.layout, cx);
+                let mut ids = Vec::new();
+                collect_leaf_ids(&s.layout, &mut ids);
+                let active = ids
+                    .iter()
+                    .position(|x| *x == s.active.entity_id())
+                    .unwrap_or(0);
+                SessionState { layout, active }
+            })
+            .collect();
         let sidebar_w = self.root_resize.read(cx).sizes().first().copied().map(f32::from);
-        let state = WsState { layout: Some(layout), active, sidebar_w, tabs: Vec::new() };
+        let state = WsState {
+            sessions,
+            active_session: self.active_session,
+            sidebar_w,
+            ..Default::default()
+        };
         if let Ok(json) = serde_json::to_string_pretty(&state) {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -528,17 +638,13 @@ impl Workspace {
         }
     }
 
-    /// 「+」新建标签：继承当前活动标签的目录。
+    /// 「+」新建会话：继承当前会话活动终端的目录。
     fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let cwd = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.read(cx).cwd())
-            .or_else(current_dir);
-        self.add_tab(cwd, cx);
+        let cwd = self.cur().and_then(|s| s.cwd(cx)).or_else(current_dir);
+        self.add_session(cwd, cx);
     }
 
-    /// 「打开项目」：弹原生选择框选一个目录，在其中开新标签。
+    /// 「打开项目」：弹原生选择框选一个目录，在其中开新会话。
     fn open_project(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -550,68 +656,87 @@ impl Workspace {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(dir) = paths.into_iter().next() {
                     let dir = dir.to_str().map(String::from);
-                    this.update(cx, |this, cx| this.add_tab(dir, cx)).ok();
+                    this.update(cx, |this, cx| this.add_session(dir, cx)).ok();
                 }
             }
         })
         .detach();
     }
 
-    /// 打开从 Finder 拖入的路径为项目：文件夹直接用，文件取其父目录，各开一个新标签。
+    /// 从 Finder 拖入的路径各开一个会话：文件夹直接用，文件取其父目录。
     fn open_paths(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
         for p in paths {
             let dir = if p.is_dir() { Some(p.as_path()) } else { p.parent() };
             if let Some(d) = dir.and_then(|d| d.to_str()) {
-                self.add_tab(Some(d.to_string()), cx);
+                self.add_session(Some(d.to_string()), cx);
             }
         }
     }
 
-    fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if self.tabs.len() <= 1 || ix >= self.tabs.len() {
-            return; // 至少保留一个终端
+    /// 关闭第 ix 个会话（至少保留一个）。
+    fn close_session(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.sessions.len() <= 1 || ix >= self.sessions.len() {
+            return;
         }
-        let target = self.tabs[ix].entity_id();
-        remove_leaf(&mut self.layout, target);
-        self.tabs.remove(ix);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        } else if self.active > ix {
-            self.active -= 1;
+        self.sessions.remove(ix);
+        if self.active_session >= self.sessions.len() {
+            self.active_session = self.sessions.len() - 1;
+        } else if self.active_session > ix {
+            self.active_session -= 1;
         }
         self.save_state(cx);
         cx.notify();
     }
 
-    /// 关闭当前活动 pane。
-    fn close_active(&mut self, cx: &mut Context<Self>) {
-        self.close_tab(self.active, cx);
+    /// Cmd+W：会话内多 pane 时关掉活动 pane（切到相邻），否则关整个会话。
+    fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sess) = self.cur() else { return };
+        if sess.pane_count() > 1 {
+            let target = sess.active.entity_id();
+            let sess = &mut self.sessions[self.active_session];
+            remove_leaf(&mut sess.layout, target);
+            let mut leaves = Vec::new();
+            collect_leaves(&sess.layout, &mut leaves);
+            if let Some(first) = leaves.first().cloned() {
+                sess.active = first;
+            }
+            self.focus_active(window, cx);
+            self.save_state(cx);
+            cx.notify();
+        } else {
+            self.close_session(self.active_session, cx);
+            self.focus_active(window, cx);
+        }
     }
 
-    /// 按终端句柄聚焦对应 pane（点击 pane / 侧栏条目走这里）。
-    fn activate_entity(
+    /// 点击 pane：把它设为当前会话的活动 pane 并聚焦（不换会话）。
+    fn activate_pane(
         &mut self,
         e: &Entity<TerminalView>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ix) = self.tabs.iter().position(|t| t.entity_id() == e.entity_id()) {
-            self.activate(ix, window, cx);
+        if let Some(sess) = self.sessions.get_mut(self.active_session) {
+            sess.active = e.clone();
         }
+        let h = e.read(cx).focus_handle();
+        window.focus(&h, cx);
+        self.save_state(cx);
+        cx.notify();
     }
 
-    /// 聚焦当前活动终端。
+    /// 聚焦当前会话的活动终端。
     fn focus_active(&self, window: &mut Window, cx: &mut App) {
-        if let Some(t) = self.tabs.get(self.active) {
-            let h = t.read(cx).focus_handle();
+        if let Some(sess) = self.cur() {
+            let h = sess.active.read(cx).focus_handle();
             window.focus(&h, cx);
         }
     }
 
-    /// 切换到第 ix 个标签并聚焦。
+    /// 切换到第 ix 个会话并聚焦。
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix < self.tabs.len() {
-            self.active = ix;
+        if ix < self.sessions.len() {
+            self.active_session = ix;
             self.focus_active(window, cx);
             self.save_state(cx);
             cx.notify();
@@ -619,17 +744,258 @@ impl Workspace {
     }
 
     fn next_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.tabs.len();
+        let n = self.sessions.len();
         if n > 0 {
-            self.activate((self.active + 1) % n, window, cx);
+            self.activate((self.active_session + 1) % n, window, cx);
         }
     }
 
     fn prev_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.tabs.len();
+        let n = self.sessions.len();
         if n > 0 {
-            self.activate((self.active + n - 1) % n, window, cx);
+            self.activate((self.active_session + n - 1) % n, window, cx);
         }
+    }
+
+    /// 修改外观设置：改全局 + 存盘 + 同步窗口背景（透明/模糊）+ 触发重绘。
+    fn update_appearance(
+        &mut self,
+        window: &mut Window,
+        f: impl FnOnce(&mut Appearance),
+        cx: &mut Context<Self>,
+    ) {
+        let mut ap = cx.global::<Appearance>().clone();
+        f(&mut ap);
+        save_appearance(&ap);
+        let win_bg = ap.window_bg();
+        cx.set_global(ap);
+        window.set_background_appearance(win_bg);
+        cx.notify();
+    }
+
+    /// 设置 / 清除背景图（不影响窗口透明度，故无需 window）。
+    fn set_bg_image(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        let mut ap = cx.global::<Appearance>().clone();
+        ap.bg_image = path;
+        save_appearance(&ap);
+        cx.set_global(ap);
+        cx.notify();
+    }
+
+    /// 弹原生选择框选一张背景图。
+    fn pick_bg_image(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择背景图片".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(p) =
+                    paths.into_iter().next().and_then(|p| p.to_str().map(String::from))
+                {
+                    this.update(cx, |this, cx| this.set_bg_image(Some(p), cx)).ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 渲染外观设置浮层（标题栏齿轮打开）：背景色 / 背景图 / 不透明度 / 模糊。
+    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (fg, muted, border, popover, ring) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground, t.border, t.popover, t.ring)
+        };
+        let ap = cx.global::<Appearance>().clone();
+
+        // 预设背景色：名称仅作区分，值为 0xRRGGBB。
+        let presets: [u32; 6] =
+            [0x1a1b26, 0x000000, 0x1e1e1e, 0x0d1117, 0x1c1917, 0x0f1a17];
+        let swatches: Vec<_> = presets
+            .iter()
+            .map(|&color| {
+                let sel = ap.bg_color == color;
+                div()
+                    .id(("bg-swatch", color as usize))
+                    .size_6()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(color))
+                    .border_2()
+                    .border_color(if sel { ring } else { border })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.update_appearance(window, move |a| a.bg_color = color, cx)
+                        }),
+                    )
+            })
+            .collect();
+
+        // 不透明度档位。
+        let opacity_row: Vec<_> = [100u32, 90, 80, 70, 60]
+            .iter()
+            .map(|&pct| {
+                let val = pct as f32 / 100.0;
+                let sel = (ap.opacity - val).abs() < 0.005;
+                div()
+                    .id(("op", pct as usize))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(if sel { fg } else { muted })
+                    .bg(if sel { border } else { popover })
+                    .hover(|s| s.bg(border))
+                    .child(format!("{pct}%"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.update_appearance(window, move |a| a.opacity = val, cx)
+                        }),
+                    )
+            })
+            .collect();
+
+        let blur_on = ap.blur;
+        let blur_chip = div()
+            .id("blur")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(if blur_on { fg } else { muted })
+            .bg(if blur_on { border } else { popover })
+            .hover(|s| s.bg(border))
+            .child(if blur_on { "毛玻璃 · 开" } else { "毛玻璃 · 关" }.to_string())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.update_appearance(window, |a| a.blur = !a.blur, cx)
+                }),
+            );
+
+        let pick_btn = div()
+            .id("pick-img")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(fg)
+            .bg(popover)
+            .hover(|s| s.bg(border))
+            .child("选择图片…".to_string())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _w, cx| this.pick_bg_image(cx)),
+            );
+        let clear_btn = div()
+            .id("clear-img")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(muted)
+            .bg(popover)
+            .hover(|s| s.bg(border))
+            .child("清除".to_string())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _w, cx| this.set_bg_image(None, cx)),
+            );
+        let img_name = ap
+            .bg_image
+            .as_deref()
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("无")
+            .to_string();
+
+        let section = |title: &str| div().text_xs().text_color(muted).child(title.to_string());
+
+        // 点背景空白关闭；面板停在右上（齿轮下方）。
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _w, cx| {
+                    this.settings_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(40.))
+                    .right(px(8.))
+                    .w(px(280.))
+                    .bg(popover)
+                    .border_1()
+                    .border_color(border)
+                    .rounded_lg()
+                    .shadow_lg()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    // 点面板内部不冒泡到背景，避免误关。
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().font_bold().text_color(fg).child("外观"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(section("背景色"))
+                            .child(div().flex().gap_2().flex_wrap().children(swatches)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(section("背景图片"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(pick_btn)
+                                    .child(clear_btn)
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(img_name),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(section("不透明度"))
+                            .child(div().flex().gap_1().children(opacity_row)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(section("背景模糊"))
+                            .child(blur_chip),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// 文件树：展开/收起一个文件夹。
@@ -749,17 +1115,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 全部命令（含逐标签切换）。
+    /// 全部命令（含逐会话切换）。
     fn all_commands(&self, cx: &App) -> Vec<(String, Cmd)> {
         let mut v = vec![
-            ("新建标签".to_string(), Cmd::NewTab),
+            ("新建会话".to_string(), Cmd::NewTab),
             ("打开项目…".to_string(), Cmd::OpenProject),
-            ("关闭当前标签".to_string(), Cmd::CloseTab),
-            ("下一个标签".to_string(), Cmd::NextTab),
-            ("上一个标签".to_string(), Cmd::PrevTab),
+            ("关闭当前会话/窗格".to_string(), Cmd::CloseTab),
+            ("下一个会话".to_string(), Cmd::NextTab),
+            ("上一个会话".to_string(), Cmd::PrevTab),
         ];
-        for (i, t) in self.tabs.iter().enumerate() {
-            v.push((format!("切换到: {}", t.read(cx).title()), Cmd::SwitchTab(i)));
+        for (i, s) in self.sessions.iter().enumerate() {
+            v.push((format!("切换到: {}", s.title(cx)), Cmd::SwitchTab(i)));
         }
         v
     }
@@ -769,19 +1135,9 @@ impl Workspace {
         match cmd {
             Cmd::NewTab => self.new_tab(cx),
             Cmd::OpenProject => self.open_project(cx),
-            Cmd::CloseTab => self.close_tab(self.active, cx),
-            Cmd::NextTab => {
-                let n = self.tabs.len();
-                if n > 0 {
-                    self.activate((self.active + 1) % n, window, cx);
-                }
-            }
-            Cmd::PrevTab => {
-                let n = self.tabs.len();
-                if n > 0 {
-                    self.activate((self.active + n - 1) % n, window, cx);
-                }
-            }
+            Cmd::CloseTab => self.close_active(window, cx),
+            Cmd::NextTab => self.next_active(window, cx),
+            Cmd::PrevTab => self.prev_active(window, cx),
             Cmd::SwitchTab(i) => self.activate(i, window, cx),
         }
     }
@@ -792,9 +1148,8 @@ impl Workspace {
         match pane {
             Pane::Leaf(t) => {
                 let active = self
-                    .tabs
-                    .get(self.active)
-                    .is_some_and(|a| a.entity_id() == t.entity_id());
+                    .cur()
+                    .is_some_and(|s| s.active.entity_id() == t.entity_id());
                 // 叠加层（absolute，不占布局、不挡点击）区分活动 / 非活动：
                 // 活动 pane 用 ring 色描一圈；非活动 pane 整块压暗拉开对比。
                 let overlay = if active {
@@ -814,11 +1169,11 @@ impl Workspace {
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
-                    // 点击非活动 pane 即聚焦它（终端自身也会抢焦点，二者一致）。
+                    // 点击 pane 即设为当前会话的活动 pane（终端自身也会抢焦点，二者一致）。
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, window, cx| {
-                            this.activate_entity(&te, window, cx)
+                            this.activate_pane(&te, window, cx)
                         }),
                     )
                     .child(t.clone())
@@ -844,34 +1199,33 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.active;
-        let can_close = self.tabs.len() > 1;
+        let active = self.active_session;
+        let can_close = self.sessions.len() > 1;
 
         // 主题色 token（跟随 gpui-component 主题，替代硬编码）
-        let (c_bg, c_border, c_popover, c_muted) = {
+        let (c_bg, c_border, c_popover, c_muted, c_fg) = {
             let t = cx.theme();
-            (t.background, t.border, t.popover, t.muted_foreground)
+            (t.background, t.border, t.popover, t.muted_foreground, t.foreground)
         };
 
-        // 先收集标签标题，释放对 self.tabs 的借用
+        // 会话标题（取活动终端的 cwd 末段）
         let titles: Vec<(usize, String)> = self
-            .tabs
+            .sessions
             .iter()
             .enumerate()
-            .map(|(ix, v)| (ix, v.read(cx).title().to_string()))
+            .map(|(ix, s)| (ix, s.title(cx)))
             .collect();
-        // 当前活动标签的标题：放到标题栏右侧作为上下文提示。
+        // 当前活动会话的标题：放到标题栏右侧作为上下文提示。
         let active_title = titles
             .iter()
             .find(|(ix, _)| *ix == active)
             .map(|(_, t)| t.clone())
             .unwrap_or_default();
 
-        // 左侧会话侧栏
-        // 按 cwd 把终端分组成项目（保持出现顺序）
+        // 左侧会话侧栏：按会话的 cwd 分组成项目（保持出现顺序）
         let mut projects: Vec<(String, Vec<usize>)> = Vec::new();
         for (ix, _title) in titles.iter() {
-            let cwd = self.tabs[*ix].read(cx).cwd().unwrap_or_default();
+            let cwd = self.sessions[*ix].cwd(cx).unwrap_or_default();
             let name = cwd
                 .trim_end_matches('/')
                 .rsplit('/')
@@ -885,14 +1239,14 @@ impl Render for Workspace {
             }
         }
 
-        // 项目 → 终端 两级菜单（gpui-component Sidebar）。
+        // 项目 → 会话 两级菜单（gpui-component Sidebar）。
         // Sidebar 组件的回调是 Fn(&_, &mut Window, &mut App)，拿不到 Context<Self>，
         // 故捕获 entity 句柄在闭包里 update 自身。
         let this = cx.entity();
         let menu_items: Vec<SidebarMenuItem> = projects
             .iter()
             .map(|(name, ixs)| {
-                let term_items: Vec<SidebarMenuItem> = ixs
+                let sess_items: Vec<SidebarMenuItem> = ixs
                     .iter()
                     .map(|&ix| {
                         let title = titles.get(ix).map(|(_, t)| t.clone()).unwrap_or_default();
@@ -907,14 +1261,14 @@ impl Render for Workspace {
                             let e_close = this.clone();
                             item = item.suffix(move |_w, _cx| {
                                 let e = e_close.clone();
-                                Button::new(("close-tab", ix))
+                                Button::new(("close-session", ix))
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::CircleX)
                                     .on_click(move |_ev, _w, cx| {
-                                        // 别把点击冒泡成「切换到该终端」
+                                        // 别把点击冒泡成「切换到该会话」
                                         cx.stop_propagation();
-                                        e.update(cx, |ws, cx| ws.close_tab(ix, cx));
+                                        e.update(cx, |ws, cx| ws.close_session(ix, cx));
                                     })
                             });
                         }
@@ -925,7 +1279,7 @@ impl Render for Workspace {
                     .icon(IconName::Folder)
                     .default_open(true)
                     .click_to_toggle(true)
-                    .children(term_items)
+                    .children(sess_items)
             })
             .collect();
 
@@ -948,12 +1302,54 @@ impl Render for Workspace {
                     .child(open_project_button(cx)),
             );
 
-        // 主内容：分屏布局树（递归 Split，叶子是终端）。
-        let content = div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .child(self.render_pane(&self.layout, "pane", cx));
+        // 主内容：有会话就渲染当前会话的分屏布局树；无会话显示空状态引导。
+        // 需 .flex()，否则单 pane 的叶子 flex_1 不生效、塌缩到内容高度（边框不到底）。
+        let content = if self.sessions.get(self.active_session).is_some() {
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .child(self.render_pane(&self.sessions[self.active_session].layout, "pane", cx))
+        } else {
+            // 空状态：引导用户新建会话 / 打开项目。
+            let btn = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .px_3()
+                    .py(px(6.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(c_border)
+                    .text_color(c_fg)
+                    .text_sm()
+                    .hover(|s| s.bg(c_border))
+                    .child(label.to_string())
+            };
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_4()
+                .child(Icon::new(IconName::SquareTerminal).size(px(40.)).text_color(c_muted))
+                .child(div().text_color(c_muted).child("还没有会话"))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(btn("empty-new", "+ 新建会话").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _w, cx| this.new_tab(cx)),
+                        ))
+                        .child(btn("empty-open", "打开项目…").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _w, cx| this.open_project(cx)),
+                        )),
+                )
+        };
 
         // 命令面板弹层：搜索框 + 候选列表全部由 ListState 渲染。
         let palette_overlay = self.palette.as_ref().map(|state| {
@@ -1025,8 +1421,9 @@ impl Render for Workspace {
                         };
                         this.split_active(axis, cx);
                     }
-                    // Cmd+W 关闭当前 pane（至少留一个）
-                    "w" => this.close_active(cx),
+                    // Cmd+W 关闭当前 pane；会话只剩一个 pane 时关掉整个会话（至少留一个会话）
+                    "w" => this.close_active(window, cx),
+                    // Cmd+Q 退出交给应用菜单的 Quit action（全局绑定，见 main）
                     _ => {}
                 }
             }))
@@ -1036,10 +1433,39 @@ impl Render for Workspace {
                     div()
                         .flex()
                         .items_center()
-                        .gap_2()
-                        .child(Icon::new(IconName::SquareTerminal))
-                        .child(div().font_bold().child("smelt"))
-                        .child(div().text_color(c_muted).child(active_title)),
+                        .justify_between()
+                        .w_full()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Icon::new(IconName::SquareTerminal))
+                                .child(div().font_bold().child("smelt"))
+                                .child(div().text_color(c_muted).child(active_title)),
+                        )
+                        // 右侧齿轮：打开外观设置面板。stop_propagation 避免触发标题栏拖拽。
+                        .child(
+                            div()
+                                .id("settings-gear")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size_6()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_color(c_muted)
+                                .hover(|s| s.bg(c_border))
+                                .child(Icon::new(IconName::Settings))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _w, cx| {
+                                        cx.stop_propagation();
+                                        this.settings_open = !this.settings_open;
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
                 ),
             )
             // 主体：左侧会话侧栏 + 右侧主区，占满标题栏以下的剩余高度。
@@ -1090,7 +1516,7 @@ impl Render for Workspace {
                     .child(match self.view {
                         MainView::Terminal => content,
                         MainView::Files => {
-                            let cwd = self.tabs.get(active).and_then(|t| t.read(cx).cwd());
+                            let cwd = self.cur().and_then(|s| s.cwd(cx));
                             let tree = file_tree(cwd, &self.expanded, cx);
                             let content = file_content_pane(&self.open_file, &self.file_scroll, cx);
                             div()
@@ -1109,7 +1535,7 @@ impl Render for Workspace {
                                 .child(content)
                         }
                         MainView::Git => {
-                            let cwd = self.tabs.get(active).and_then(|t| t.read(cx).cwd());
+                            let cwd = self.cur().and_then(|s| s.cwd(cx));
                             git_view(
                                 cwd,
                                 &self.git_diff,
@@ -1125,6 +1551,8 @@ impl Render for Workspace {
             )
             // 命令面板（最上层）
             .children(palette_overlay)
+            // 外观设置浮层
+            .children(self.settings_open.then(|| self.render_settings(cx)))
     }
 }
 
@@ -1965,10 +2393,24 @@ fn main() {
         // 深色主题（与终端配色一致）
         Theme::change(ThemeMode::Dark, None, cx);
 
+        // 应用菜单栏 + Cmd+Q 退出：macOS 顶部「Smelt」菜单，含「退出 Smelt ⌘Q」。
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus(vec![
+            Menu::new("Smelt").items([MenuItem::action("退出 Smelt", Quit)]),
+        ]);
+
+        // 外观设置：读盘设为全局单例，据此确定窗口背景外观（透明 / 模糊）。
+        let appearance = load_appearance();
+        let window_bg = appearance.window_bg();
+        cx.set_global(appearance);
+
         cx.spawn(async move |cx| {
             let window_options = WindowOptions {
                 // 透明标题栏：红绿灯浮在内容上，拖拽 / 双击最大化由自定义 TitleBar 接管。
                 titlebar: Some(TitleBar::title_bar_options()),
+                // 透明/模糊背景（跟随外观设置；终端底色带 alpha 时桌面透出）。
+                window_background: window_bg,
                 ..Default::default()
             };
             cx.open_window(window_options, |window, cx| {
