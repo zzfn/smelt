@@ -40,6 +40,11 @@ const AFK_FRAMES: f32 = 20.0 * 600.0;
 /// 切换 app 后再评论的冷却帧数（20fps × ~75s）：频繁切 app 时不啰嗦。
 const APP_SWITCH_COOLDOWN: f32 = 20.0 * 75.0;
 
+/// 「忙碌值」超过此值判定情绪为 Busy。
+const BUSY_THRESHOLD: f32 = 2.2;
+/// 忙碌值每帧衰减系数（约 35s 半衰期）。
+const ENERGY_DECAY: f32 = 0.999;
+
 /// 点一下宠物轮换的台词。
 const LINES: &[&str] = &[
     "在忙什么呀？",
@@ -121,6 +126,17 @@ pub fn push_pet_message(cx: &App, text: impl Into<SharedString>) {
 
 // ===================== 视图 =====================
 
+/// 宠物的「情绪」：由光标静止时长 + 最近切 app 频率推出，驱动步速/停留时长/说话语气。
+#[derive(Clone, Copy, PartialEq)]
+enum Mood {
+    /// 光标长时间不动：悠闲放空，走得慢、歇得久。
+    Chill,
+    /// 默认状态：专注陪伴。
+    Focused,
+    /// 最近频繁切 app：走得快、歇得短，说话也带点紧张感。
+    Busy,
+}
+
 pub struct PetView {
     /// 单调递增的动画相位（弧度），驱动呼吸 / 浮动的 sin；每帧到 TAU 归零防精度漂移。
     phase: f32,
@@ -163,6 +179,8 @@ pub struct PetView {
     last_app: Option<String>,
     /// 切 app 评论的冷却计时（帧），>0 时不评论。
     app_switch_cd: f32,
+    /// 「忙碌值」：每次切 app 累加，逐帧衰减，用于推出情绪状态。
+    switch_energy: f32,
 }
 
 impl PetView {
@@ -173,7 +191,15 @@ impl PetView {
             Timer::after(FRAME).await;
             let alive = this
                 .update(cx, |this, cx| {
-                    this.phase += PHASE_STEP;
+                    // 忙碌值逐帧衰减；情绪越「忙碌」呼吸越快，越「悠闲」呼吸越慢——
+                    // 不开大脑时也有这层无声的情绪表达。
+                    this.switch_energy *= ENERGY_DECAY;
+                    let phase_mult = match this.mood() {
+                        Mood::Chill => 0.7,
+                        Mood::Focused => 1.0,
+                        Mood::Busy => 1.5,
+                    };
+                    this.phase += PHASE_STEP * phase_mult;
                     if this.phase > TAU {
                         this.phase -= TAU;
                     }
@@ -231,6 +257,10 @@ impl PetView {
                     if front != this.last_app {
                         let had_prev = this.last_app.is_some();
                         this.last_app = front.clone();
+                        if had_prev {
+                            // 切 app 记一笔「忙碌值」，不受评论冷却限制——即便不吭声，情绪也在累积。
+                            this.switch_energy = (this.switch_energy + 1.0).min(6.0);
+                        }
                         // 首次观测只记基线不评论；切到 smelt 自己也不评论。
                         if had_prev && this.app_switch_cd <= 0.0 {
                             if let Some(app) = front.filter(|a| a != "smelt" && a != "Smelt") {
@@ -294,15 +324,38 @@ impl PetView {
             afk_notified: false,
             last_app: None,
             app_switch_cd: 0.0,
+            switch_energy: 0.0,
         }
     }
 
-    /// 当前前台 app 的上下文串（喂给大脑，让搭话更贴合当下）；无则空串。
+    /// 当前前台 app + 情绪的上下文串（喂给大脑，让搭话更贴合当下）。
     fn app_ctx(&self) -> String {
-        self.last_app
+        let app_part = self
+            .last_app
             .as_deref()
-            .map(|a| format!("（主人现在在用 {a}）"))
-            .unwrap_or_default()
+            .map(|a| format!("在用 {a}，"))
+            .unwrap_or_default();
+        format!("（主人现在{app_part}此刻状态偏「{}」）", Self::mood_label(self.mood()))
+    }
+
+    /// 推出当前情绪：光标静止久 → 悠闲放空；最近频繁切 app → 忙碌紧张；否则专注陪伴。
+    fn mood(&self) -> Mood {
+        if self.still_frames > AFK_FRAMES / 3.0 {
+            Mood::Chill
+        } else if self.switch_energy > BUSY_THRESHOLD {
+            Mood::Busy
+        } else {
+            Mood::Focused
+        }
+    }
+
+    /// 情绪的中文描述，喂给 LLM 让语气贴合当下状态。
+    fn mood_label(mood: Mood) -> &'static str {
+        match mood {
+            Mood::Chill => "悠闲放空",
+            Mood::Focused => "专注陪伴",
+            Mood::Busy => "有点忙碌紧张",
+        }
     }
 
     /// 主动开口（受「播报开关」总控，且当前没在说话时才说）：
@@ -386,10 +439,13 @@ impl Render for PetView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cfg = cx.try_global::<PetConfig>().cloned().unwrap_or_default();
 
-        // 首帧剥离原生窗口外框（无边框 / 无阴影 / 透明）。
+        // 首帧剥离原生窗口外框（无边框 / 无阴影 / 透明），顺手把原生窗口指针存成
+        // 全局单例——设置面板切换显示开关时要用它直接 order 显隐（见 sync_visibility 的注释）。
         if !self.chrome_stripped {
             strip_native_chrome(window);
             self.chrome_stripped = true;
+            #[cfg(target_os = "macos")]
+            cx.set_global(PetWindowHandle(ns_window_of(window)));
         }
         // 显示开关变化时，order 原生窗口显隐（关掉时窗口彻底不挡点击）。
         if self.visible_applied != Some(cfg.enabled) {
@@ -688,13 +744,13 @@ fn strip_native_chrome(window: &Window) {
 #[cfg(not(target_os = "macos"))]
 fn strip_native_chrome(_window: &Window) {}
 
-/// 显隐原生窗口（显示开关关掉时 orderOut，彻底不挡点击）。
+/// 对一个原生 NSWindow 指针发 order 消息（提出 / 收起），供 `set_window_visible`
+/// 和 `sync_pet_window_visibility` 共用。
 #[cfg(target_os = "macos")]
-fn set_window_visible(window: &Window, visible: bool) {
+fn order_ns_window(ns_window: *mut objc::runtime::Object, visible: bool) {
     use objc::runtime::Object;
     use objc::{msg_send, sel, sel_impl};
 
-    let ns_window = ns_window_of(window);
     if ns_window.is_null() {
         return;
     }
@@ -706,6 +762,39 @@ fn set_window_visible(window: &Window, visible: bool) {
             let _: () = msg_send![ns_window, orderOut: nil];
         }
     }
+}
+
+/// 显隐原生窗口（显示开关关掉时 orderOut，彻底不挡点击）。
+#[cfg(target_os = "macos")]
+fn set_window_visible(window: &Window, visible: bool) {
+    order_ns_window(ns_window_of(window), visible);
+}
+
+/// 宠物原生窗口指针（macOS）。首帧渲染时缓存（见 `Render for PetView`），供
+/// `sync_pet_window_visibility` 直接 order 显隐，绕开会被 GPUI 按窗口 occlusion
+/// 状态整个停掉的渲染循环。
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct PetWindowHandle(*mut objc::runtime::Object);
+
+#[cfg(target_os = "macos")]
+impl Global for PetWindowHandle {}
+
+/// 设置面板切换宠物显示开关时，从 Workspace 侧直接调用，立即 order 显隐宠物窗口。
+///
+/// 不能指望宠物自己的 `render()` 去响应配置变化：GPUI 在 mac 上一旦窗口 occlusion
+/// 状态变 hidden 就会把驱动渲染的 DisplayLink 整个停掉（`windowDidChangeOcclusionState:`），
+/// `orderOut` 之后宠物窗口再也等不到下一次 render() 把自己重新 order 出来——先有鸡还是
+/// 先有蛋。这里绕开渲染循环，直接对缓存的原生窗口指针发 order 消息，从而触发 occlusion
+/// 状态变化、重新点亮 DisplayLink，宠物自己的动画循环下一帧就能接着正常跑，
+/// 内部的 `visible_applied` 也会在那一帧自愈同步。
+pub fn sync_pet_window_visibility(cx: &App, visible: bool) {
+    #[cfg(target_os = "macos")]
+    if let Some(handle) = cx.try_global::<PetWindowHandle>() {
+        order_ns_window(handle.0, visible);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (cx, visible);
 }
 
 #[cfg(not(target_os = "macos"))]

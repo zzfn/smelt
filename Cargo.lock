@@ -6576,6 +6576,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "core-foundation 0.10.0",
+ "core-graphics 0.24.0",
  "dirs 5.0.1",
  "gpui",
  "gpui-component",

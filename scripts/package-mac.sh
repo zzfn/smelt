@@ -108,6 +108,16 @@ PLIST
 # 去掉本机 quarantine，方便自测双击打开
 xattr -cr "$APP" || true
 
+# ad-hoc 签名（免费，不需要开发者证书）：只为给这个 app 一个稳定的身份锚点
+# （固定 bundle id + 签名),避免每次重新编译后 系统设置→隐私与安全性 里的辅助功能
+# 授权（划词翻译用到）失效——之前直接 `cargo run` 裸二进制没有 bundle/签名，
+# macOS 的 TCC 认不准身份，一重新编译权限就跑丢。注意：ad-hoc 签名不能让 Gatekeeper
+# 免弹「来自身份不明开发者」的警告（那个需要付费 Developer ID 证书 + 公证），
+# 这里只解决权限持久化，自用/局域网分发够用。
+echo "▶ ad-hoc 签名（免费，仅用于稳定权限身份，不影响 Gatekeeper 警告）…"
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP" && echo "  ✓ 签名校验通过"
+
 echo "▶ 打 dmg（定制安装窗口）…"
 # staging：app + 指向 /Applications 的软链 + 隐藏背景图。挂载后是一个固定尺寸、
 # 带背景箭头的窗口，把 app 拖到「应用程序」即完成安装（精致拖拽安装体验）。

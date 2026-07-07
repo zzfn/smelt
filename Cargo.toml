@@ -43,3 +43,7 @@ similar = "2"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 raw-window-handle = "0.6"
+# 划词翻译：CGEventTap 被动监听全局鼠标拖拽 + 模拟 Cmd+C 读剪贴板。
+# 版本对齐 cocoa/gpui_platform 依赖树里已解析的那一份，避免重复编译两份。
+core-graphics = "0.24"
+core-foundation = "0.10"

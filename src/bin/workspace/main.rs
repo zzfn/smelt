@@ -6,10 +6,13 @@
 //! 运行： cargo run --bin workspace
 
 mod agent;
+mod hotspot;
 mod pet;
 mod terminal;
 mod terminal_view;
+mod updater;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
@@ -157,13 +160,14 @@ impl ListDelegate for CmdDelegate {
     }
 }
 
-/// 主区视图：总览 / 终端 / 文件树 / Git。
+/// 主区视图：总览 / 终端 / 文件树 / Git / 热力图。
 #[derive(Clone, Copy, PartialEq)]
 enum MainView {
     Overview,
     Terminal,
     Files,
     Git,
+    Hotspot,
     Settings,
 }
 
@@ -696,6 +700,11 @@ struct Workspace {
     git_status: HashMap<String, (Instant, GitStatusData)>,
     /// 正在后台刷新 status 的 root（防重复并发 spawn）。
     git_status_inflight: HashSet<String>,
+    /// 热力图缓存（root → (取得时刻, 数据)）：`git log` 扫 90 天历史比 status 更慢，
+    /// 同样绝不在 render 里同步跑，后台算完缓存，render 只读。
+    hotspot_data: HashMap<String, (Instant, Rc<Vec<hotspot::HotspotEntry>>)>,
+    /// 正在后台计算热力的 root（防重复并发 spawn）。
+    hotspot_inflight: HashSet<String>,
     /// 调试 HUD 开关（Cmd+Shift+F 切换）：开启时右上角显示帧率 + 帧耗时。
     debug_hud: bool,
     /// 上一帧渲染时刻（算帧间隔用）。
@@ -704,6 +713,8 @@ struct Workspace {
     fps_ema: f32,
     /// 退出确认拦截弹窗开关
     show_quit_confirm: bool,
+    /// 在线更新状态机（检查/下载/暂存就绪），驱动设置页"更新"分区 + 齿轮强调色。
+    update_status: updater::UpdateStatus,
 }
 
 /// 宠物大脑配置的四个输入框（base_url / api_key / model / persona）。
@@ -757,7 +768,7 @@ impl Workspace {
             this.save_state(cx);
         });
 
-        let ws = Self {
+        let mut ws = Self {
             sessions,
             active_session,
             view: MainView::Terminal,
@@ -784,6 +795,8 @@ impl Workspace {
             git_cache: HashMap::new(),
             git_status: HashMap::new(),
             git_status_inflight: HashSet::new(),
+            hotspot_data: HashMap::new(),
+            hotspot_inflight: HashSet::new(),
             llm_inputs: None,
             llm_subs: Vec::new(),
             opacity_slider: None,
@@ -795,11 +808,14 @@ impl Workspace {
             last_frame: None,
             fps_ema: 0.0,
             show_quit_confirm: false,
+            update_status: updater::UpdateStatus::default(),
         };
         // 立即写盘：把本次启动生成/沿用的会话 id 落到存档。否则首启（或旧存档迁移）
         // 生成的新 id 只在内存里，若用户不做任何布局操作就退出，重开会因无 id 而
         // 新开 shell，守护里旧会话成孤儿 —— reattach 全靠这一步。
         ws.save_state(cx);
+        updater::cleanup_stale_backup();
+        ws.check_for_update(true, cx);
         ws
     }
 
@@ -1012,6 +1028,27 @@ impl Workspace {
         self.add_session(cwd, cx);
     }
 
+    /// 临时终端：不挂在任何项目下，固定落在 $HOME，侧栏单独分组「临时终端」。
+    /// 跟"打开项目/项目内新建"平级，但不需要先切到某个项目才能开。
+    fn new_scratch_session(&mut self, cx: &mut Context<Self>) {
+        self.add_session(scratch_dir(), cx);
+    }
+
+    /// 顶部「临时终端」入口：已有临时终端就切过去，没有才新开一个
+    /// （避免每次点这个常驻入口都新建一个空终端）。这个入口能从总览/设置页直接点，
+    /// `activate`/`add_session` 都不管 `self.view`，这里补上，否则点了但看不到终端。
+    fn activate_or_new_scratch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let home = scratch_dir();
+        let existing = self.sessions.iter().position(|s| s.cwd(cx) == home);
+        match existing {
+            Some(ix) => self.activate(ix, window, cx),
+            None => self.new_scratch_session(cx),
+        }
+        self.view = MainView::Terminal;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
     /// 「打开项目」：弹原生选择框选一个目录，在其中开新会话。
     fn open_project(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
@@ -1169,8 +1206,14 @@ impl Workspace {
     /// 修改桌面宠物配置：改全局 + 存盘 + 触发重绘。宠物窗口每帧读该全局，改动 ≤50ms 生效。
     fn update_pet_config(&mut self, f: impl FnOnce(&mut pet::PetConfig), cx: &mut Context<Self>) {
         let mut c = cx.global::<pet::PetConfig>().clone();
+        let was_enabled = c.enabled;
         f(&mut c);
         pet::save_pet_config(&c);
+        if c.enabled != was_enabled {
+            // 显示开关翻转：直接同步原生窗口显隐，不能只靠宠物自己的渲染循环去响应
+            // ——那条循环在窗口 orderOut 后会被 GPUI 停掉，见 sync_pet_window_visibility 的注释。
+            pet::sync_pet_window_visibility(cx, c.enabled);
+        }
         cx.set_global(c);
         cx.notify();
     }
@@ -1191,6 +1234,66 @@ impl Workspace {
         save_appearance(&ap);
         cx.set_global(ap);
         cx.notify();
+    }
+
+    /// 检查是否有新版本。`silent` 区分启动时的后台静默检查（离线/失败时不打扰用户，
+    /// 悄悄退回 Idle）和设置页手动点「检查更新」（失败要如实展示原因）。
+    /// 发现新版本会直接接上后台静默下载，不需要用户二次确认——这是"全自动静默更新"承诺的一环。
+    fn check_for_update(&mut self, silent: bool, cx: &mut Context<Self>) {
+        self.update_status = updater::UpdateStatus::Checking;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(updater::fetch_latest())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok((version, url)) if updater::is_newer(&version, env!("CARGO_PKG_VERSION")) => {
+                        this.start_update_download(version, url, cx);
+                        return; // start_update_download 里已经 notify 过
+                    }
+                    Ok(_) => this.update_status = updater::UpdateStatus::UpToDate,
+                    Err(e) => {
+                        this.update_status =
+                            if silent { updater::UpdateStatus::Idle } else { updater::UpdateStatus::Failed(e.to_string()) };
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 后台静默下载新版 dmg 并暂存好 `.app`，完成后置 `ReadyToInstall`（不重启、不打断）。
+    fn start_update_download(&mut self, version: String, url: String, cx: &mut Context<Self>) {
+        self.update_status = updater::UpdateStatus::Downloading { version: version.clone() };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let v = version.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(updater::download_and_stage(&url, &v))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_status = match result {
+                    Ok(staged_app) => updater::UpdateStatus::ReadyToInstall { version, staged_app },
+                    Err(e) => updater::UpdateStatus::Failed(e.to_string()),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 弹原生选择框选一张背景图。
@@ -1605,7 +1708,16 @@ impl Workspace {
                                     .cursor_pointer()
                                     .hover(move |s| s.bg(c_blue_hover))
                                     .child("确定退出")
-                                    .on_click(|_, _, cx| cx.quit())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        // 有暂存好的新版本就在退出前落盘替换；失败静默忽略，
+                                        // 不能因为自更新出岔子就把用户堵在退出流程里。
+                                        if let updater::UpdateStatus::ReadyToInstall { staged_app, .. } =
+                                            &this.update_status
+                                        {
+                                            let _ = updater::finalize_pending_update(staged_app);
+                                        }
+                                        cx.quit();
+                                    }))
                             )
                     )
             )
@@ -1619,47 +1731,57 @@ impl Workspace {
         };
         let ap = cx.global::<Appearance>().clone();
 
-        let blur_chip = Switch::new("blur").checked(ap.blur).label("毛玻璃").on_click(
+        let blur_chip = Switch::new("blur").checked(ap.blur).on_click(
             cx.listener(|this, checked: &bool, window, cx| {
                 let v = *checked;
                 this.update_appearance(window, move |a| a.blur = v, cx)
             }),
         );
 
-        let pick_btn = div()
-            .id("pick-img")
-            .px_3()
-            .py_1_5()
-            .rounded_md()
-            .cursor_pointer()
-            .text_xs()
-            .text_color(fg)
-            .bg(popover)
-            .border_1()
-            .border_color(border)
-            .hover(|s| s.bg(border))
-            .child("选择图片…".to_string())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _w, cx| this.pick_bg_image(cx)),
-            );
-        let clear_btn = div()
-            .id("clear-img")
-            .px_3()
-            .py_1_5()
-            .rounded_md()
-            .cursor_pointer()
-            .text_xs()
-            .text_color(muted)
-            .bg(popover)
-            .border_1()
-            .border_color(border)
-            .hover(|s| s.bg(border))
-            .child("清除".to_string())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _w, cx| this.set_bg_image(None, cx)),
-            );
+        // 统一的小按钮：固定高度 + flex_none，避免被 flex 布局拉伸成大块。
+        let btn = |id: &'static str, label: String| {
+            div()
+                .id(id)
+                .h(px(26.))
+                .px_3()
+                .flex()
+                .flex_none()
+                .items_center()
+                .rounded_md()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(fg)
+                .bg(popover)
+                .border_1()
+                .border_color(border)
+                .hover(|s| s.bg(border))
+                .child(label)
+        };
+        // 统一的设置行：左标签右控件，取代「标签在上、控件在下」的松散堆叠。
+        let row = |label: &str, control: AnyElement| {
+            h_flex()
+                .justify_between()
+                .items_center()
+                .gap_4()
+                .child(div().text_sm().text_color(fg).flex_none().child(label.to_string()))
+                .child(control)
+        };
+        // 每个分区一张圆角卡片：标题在外、内容带边框，取代原先的细分割线。
+        let card = |title: &str, body: Div| {
+            v_flex()
+                .gap_2()
+                .child(div().text_xs().font_semibold().text_color(muted).child(title.to_string()))
+                .child(body.p_4().rounded_lg().border_1().border_color(border))
+        };
+
+        let pick_btn = btn("pick-img", "选择图片…".into()).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _w, cx| this.pick_bg_image(cx)),
+        );
+        let clear_btn = btn("clear-img", "清除".into()).text_color(muted).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _w, cx| this.set_bg_image(None, cx)),
+        );
         let img_name = ap
             .bg_image
             .as_deref()
@@ -1667,17 +1789,15 @@ impl Workspace {
             .unwrap_or("无")
             .to_string();
 
-        let section = |title: &str| div().text_xs().font_semibold().text_color(muted).child(title.to_string());
-
         // —— 桌面宠物设置 ——
         let pc = cx.global::<pet::PetConfig>().clone();
-        let pet_show_chip = Switch::new("pet-show").checked(pc.enabled).label("显示").on_click(
+        let pet_show_chip = Switch::new("pet-show").checked(pc.enabled).on_click(
             cx.listener(|this, c: &bool, _w, cx| {
                 let v = *c;
                 this.update_pet_config(move |cfg| cfg.enabled = v, cx)
             }),
         );
-        let pet_notify_chip = Switch::new("pet-notify").checked(pc.notify).label("播报").on_click(
+        let pet_notify_chip = Switch::new("pet-notify").checked(pc.notify).on_click(
             cx.listener(|this, c: &bool, _w, cx| {
                 let v = *c;
                 this.update_pet_config(move |cfg| cfg.notify = v, cx)
@@ -1699,7 +1819,7 @@ impl Workspace {
             ]);
 
         let lc = cx.global::<agent::LlmConfig>().clone();
-        let llm_chip = Switch::new("pet-brain").checked(lc.enabled).label("大脑").on_click(
+        let llm_chip = Switch::new("pet-brain").checked(lc.enabled).on_click(
             cx.listener(|this, c: &bool, _w, cx| {
                 let v = *c;
                 this.update_llm_config(move |cfg| cfg.enabled = v, cx)
@@ -1764,65 +1884,43 @@ impl Workspace {
                                     }))
                             )
                     )
-                    // —— 外观设置部分 ——
-                    .child(
+                    // —— 外观 ——
+                    .child(card(
+                        "外观",
                         v_flex()
                             .gap_4()
-                            .child(div().text_lg().font_bold().text_color(fg).child("外观"))
+                            .child(row(
+                                "背景色",
+                                div()
+                                    .children(self.bg_color_picker.as_ref().map(|p| ColorPicker::new(p).small()))
+                                    .into_any_element(),
+                            ))
+                            .child(row(
+                                "背景图片",
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().text_xs().text_color(muted).child(img_name))
+                                    .child(pick_btn)
+                                    .child(clear_btn)
+                                    .into_any_element(),
+                            ))
                             .child(
                                 v_flex()
-                                    .gap_1()
-                                    .child(section("背景色"))
-                                    .children(self.bg_color_picker.as_ref().map(|p| ColorPicker::new(p).small())),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(section("背景图片"))
-                                    .child(
-                                        h_flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(pick_btn)
-                                            .child(clear_btn)
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .text_xs()
-                                                    .text_color(muted)
-                                                    .child(img_name),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(section("不透明度"))
+                                    .gap_2()
+                                    .child(div().text_sm().text_color(fg).child("不透明度"))
                                     .children(self.opacity_slider.as_ref().map(Slider::new)),
                             )
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .child(section("背景模糊"))
-                                    .child(blur_chip),
-                            )
-                    )
-                    .child(div().h(px(1.)).bg(border)) // 分割线
-                    // —— 桌面宠物设置部分 ——
-                    .child(
+                            .child(row("背景模糊", blur_chip.into_any_element())),
+                    ))
+                    // —— 桌面宠物 ——
+                    .child(card(
+                        "桌面宠物",
                         v_flex()
                             .gap_4()
-                            .child(div().text_lg().font_bold().text_color(fg).child("桌面宠物"))
-                            .child(
-                                h_flex()
-                                    .gap_3()
-                                    .items_center()
-                                    .child(pet_show_chip)
-                                    .child(pet_notify_chip)
-                                    .child(llm_chip),
-                            )
+                            .child(row("显示宠物", pet_show_chip.into_any_element()))
+                            .child(row("状态播报", pet_notify_chip.into_any_element()))
+                            .child(row("宠物大脑（LLM）", llm_chip.into_any_element()))
                             .child(
                                 div()
                                     .text_xs()
@@ -1830,19 +1928,85 @@ impl Workspace {
                                     .child("大脑：接入 OpenAI 兼容接口，点击或通知宠物时将调用 LLM 主动说话。"),
                             )
                             .children(llm_fields)
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(section("颜色"))
-                                    .children(self.pet_color_picker.as_ref().map(|p| ColorPicker::new(p).small())),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(section("大小"))
-                                    .child(pet_size_group),
-                            )
-                    )
+                            .child(row(
+                                "颜色",
+                                div()
+                                    .children(self.pet_color_picker.as_ref().map(|p| ColorPicker::new(p).small()))
+                                    .into_any_element(),
+                            ))
+                            .child(row("大小", pet_size_group.into_any_element())),
+                    ))
+                    // —— 在线更新部分：检查/下载全自动静默，生效推迟到退出时 ——
+                    .child({
+                        let status_text = match &self.update_status {
+                            updater::UpdateStatus::Idle => String::new(),
+                            updater::UpdateStatus::Checking => "检查中…".to_string(),
+                            updater::UpdateStatus::UpToDate => "已是最新版本".to_string(),
+                            updater::UpdateStatus::Downloading { version } => {
+                                format!("正在下载 v{version}…")
+                            }
+                            updater::UpdateStatus::ReadyToInstall { version, .. } => {
+                                format!("新版本 v{version} 已就绪，下次启动生效")
+                            }
+                            updater::UpdateStatus::Failed(e) => format!("检查失败：{e}"),
+                        };
+                        let busy = matches!(
+                            self.update_status,
+                            updater::UpdateStatus::Checking | updater::UpdateStatus::Downloading { .. }
+                        );
+                        let ready = matches!(self.update_status, updater::UpdateStatus::ReadyToInstall { .. });
+
+                        let check_btn = btn("check-update", if busy { "检查中…".into() } else { "检查更新".into() })
+                            .text_color(if busy { muted } else { fg })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _w, cx| {
+                                    if !matches!(
+                                        this.update_status,
+                                        updater::UpdateStatus::Checking
+                                            | updater::UpdateStatus::Downloading { .. }
+                                    ) {
+                                        this.check_for_update(false, cx);
+                                    }
+                                }),
+                            );
+                        let restart_btn = ready.then(|| {
+                            btn("restart-update", "立即重启更新".into())
+                                .text_color(rgb(0x8fc7ff))
+                                .bg(Hsla::from(rgba(0x4a9eff24)))
+                                .hover(|s| s.bg(Hsla::from(rgba(0x4a9eff40))))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _w, cx| {
+                                        if let updater::UpdateStatus::ReadyToInstall { staged_app, .. } =
+                                            &this.update_status
+                                        {
+                                            if updater::finalize_pending_update(staged_app).is_ok() {
+                                                cx.quit();
+                                            }
+                                        }
+                                    }),
+                                )
+                        });
+
+                        card(
+                            "更新",
+                            v_flex()
+                                .gap_3()
+                                .child(row(
+                                    concat!("当前版本 v", env!("CARGO_PKG_VERSION")),
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(check_btn)
+                                        .children(restart_btn)
+                                        .into_any_element(),
+                                ))
+                                .children((!status_text.is_empty()).then(|| {
+                                    div().text_xs().text_color(muted).child(status_text)
+                                })),
+                        )
+                    })
             )
         )
     }
@@ -1931,6 +2095,32 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 this.git_status_inflight.remove(&root);
                 this.git_status.insert(root, (Instant::now(), data));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 确保某 root 的热力图数据缓存新鲜（>20s 或缺失就后台刷新）。`git log --since=90.days`
+    /// 比 `git status` 慢得多，缓存窗口相应拉长，避免切换到热力图页就反复重算。
+    fn ensure_hotspot(&mut self, root: String, cx: &mut Context<Self>) {
+        let fresh = self
+            .hotspot_data
+            .get(&root)
+            .is_some_and(|(t, _)| t.elapsed() < std::time::Duration::from_secs(20));
+        if fresh || self.hotspot_inflight.contains(&root) {
+            return;
+        }
+        self.hotspot_inflight.insert(root.clone());
+        cx.spawn(async move |this, cx| {
+            let r = root.clone();
+            let entries = cx
+                .background_executor()
+                .spawn(async move { hotspot::compute(&r) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.hotspot_inflight.remove(&root);
+                this.hotspot_data.insert(root, (Instant::now(), Rc::new(entries)));
                 cx.notify();
             });
         })
@@ -2164,6 +2354,13 @@ impl Render for Workspace {
             }
         }
 
+        // 热力图页：后台刷新改动热力（git log 扫历史更慢，同样绝不同步跑）。
+        if self.view == MainView::Hotspot {
+            if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
+                self.ensure_hotspot(root, cx);
+            }
+        }
+
         // 文件树页：后台刷新根目录 + 所有已展开目录的直接子项列表（fs::read_dir 绝不
         // 在 render 里同步跑）。展开新目录时它会先落空，下一帧缓存到位后自动出现。
         if self.view == MainView::Files {
@@ -2227,16 +2424,23 @@ impl Render for Workspace {
 
         // 左侧会话侧栏：按会话的 cwd 分组成项目（保持出现顺序），
         // 记住每组的完整 cwd 供「在该项目新建终端」用。
+        // 临时终端（cwd 落在 scratch_dir，即 $HOME）单独归一组「临时终端」，
+        // 不跟真实项目混在一起、也不会被当成"名叫用户名的项目"。
+        let home = scratch_dir();
         let mut projects: Vec<(String, String, Vec<usize>)> = Vec::new();
         for (ix, _title) in titles.iter() {
             let cwd = self.sessions[*ix].cwd(cx).unwrap_or_default();
-            let name = cwd
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("项目")
-                .to_string();
+            let is_scratch = home.as_deref().is_some_and(|h| h == cwd);
+            let name = if is_scratch {
+                "临时终端".to_string()
+            } else {
+                cwd.trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("项目")
+                    .to_string()
+            };
             match projects.iter_mut().find(|(n, _, _)| *n == name) {
                 Some(p) => p.2.push(*ix),
                 None => projects.push((name, cwd, vec![*ix])),
@@ -2305,8 +2509,9 @@ impl Render for Workspace {
                 // 项目行右侧「+」：在该项目目录下新建终端会话。
                 let e_new = this.clone();
                 let new_cwd = cwd.clone();
+                let is_scratch_group = name == "临时终端";
                 SidebarMenuItem::new(name.clone())
-                    .icon(IconName::Folder)
+                    .icon(if is_scratch_group { IconName::SquareTerminal } else { IconName::Folder })
                     .default_open(true)
                     .click_to_toggle(true)
                     .suffix(move |_w, _cx| {
@@ -2334,10 +2539,12 @@ impl Render for Workspace {
             // 宽度交给外层 resizable_panel 控制（可拖），这里填满 panel。
             // 品牌已移到顶部标题栏，侧栏直接从「会话」开始，避免重复。
             .w(relative(1.))
-            // 总览：全局视图，独立入口（不在会话的终端/文件树/Git tab 里）。
-            .child(
+            // 总览 + 临时终端：不挂在任何项目下的全局入口，跟当前在哪个项目无关，
+            // 随时点得到（临时终端不用先切项目、也不用等 sidebar 里已有临时终端分组）。
+            .child({
+                let e_scratch = this.clone();
                 SidebarGroup::new("").child(
-                    SidebarMenu::new().child(
+                    SidebarMenu::new().children([
                         SidebarMenuItem::new("总览")
                             .icon(IconName::LayoutDashboard)
                             .active(overview_active)
@@ -2348,9 +2555,14 @@ impl Render for Workspace {
                                     cx.notify();
                                 });
                             }),
-                    ),
-                ),
-            )
+                        SidebarMenuItem::new("临时终端")
+                            .icon(IconName::SquareTerminal)
+                            .on_click(move |_ev, window, cx| {
+                                e_scratch.update(cx, |ws, cx| ws.activate_or_new_scratch(window, cx));
+                            }),
+                    ]),
+                )
+            })
             .child(SidebarGroup::new("会话").child(SidebarMenu::new().children(menu_items)))
             // 不用 SidebarFooter：它会给整块 footer 挂 hover 背景（sidebar_accent），
             // 盖住按钮自己的 hover。直接放普通容器，让每个按钮各自 hover 可见。
@@ -2573,7 +2785,16 @@ impl Render for Workspace {
                                         .size_6()
                                         .rounded_md()
                                         .cursor_pointer()
-                                        .text_color(c_muted)
+                                        // 有新版本在下载/已就绪 → 齿轮变蓝，照抄铃铛的"有待处理事项"配色。
+                                        .text_color(if matches!(
+                                            self.update_status,
+                                            updater::UpdateStatus::Downloading { .. }
+                                                | updater::UpdateStatus::ReadyToInstall { .. }
+                                        ) {
+                                            rgb(0x4a9eff).into()
+                                        } else {
+                                            c_muted
+                                        })
                                         .hover(|s| s.bg(c_border))
                                         .child(Icon::new(IconName::Settings))
                                         .on_mouse_down(
@@ -2625,19 +2846,22 @@ impl Render for Workspace {
                             .selected_index(match self.view {
                                 MainView::Terminal => 0,
                                 MainView::Files => 1,
-                                _ => 2,
+                                MainView::Git => 2,
+                                _ => 3,
                             })
                             .on_click(cx.listener(|this, ix: &usize, _window, cx| {
                                 this.view = match *ix {
                                     0 => MainView::Terminal,
                                     1 => MainView::Files,
-                                    _ => MainView::Git,
+                                    2 => MainView::Git,
+                                    _ => MainView::Hotspot,
                                 };
                                 cx.notify();
                             }))
                             .child(Tab::new().label("终端"))
                             .child(Tab::new().label("文件树"))
                             .child(Tab::new().label("Git"))
+                            .child(Tab::new().label("热力图"))
                     }))
                     .child(match self.view {
                         MainView::Overview => self.render_overview(cx),
@@ -2680,6 +2904,13 @@ impl Render for Workspace {
                                 &self.diff_scroll,
                                 cx,
                             )
+                        }
+                        MainView::Hotspot => {
+                            let cwd = self.cur().and_then(|s| s.cwd(cx));
+                            let data = cwd
+                                .as_ref()
+                                .and_then(|r| self.hotspot_data.get(r).map(|(_, d)| d.clone()));
+                            hotspot_view(cwd, data, cx)
                         }
                         MainView::Settings => self.render_settings_page(cx),
                     }),
@@ -2862,6 +3093,176 @@ fn walk_dir_cached(
             walk_dir_cached(&path, dir_cache, expanded, depth + 1, out);
         }
     }
+}
+
+/// 冷→热配色：t∈[0,1]（由排名百分位归一化，见 hotspot_view）从冷蓝经琥珀到警示红。
+fn heat_color(t: f32) -> Hsla {
+    let t = t.clamp(0.0, 1.0);
+    let stops: [(u8, u8, u8); 3] = [(0x2a, 0x41, 0x5c), (0xd9, 0x8a, 0x2e), (0xe0, 0x38, 0x38)];
+    let (lo, hi, local_t) = if t < 0.5 { (stops[0], stops[1], t / 0.5) } else { (stops[1], stops[2], (t - 0.5) / 0.5) };
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * local_t).round() as u32;
+    let packed = (lerp(lo.0, hi.0) << 16) | (lerp(lo.1, hi.1) << 8) | lerp(lo.2, hi.2);
+    rgb(packed).into()
+}
+
+/// 热力图视图：squarified treemap——每个矩形是一个近 90 天内改动过的文件。
+/// 面积 = 热力分数（改动频率 × 时间衰减，见 hotspot::compute）；颜色则按热力排名百分位
+/// 取色（而非分数原始值直接映射）——分数分布是指数衰减的长尾，直接按分数取色会导致只有
+/// 前一两名亮红/亮橙、其余瞬间跌成同一片暗色，按排名取色才能让整张图有连续的冷暖梯度。
+/// 右上角小圆点额外标出「最近改动」（2 天内）的文件；点击某块直接在文件树里打开对应文件。
+fn hotspot_view(
+    cwd: Option<String>,
+    data: Option<Rc<Vec<hotspot::HotspotEntry>>>,
+    cx: &mut Context<Workspace>,
+) -> Div {
+    let (muted, c_bg) = {
+        let t = cx.theme();
+        (t.muted_foreground, t.background)
+    };
+    let Some(root) = cwd else {
+        return placeholder_view("无项目目录", muted);
+    };
+    let Some(entries) = data else {
+        return placeholder_view("计算改动热力中…", muted);
+    };
+    if entries.is_empty() {
+        return placeholder_view(
+            &format!(
+                "近 {} 天无改动记录（非 git 仓库，或近期无改动）",
+                hotspot::WINDOW_DAYS
+            ),
+            muted,
+        );
+    }
+
+    // 只画热力最高的一批：太多小方块既放不下标签也没有辨识度。
+    const MAX_TILES: usize = 80;
+    let total = entries.len();
+    let shown: Vec<&hotspot::HotspotEntry> = entries.iter().take(MAX_TILES).collect();
+    let weights: Vec<f64> = shown.iter().map(|e| e.score.max(1e-6)).collect();
+    let rects = hotspot::squarify(&weights);
+    let last_ix = shown.len().saturating_sub(1).max(1) as f32;
+
+    let this = cx.entity();
+    let tiles: Vec<AnyElement> = shown
+        .iter()
+        .zip(rects.iter())
+        .enumerate()
+        .map(|(i, (entry, rect))| {
+            // 排名百分位（0 = 最热）取色，与面积（真实分数）解耦，避免长尾把色阶压平。
+            let heat = 1.0 - (i as f32 / last_ix);
+            let recent = entry.days_since < 2.0;
+            let name = Path::new(&entry.rel_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.rel_path.clone());
+            let abs_path = Path::new(&root).join(&entry.rel_path).to_string_lossy().into_owned();
+            let this = this.clone();
+            let show_label = rect.w > 0.05 && rect.h > 0.06;
+
+            let mut tile = div()
+                .id(("hotspot-tile", i))
+                .absolute()
+                .left(relative(rect.x))
+                .top(relative(rect.y))
+                .w(relative(rect.w))
+                .h(relative(rect.h))
+                .overflow_hidden()
+                .cursor_pointer()
+                .rounded(px(4.))
+                .border_2()
+                .border_color(c_bg)
+                .bg(heat_color(heat))
+                .hover(|d| d.border_color(rgb(0x4a9eff)))
+                .on_click(move |_ev, _window, cx| {
+                    this.update(cx, |ws, cx| {
+                        ws.view = MainView::Files;
+                        ws.view_file(abs_path.clone(), cx);
+                    });
+                });
+
+            // 太小的方块放不下文字，索性留白，靠颜色传达信息即可。
+            if show_label {
+                tile = tile
+                    // 底部暗角渐变：不管方块本身冷暖，文字永远压在深色底上，保证可读。
+                    .child(
+                        div().absolute().inset_0().bg(linear_gradient(
+                            180.,
+                            linear_color_stop(rgba(0x00000000), 0.0),
+                            linear_color_stop(rgba(0x00000099), 1.0),
+                        )),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .p(px(4.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .text_xs()
+                            .text_color(rgb(0xf3f5f8))
+                            .child(div().overflow_hidden().whitespace_nowrap().child(name))
+                            .child(
+                                div()
+                                    .text_color(rgba(0xffffffa8))
+                                    .child(format!("×{} · {:.0}d", entry.commits, entry.days_since)),
+                            ),
+                    );
+            }
+            // 最近改动：右上角一颗小圆点，不影响整体边框/网格的干净观感。
+            if recent {
+                tile = tile.child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .right(px(4.))
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(rgb(0x4a9eff))
+                        .shadow_sm(),
+                );
+            }
+            tile.into_any_element()
+        })
+        .collect();
+
+    let caption = if total > MAX_TILES {
+        format!(
+            "改动热力 · 近 {} 天 · 显示热力最高的 {} / 共 {} 个文件 · 🔵 圆点 = 最近 2 天内改动",
+            hotspot::WINDOW_DAYS, MAX_TILES, total
+        )
+    } else {
+        format!(
+            "改动热力 · 近 {} 天 · 共 {} 个文件 · 🔵 圆点 = 最近 2 天内改动",
+            hotspot::WINDOW_DAYS, total
+        )
+    };
+
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .px_3()
+                .py_2()
+                .text_xs()
+                .text_color(muted)
+                .child(caption),
+        )
+        .child(
+            div()
+                .id("hotspot-canvas")
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .m_2()
+                .children(tiles),
+        )
 }
 
 /// Git 视图：左侧分支 + 改动文件列表（可点击），右侧显示选中文件的 diff。
@@ -3570,6 +3971,12 @@ fn current_dir() -> Option<String> {
         .and_then(|p| p.to_str().map(String::from))
 }
 
+/// 临时终端的落脚目录：固定用 $HOME，跟任何项目区分开、且多个临时终端共享同一
+/// 目录字符串，侧栏才能按 cwd 分组把它们聚成一组（见 render 里的 `is_scratch_cwd`）。
+fn scratch_dir() -> Option<String> {
+    dirs::home_dir().and_then(|p| p.to_str().map(String::from))
+}
+
 /// file:// URL → 本地路径（percent 解码，支持中文 / 空格目录名）。
 fn file_url_to_path(url: &str) -> Option<std::path::PathBuf> {
     let rest = url.strip_prefix("file://")?;
@@ -3592,6 +3999,28 @@ fn file_url_to_path(url: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(String::from_utf8(bytes).ok()?))
 }
 
+/// 开一扇主工作台窗口（Workspace + Root 包装），返回其 weak 引用。
+/// 首启和「点 Dock 图标重开」共用这一份：`Workspace::new` 本来就会从存档 + smeltd
+/// 重新拼出会话布局，跟正常重启应用效果一致。
+fn open_workspace_window(cx: &mut App, window_bg: WindowBackgroundAppearance) -> WeakEntity<Workspace> {
+    let window_options = WindowOptions {
+        // 透明标题栏：红绿灯浮在内容上，拖拽 / 双击最大化由自定义 TitleBar 接管。
+        titlebar: Some(TitleBar::title_bar_options()),
+        // 透明/模糊背景（跟随外观设置；终端底色带 alpha 时桌面透出）。
+        window_background: window_bg,
+        ..Default::default()
+    };
+    let mut workspace = None;
+    cx.open_window(window_options, |window, cx| {
+        let view = cx.new(|cx| Workspace::new(cx));
+        workspace = Some(view.clone());
+        // 顶层视图必须包一层 Root（组件库的主题/遮罩系统要求）。
+        cx.new(|cx| Root::new(view, window, cx))
+    })
+    .expect("打开窗口失败");
+    workspace.expect("回调里一定会设置 workspace").downgrade()
+}
+
 fn main() {
     // with_assets 注册组件库图标资源，Sidebar 的 IconName svg 才能渲染。
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
@@ -3601,6 +4030,30 @@ fn main() {
     app.on_open_urls(move |urls| {
         let _ = url_tx.send_blocking(urls);
     });
+
+    // 当前存活的主窗口（weak，随窗口关闭自然失效）。首启时在 run() 里写入；
+    // URL 投递循环和「点 Dock 图标重开」都读它判断当前有没有主窗口。
+    // on_reopen 得在 run() 之前挂在 Application builder 上（跟 on_open_urls 一样），
+    // 但它触发时 run() 早已跑起来，Rc 到时候已经被 run() 里的首启逻辑填过了。
+    let current_ws: Rc<RefCell<Option<WeakEntity<Workspace>>>> = Rc::new(RefCell::new(None));
+    {
+        let current_ws = current_ws.clone();
+        // 点 Dock 图标 / 双击程序图标重开：GPUI 只在系统判定「没有可见窗口」时才会调这个
+        // 回调（宠物浮窗一直挂着，是否会被系统计入可见窗口未经验证，这里做好兜底：
+        // 主窗口还活着就什么都不做，只有真的没了才重新开一扇）。
+        app.on_reopen(move |cx| {
+            let alive = current_ws.borrow().as_ref().is_some_and(|w| w.upgrade().is_some());
+            if !alive {
+                let window_bg = cx
+                    .try_global::<Appearance>()
+                    .map(|a| a.window_bg())
+                    .unwrap_or(WindowBackgroundAppearance::Opaque);
+                let ws = open_workspace_window(cx, window_bg);
+                *current_ws.borrow_mut() = Some(ws);
+            }
+        });
+    }
+
     app.run(move |cx| {
         // 用任何 gpui-component 功能前必须先初始化。
         gpui_component::init(cx);
@@ -3631,33 +4084,21 @@ fn main() {
         cx.set_global(agent::load_llm_config());
         pet::open_pet_window(cx);
 
+        // 首启主窗口，记入 current_ws（reopen 回调 / URL 投递循环都靠它判断当前主窗口）。
+        *current_ws.borrow_mut() = Some(open_workspace_window(cx, window_bg));
+
+        // 消费 Dock / Finder 投递的目录：每个开一个会话（文件取父目录）。常驻到应用退出，
+        // 不因主窗口一度被关掉而停——重开窗口后应继续能接文件投递。
         cx.spawn(async move |cx| {
-            let window_options = WindowOptions {
-                // 透明标题栏：红绿灯浮在内容上，拖拽 / 双击最大化由自定义 TitleBar 接管。
-                titlebar: Some(TitleBar::title_bar_options()),
-                // 透明/模糊背景（跟随外观设置；终端底色带 alpha 时桌面透出）。
-                window_background: window_bg,
-                ..Default::default()
-            };
-            let mut workspace = None;
-            cx.open_window(window_options, |window, cx| {
-                let view = cx.new(|cx| Workspace::new(cx));
-                workspace = Some(view.clone());
-                // 顶层视图必须包一层 Root（组件库的主题/遮罩系统要求）。
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("打开窗口失败");
-            // 消费 Dock / Finder 投递的目录：每个开一个会话（文件取父目录）。
-            // 用 weak 引用：窗口销毁后 update 返回 Err，循环自然退出。
-            let Some(ws) = workspace.map(|w| w.downgrade()) else { return };
             while let Ok(urls) = url_rx.recv().await {
                 let paths: Vec<std::path::PathBuf> =
                     urls.iter().filter_map(|u| file_url_to_path(u)).collect();
                 if paths.is_empty() {
                     continue;
                 }
-                if ws.update(cx, |ws, cx| ws.open_paths(&paths, cx)).is_err() {
-                    break; // 窗口已销毁
+                let ws = current_ws.borrow().clone();
+                if let Some(ws) = ws {
+                    let _ = ws.update(cx, |ws, cx| ws.open_paths(&paths, cx));
                 }
             }
         })
