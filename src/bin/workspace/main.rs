@@ -393,6 +393,28 @@ struct OpenFile {
     lines: Rc<Vec<Vec<(Rgba, String)>>>,
 }
 
+/// 文件树搜索的一条命中。
+struct SearchHit {
+    /// 命中文件的绝对路径（点击时用它 view_file）。
+    path: String,
+    /// 相对项目根的展示路径。
+    rel: String,
+    /// 内容命中时的首个匹配行：(行号从 1 起, 该行文本预览)；仅文件名命中时为 None。
+    line: Option<(usize, String)>,
+}
+
+/// 文件树搜索的一次结果快照。后台遍历项目填充，render 只读。
+struct SearchState {
+    /// 触发本次结果的查询串（用于判断是否需要重跑）。
+    query: String,
+    /// 后台遍历是否已跑完（false 时列表顶部显示「搜索中…」）。
+    done: bool,
+    /// 命中列表（文件名命中在前、内容命中在后，各自按路径序）。
+    hits: Vec<SearchHit>,
+    /// 是否因命中数触顶而截断（列表底部提示还有更多）。
+    truncated: bool,
+}
+
 /// diff 行的类型，决定行号显示、前景色、整行背景与左侧色条。
 #[derive(Clone, Copy, PartialEq)]
 enum DiffKind {
@@ -675,6 +697,15 @@ struct Workspace {
     file_scroll: UniformListScrollHandle,
     /// 文件树列表的滚动句柄（普通滚动，非虚拟滚动——见 file_tree 函数注释）。
     file_tree_scroll: ScrollHandle,
+    /// 文件树顶部的过滤输入框；首次渲染文件树时懒创建（需要 window）。
+    file_filter: Option<Entity<gpui_component::input::InputState>>,
+    /// 过滤框的变更订阅（键入即重渲染）；随视图存活。
+    _file_filter_sub: Option<Subscription>,
+    /// 文件树搜索结果（文件名 + 文件内容）：后台遍历项目填充，render 只读。
+    /// query 非空时左栏由树形切换为扁平命中列表。
+    search_results: Option<SearchState>,
+    /// 搜索任务自增序号：后台遍历完成时用它丢弃过期结果（期间又改了查询）。
+    search_gen: u64,
     /// 根布局左右分栏（会话侧栏 ↔ 主区）的可拖拽状态；常驻以保住拖出的宽度。
     root_resize: Entity<ResizableState>,
     /// 侧栏初始宽度（px）：启动时从存档恢复，作为 resizable_panel 的初始 size。
@@ -789,6 +820,10 @@ impl Workspace {
             diff_scroll: UniformListScrollHandle::new(),
             file_scroll: UniformListScrollHandle::new(),
             file_tree_scroll: ScrollHandle::new(),
+            file_filter: None,
+            _file_filter_sub: None,
+            search_results: None,
+            search_gen: 0,
             root_resize,
             sidebar_w,
             _resize_sub,
@@ -2053,6 +2088,47 @@ impl Workspace {
         .detach();
     }
 
+    /// 文件树搜索：按 query 匹配文件名 + 文件内容，后台遍历项目、命中写回 search_results。
+    /// 与 view_file 同款「background_executor + 自增 gen 丢弃过期结果」模式，绝不阻塞 render。
+    /// query 未变（已有对应结果或正在跑同一 query）就跳过，避免每帧重扫。
+    fn ensure_search(&mut self, root: String, query: String, cx: &mut Context<Self>) {
+        // 已有本 query 的结果、或正有一次针对本 query 的遍历在跑，就不重复触发。
+        if self.search_results.as_ref().is_some_and(|s| s.query == query) {
+            return;
+        }
+        self.search_gen = self.search_gen.wrapping_add(1);
+        let gen = self.search_gen;
+        // 先占位：done=false 让列表顶部显示「搜索中…」，遍历完成后替换。
+        self.search_results = Some(SearchState {
+            query: query.clone(),
+            done: false,
+            hits: Vec::new(),
+            truncated: false,
+        });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let (r, q) = (root.clone(), query.clone());
+            let (hits, truncated) = cx
+                .background_executor()
+                .spawn(async move { search_project(&r, &q) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // 只有仍是最新一次搜索才写入，丢弃期间被新查询取代的过期结果。
+                if this.search_gen == gen {
+                    this.search_results = Some(SearchState {
+                        query,
+                        done: true,
+                        hits,
+                        truncated,
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Git 视图：查看某个改动文件的 diff。已跟踪文件用 `git diff HEAD`，
     /// 未跟踪文件（??）用 `git diff --no-index` 展示全文（整体当作新增）。
     /// 确保某 root 的 git status 缓存新鲜（>1.5s 或缺失就后台刷新）。
@@ -2364,11 +2440,36 @@ impl Render for Workspace {
         // 文件树页：后台刷新根目录 + 所有已展开目录的直接子项列表（fs::read_dir 绝不
         // 在 render 里同步跑）。展开新目录时它会先落空，下一帧缓存到位后自动出现。
         if self.view == MainView::Files {
-            if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
-                self.ensure_dir_listing(root, cx);
+            // 搜索输入框懒创建（需要 window）：键入即 notify，触发文件名 + 内容搜索。
+            if self.file_filter.is_none() {
+                use gpui_component::input::{InputEvent, InputState};
+                let state =
+                    cx.new(|cx| InputState::new(window, cx).placeholder("搜索文件名 / 内容…"));
+                self._file_filter_sub =
+                    Some(cx.subscribe(&state, |_, _, ev: &InputEvent, cx| {
+                        if matches!(ev, InputEvent::Change) {
+                            cx.notify();
+                        }
+                    }));
+                self.file_filter = Some(state);
             }
-            for dir in self.expanded.clone() {
-                self.ensure_dir_listing(dir, cx);
+            let query = self
+                .file_filter
+                .as_ref()
+                .map(|s| s.read(cx).value().trim().to_string())
+                .unwrap_or_default();
+            if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
+                if query.is_empty() {
+                    // 无查询：正常树形浏览，清空上一次搜索结果。
+                    self.search_results = None;
+                    self.ensure_dir_listing(root.clone(), cx);
+                    for dir in self.expanded.clone() {
+                        self.ensure_dir_listing(dir, cx);
+                    }
+                } else {
+                    // 有查询：切换为搜索结果视图，后台遍历项目（query 未变则不重扫）。
+                    self.ensure_search(root, query, cx);
+                }
             }
         }
 
@@ -2868,13 +2969,37 @@ impl Render for Workspace {
                         MainView::Terminal => content,
                         MainView::Files => {
                             let cwd = self.cur().and_then(|s| s.cwd(cx));
-                            let tree = file_tree(
-                                cwd,
-                                &self.expanded,
-                                &self.dir_cache,
-                                &self.file_tree_scroll,
-                                cx,
-                            );
+                            // 有查询串 → 显示搜索结果；否则显示文件树。
+                            let has_query = self
+                                .file_filter
+                                .as_ref()
+                                .is_some_and(|s| !s.read(cx).value().trim().is_empty());
+                            let body = if has_query {
+                                match &self.search_results {
+                                    Some(state) => {
+                                        search_results_view(state, &self.file_tree_scroll, cx)
+                                    }
+                                    // ensure_search 已在 render 顶部同步置位，通常到不了这里。
+                                    None => div().flex_1().into_any_element(),
+                                }
+                            } else {
+                                file_tree(
+                                    cwd,
+                                    &self.expanded,
+                                    &self.dir_cache,
+                                    &self.file_tree_scroll,
+                                    cx,
+                                )
+                            };
+                            // 顶部搜索框（file_filter 已在 render 顶部懒创建）。
+                            let search_box = self.file_filter.as_ref().map(|state| {
+                                div()
+                                    .px_2()
+                                    .py(px(6.))
+                                    .border_b_1()
+                                    .border_color(c_border)
+                                    .child(Input::new(state).small())
+                            });
                             let content = file_content_pane(&self.open_file, &self.file_scroll, cx);
                             div()
                                 .flex_1()
@@ -2885,9 +3010,13 @@ impl Render for Workspace {
                                 .child(
                                     div()
                                         .w(px(260.))
+                                        .flex()
+                                        .flex_col()
+                                        .min_h_0()
                                         .border_r_1()
                                         .border_color(c_border)
-                                        .child(tree),
+                                        .children(search_box)
+                                        .child(body),
                                 )
                                 .child(content)
                         }
@@ -3075,6 +3204,109 @@ fn file_tree(
         .into_any_element()
 }
 
+/// 文件树搜索结果视图：扁平命中列表（替代 query 非空时的树形浏览）。
+/// 每项显示相对路径 + 内容命中行预览，点击用 view_file 打开该文件。
+fn search_results_view(
+    state: &SearchState,
+    scroll: &ScrollHandle,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let (muted, fg, hover, accent) = {
+        let t = cx.theme();
+        (t.muted_foreground, t.foreground, t.accent, t.primary)
+    };
+    // 顶栏状态：搜索中 / 无结果 / N 项命中(是否截断)。
+    let status = if !state.done {
+        "搜索中…".to_string()
+    } else if state.hits.is_empty() {
+        "无匹配".to_string()
+    } else if state.truncated {
+        format!("命中 {}+ 项（已截断）", state.hits.len())
+    } else {
+        format!("命中 {} 项", state.hits.len())
+    };
+
+    let this = cx.entity();
+    let rows: Vec<AnyElement> = state
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let this = this.clone();
+            let p = hit.path.clone();
+            // 拆出目录前缀与文件名：文件名高亮、目录弱化，便于扫读。
+            let (dir_part, name_part) = match hit.rel.rfind('/') {
+                Some(idx) => (hit.rel[..=idx].to_string(), hit.rel[idx + 1..].to_string()),
+                None => (String::new(), hit.rel.clone()),
+            };
+            let preview = hit.line.clone();
+            div()
+                .id(("search-hit", i))
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .px_2()
+                .py(px(2.0))
+                .hover(move |s| s.bg(hover))
+                .on_click(move |_ev, _window, cx| {
+                    this.update(cx, |ws, cx| ws.view_file(p.clone(), cx));
+                })
+                // 第一行：目录（弱）+ 文件名（强）。
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_sm()
+                        .child(Icon::new(IconName::File).size(px(13.)).text_color(muted))
+                        .child(div().text_color(muted).child(dir_part))
+                        .child(div().text_color(fg).child(name_part)),
+                )
+                // 第二行：内容命中的行号 + 行预览（仅内容命中时有）。
+                .children(preview.map(|(no, text)| {
+                    div()
+                        .flex()
+                        .gap_1()
+                        .pl(px(18.))
+                        .text_xs()
+                        .text_color(muted)
+                        .child(div().text_color(accent).child(format!("{no}")))
+                        .child(div().min_w_0().child(text))
+                }))
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .id("search-results")
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(muted)
+                .child(status),
+        )
+        .child(
+            div()
+                .id("search-results-list")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .pb_1()
+                .track_scroll(scroll)
+                .vertical_scrollbar(scroll)
+                .children(rows),
+        )
+        .into_any_element()
+}
+
 /// 只读缓存的递归收集目录条目（仅进入已展开且已缓存的文件夹）；绝不做任何 fs 调用。
 /// 展开了但尚未缓存的目录会被跳过——render 每帧检查并后台补齐，下一帧自动出现。
 fn walk_dir_cached(
@@ -3093,6 +3325,91 @@ fn walk_dir_cached(
             walk_dir_cached(&path, dir_cache, expanded, depth + 1, out);
         }
     }
+}
+
+/// 搜索命中数上限：触顶即停并标记截断，避免超大仓遍历/渲染失控。
+const SEARCH_HIT_LIMIT: usize = 200;
+/// 内容搜索跳过的单文件大小上限（512KB）：更大的多半是数据/构建产物，逐行扫不划算。
+const SEARCH_MAX_FILE_BYTES: u64 = 512 * 1024;
+
+/// 后台遍历项目搜索 query（大小写不敏感）：文件名命中或文件内容逐行命中。
+/// 跳过 .git/node_modules/target/.DS_Store、隐藏目录、大文件与二进制（含 NUL 字节）。
+/// 返回 (命中列表, 是否因触顶截断)；文件名命中排在内容命中前。绝不在此之外做 UI 调用。
+fn search_project(root: &str, query: &str) -> (Vec<SearchHit>, bool) {
+    let needle = query.to_lowercase();
+    let mut name_hits: Vec<SearchHit> = Vec::new();
+    let mut content_hits: Vec<SearchHit> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(root)];
+    let root_path = std::path::Path::new(root);
+    let mut truncated = false;
+
+    'outer: while let Some(dir) = stack.pop() {
+        let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd.flatten().collect(),
+            Err(_) => continue,
+        };
+        // 目录序稳定：按名字排序，命中列表才不会每次遍历顺序抖动。
+        entries.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().to_string();
+            // 排除规则与 ensure_dir_listing 对齐，另跳过所有隐藏文件/目录。
+            if matches!(name.as_str(), ".git" | "node_modules" | "target" | ".DS_Store")
+                || name.starts_with('.')
+            {
+                continue;
+            }
+            let path = e.path();
+            let is_dir = path.is_dir();
+            if is_dir {
+                stack.push(path);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let abs = path.to_string_lossy().to_string();
+            // 文件名命中：直接记一条（不再看内容），命中行留空。
+            if name.to_lowercase().contains(&needle) {
+                name_hits.push(SearchHit { path: abs, rel, line: None });
+                if name_hits.len() + content_hits.len() >= SEARCH_HIT_LIMIT {
+                    truncated = true;
+                    break 'outer;
+                }
+                continue;
+            }
+            // 内容命中：跳过大文件；读文本失败（二进制/非 UTF-8）则跳过。
+            if e.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > SEARCH_MAX_FILE_BYTES {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            // 含 NUL 视为二进制，不逐行扫。
+            if text.as_bytes().contains(&0) {
+                continue;
+            }
+            if let Some((no, line)) = text
+                .lines()
+                .enumerate()
+                .find(|(_, l)| l.to_lowercase().contains(&needle))
+            {
+                // 预览行去掉首尾空白并截断，避免超长行撑爆列表。
+                let preview: String = line.trim().chars().take(200).collect();
+                content_hits.push(SearchHit {
+                    path: abs,
+                    rel,
+                    line: Some((no + 1, preview)),
+                });
+                if name_hits.len() + content_hits.len() >= SEARCH_HIT_LIMIT {
+                    truncated = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    name_hits.extend(content_hits);
+    (name_hits, truncated)
 }
 
 /// 冷→热配色：t∈[0,1]（由排名百分位归一化，见 hotspot_view）从冷蓝经琥珀到警示红。

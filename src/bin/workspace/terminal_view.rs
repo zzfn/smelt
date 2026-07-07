@@ -95,6 +95,10 @@ pub struct TerminalView {
     /// 改过（这些跟 PTY 内容无关，Terminal::take_damage 感知不到）。
     /// None = 还没比较过，首次一律当作"变了"以确保能显示当前外观。
     last_appearance: Option<crate::Appearance>,
+    /// 触控板滚轮的像素余数：触控板每帧只送几像素的增量，若逐事件独立按
+    /// LINE_PX 取整会把大部分小增量截断成 0（滚了但没反应），造成"很不跟手"
+    /// 的卡顿感。改为跨事件累加像素，攒够一整行再吐出、余数留到下次。
+    scroll_accum: f32,
 }
 
 /// 外观设置里跟终端渲染相关的字段是否发生变化（bg_color/bg_image/opacity/blur）。
@@ -252,6 +256,7 @@ impl TerminalView {
             completed_unread: false,
             last_notified: None,
             last_appearance: None,
+            scroll_accum: 0.0,
         }
     }
 
@@ -678,14 +683,21 @@ impl Render for TerminalView {
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
-                let lines = match ev.delta {
-                    ScrollDelta::Lines(p) => p.y as i32,
-                    ScrollDelta::Pixels(p) => (f32::from(p.y) / LINE_PX) as i32,
+                // 新的一次触控板手势开始时清空余数，避免上一次手势的残留跟这次叠加。
+                if matches!(ev.touch_phase, TouchPhase::Started) {
+                    this.scroll_accum = 0.0;
+                }
+                let delta_px = match ev.delta {
+                    ScrollDelta::Lines(p) => p.y * LINE_PX,
+                    ScrollDelta::Pixels(p) => f32::from(p.y),
                 };
-                if lines != 0 {
+                this.scroll_accum += delta_px;
+                let lines = (this.scroll_accum / LINE_PX).trunc();
+                if lines != 0.0 {
+                    this.scroll_accum -= lines * LINE_PX;
                     // 按终端模式分流：TUI（Claude Code）转成鼠标滚轮事件，普通 shell 滚历史。
                     let (row, col) = this.pos_to_cell(ev.position, window);
-                    this.terminal.scroll_wheel(lines, row, col);
+                    this.terminal.scroll_wheel(lines as i32, row, col);
                     cx.notify();
                 }
             }))
