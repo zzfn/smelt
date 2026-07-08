@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+:root {
+  /* 基础色阶 —— 固定深色，不跟随系统 */
+  --background: #08090c;
+  --surface: #111219;
+  --surface-2: #15171f;
+  --border: #23252f;
+  --foreground: #e8e9ee;
+  --muted: #8b8d9c;
+  --dim: #56586a;
+
+  /* smelt 品牌色：熔炼 / 炉火橙 */
+  --accent: #f0a545;
+  --accent-2: #ff6b4a;
+  --success: #7ee787;
+  --danger: #ff7b72;
+
+  /* 语法高亮 token（One Dark 风格） */
+  --syn-keyword: #c586c0;
+  --syn-string: #98c379;
+  --syn-function: #61afef;
+  --syn-number: #d19a66;
+  --syn-comment: #5c6370;
+  --syn-punct: #abb2bf;
+  --syn-property: #e06c75;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-dim: var(--dim);
+  --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
+  --color-success: var(--success);
+  --color-danger: var(--danger);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(240, 165, 69, 0.12), transparent),
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: auto, 48px 48px, 48px 48px;
+  background-position: 0 0, -1px -1px, -1px -1px;
+}
+
+::selection {
+  background: var(--accent);
+  color: #08090c;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--background);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--surface-2);
+  border-radius: 999px;
+  border: 2px solid var(--background);
+}
