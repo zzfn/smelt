@@ -126,6 +126,8 @@ fn handle_open(
     let cols = v["cols"].as_u64().unwrap_or(80) as u16;
     let rows = v["rows"].as_u64().unwrap_or(24) as u16;
     let cwd = v["cwd"].as_str().map(String::from);
+    // 只在新建会话时生效（reattach 到已存在的会话没有"起始命令"这回事）。
+    let launch = v["launch"].as_str().map(String::from);
 
     // 取既有会话（reattach）或新建。
     let existing = sessions.lock().unwrap().get(&id).cloned();
@@ -136,7 +138,8 @@ fn handle_open(
             s
         }
         None => {
-            let Ok((sess, pty_reader)) = spawn_session(rows, cols, cwd.as_deref()) else {
+            let Ok((sess, pty_reader)) = spawn_session(rows, cols, cwd.as_deref(), launch.as_deref())
+            else {
                 return;
             };
             let sess = Arc::new(sess);
@@ -214,18 +217,27 @@ fn handle_open(
 }
 
 /// 开 PTY + 起 shell（环境设置与 GUI 内嵌版完全一致，见 workspace/terminal.rs 的注释）。
+/// `launch`：项目「+」悬浮菜单的 Claude Code / Codex 快捷入口——把要跑的命令直接编进
+/// 启动命令行（`-c '<launch>; exec <shell> -l'`），而不是等 shell 起来后再补发按键。
+/// 这样从根上没有"shell 是否已经在读 stdin"的时序问题，命令跑完会 exec 回一个
+/// 正常交互 login shell，之后就是一个普通会话。
 fn spawn_session(
     rows: u16,
     cols: u16,
     cwd: Option<&str>,
+    launch: Option<&str>,
 ) -> anyhow::Result<(Session, Box<dyn Read + Send>)> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let mut cmd = CommandBuilder::new(shell);
+    let mut cmd = CommandBuilder::new(shell.clone());
     // login shell：拿完整 PATH（.app 双击启动时系统 PATH 很精简）。
     cmd.arg("-l");
+    if let Some(launch) = launch {
+        cmd.arg("-c");
+        cmd.arg(format!("{launch}; exec {shell} -l"));
+    }
     if let Some(dir) = cwd {
         cmd.cwd(dir);
     }

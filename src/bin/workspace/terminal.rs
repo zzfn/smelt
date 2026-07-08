@@ -299,14 +299,21 @@ pub struct Terminal {
 impl Terminal {
     /// 打开（或重连）守护里 id 对应的会话：shell 环境由 smeltd 负责（-l / TERM /
     /// iTerm2 伪装 / LANG 兜底，见 smeltd.rs）。id 已存在 → attach，守护先重放输出
-    /// 缓冲恢复画面，再实时转发。
-    pub fn spawn(rows: usize, cols: usize, cwd: Option<&str>, id: &str) -> anyhow::Result<Self> {
+    /// 缓冲恢复画面，再实时转发。`launch`：新建会话时要先跑的命令（编进 shell 启动
+    /// 命令行，见 smeltd.rs::spawn_session），只在新建时生效，reattach 会被忽略。
+    pub fn spawn(
+        rows: usize,
+        cols: usize,
+        cwd: Option<&str>,
+        id: &str,
+        launch: Option<&str>,
+    ) -> anyhow::Result<Self> {
         // 1) 连守护（不在则自动拉起）并声明要打开的会话
         let mut writer = connect_daemon()?;
         writeln!(
             writer,
             "{}",
-            serde_json::json!({ "op": "open", "id": id, "cwd": cwd, "cols": cols, "rows": rows })
+            serde_json::json!({ "op": "open", "id": id, "cwd": cwd, "cols": cols, "rows": rows, "launch": launch })
         )?;
 
         // 守护先回报 PTY 当前尺寸（reattach 时是断开前的实际尺寸）：本地终端必须建成
@@ -583,7 +590,7 @@ mod damage_gate_tests {
         let _ = std::fs::create_dir_all(&dir);
         let id = format!("damage-test-{}", uuid_like());
 
-        let mut term = Terminal::spawn(24, 80, dir.to_str(), &id).expect("spawn 失败");
+        let mut term = Terminal::spawn(24, 80, dir.to_str(), &id, None).expect("spawn 失败");
 
         // 让 shell 起步、打印 prompt 稳定下来（这部分输出算真实变化，先排掉）。
         thread::sleep(Duration::from_millis(800));

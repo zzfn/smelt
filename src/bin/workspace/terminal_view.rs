@@ -143,9 +143,14 @@ fn title_is_running(title: Option<String>) -> bool {
 const STUCK_FRAMES: u32 = 8 * 60 * 1000 / 30;
 
 impl TerminalView {
-    pub fn new(cx: &mut Context<Self>, cwd: Option<String>, session_id: String) -> Self {
-        let terminal =
-            Terminal::spawn(24, 80, cwd.as_deref(), &session_id).expect("启动内嵌终端失败");
+    pub fn new(
+        cx: &mut Context<Self>,
+        cwd: Option<String>,
+        session_id: String,
+        launch: Option<&str>,
+    ) -> Self {
+        let terminal = Terminal::spawn(24, 80, cwd.as_deref(), &session_id, launch)
+            .expect("启动内嵌终端失败");
 
         // 定时重绘：后台读线程更新 Term 网格，这里每 30ms 通知 UI 刷新。
         // 顺便检查响铃：非活动会话也在跑此循环，故能在后台标记「需要注意」。
@@ -279,6 +284,7 @@ impl TerminalView {
     pub fn notified_at(&self) -> Option<Instant> {
         self.notified_at
     }
+
 
     /// 终端末尾最多 n 行非空文本（总览页迷你预览用）。
     pub fn last_lines(&self, n: usize) -> Vec<String> {

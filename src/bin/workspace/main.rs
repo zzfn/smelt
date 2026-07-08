@@ -25,6 +25,7 @@ use std::time::Instant;
 use chrono::Datelike;
 use gpui::*;
 use gpui::prelude::FluentBuilder;
+use gpui::InteractiveElement;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::chart::BarChart;
 use gpui_component::sidebar::{
@@ -204,6 +205,55 @@ enum Pane {
         state: Entity<ResizableState>,
         children: Vec<Pane>,
     },
+}
+
+/// 拖拽会话排序时跟随鼠标的小预览 chip（侧栏「项目内会话拖拽」用）。
+#[derive(Clone)]
+struct SessionDrag {
+    id: EntityId,
+    title: SharedString,
+}
+
+impl Render for SessionDrag {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme();
+        div()
+            .id("session-drag-preview")
+            .cursor_grab()
+            .py_1()
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .text_xs()
+            .text_color(t.foreground)
+            .child(self.title.clone())
+    }
+}
+
+/// 拖拽项目分组排序时跟随鼠标的小预览 chip。
+#[derive(Clone)]
+struct ProjectDrag {
+    name: SharedString,
+}
+
+impl Render for ProjectDrag {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme();
+        div()
+            .id("project-drag-preview")
+            .cursor_grab()
+            .py_1()
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .text_xs()
+            .text_color(t.foreground)
+            .child(self.name.clone())
+    }
 }
 
 /// 一个会话 = 一棵独立分屏树 + 会话内当前活动 pane（终端）。
@@ -585,7 +635,7 @@ fn rebuild_pane(
         PaneState::Leaf { cwd, id } => {
             // 有存档 id → reattach 守护里还活着的会话；旧存档无 id → 开新会话。
             let sid = id.clone().unwrap_or_else(new_sid);
-            let v = cx.new(|cx| TerminalView::new(cx, cwd.clone(), sid));
+            let v = cx.new(|cx| TerminalView::new(cx, cwd.clone(), sid, None));
             tabs.push(v.clone());
             Pane::Leaf(v)
         }
@@ -842,6 +892,13 @@ struct Workspace {
     usage_cache: Option<(Instant, Rc<usage_stats::UsageData>)>,
     /// 正在后台扫描用量数据（防重复并发 spawn）。
     usage_inflight: bool,
+    /// 项目行「+」悬浮出的 Claude Code / Codex 快捷菜单——记的是项目在 `projects`
+    /// 分组列表里的序号（`pix`）。
+    hover_launch_menu: Option<usize>,
+    /// 悬浮菜单的去抖动世代号：每次悬浮进/出都自增，鼠标离开按钮时不立即关菜单，
+    /// 而是延迟一小段再看世代号有没有变——没变才真的关，避免鼠标从按钮移向菜单项
+    /// 途中经过的空隙被判定成"已离开"而提前收起（见 set_launch_hover）。
+    hover_launch_gen: u64,
 }
 
 /// 宠物大脑配置的四个输入框（base_url / api_key / model / persona）。
@@ -881,7 +938,7 @@ impl Workspace {
             } else {
                 // 更旧格式：cwd 列表 → 每个 cwd 一个独立会话。
                 for cwd in s.tabs.clone() {
-                    let v = cx.new(|cx| TerminalView::new(cx, cwd, new_sid()));
+                    let v = cx.new(|cx| TerminalView::new(cx, cwd, new_sid(), None));
                     sessions.push(Session::single(v));
                 }
                 active_session = s.active;
@@ -951,6 +1008,8 @@ impl Workspace {
             dock_badge_count: None,
             usage_cache: None,
             usage_inflight: false,
+            hover_launch_menu: None,
+            hover_launch_gen: 0,
         };
         // 立即写盘：把本次启动生成/沿用的会话 id 落到存档。否则首启（或旧存档迁移）
         // 生成的新 id 只在内存里，若用户不做任何布局操作就退出，重开会因无 id 而
@@ -1109,13 +1168,157 @@ impl Workspace {
         self.sessions.get(self.active_session)
     }
 
+    /// 按会话的 cwd 分组成「项目」：(项目名, cwd, 该项目下的会话下标列表)，
+    /// 顺序 = 会话在 self.sessions 里首次出现的顺序。侧栏渲染和拖拽排序共用同一份算法，
+    /// 避免两处各算一遍、行为跑偏。临时终端（cwd 落在 scratch_dir）单独归一组「临时终端」。
+    fn project_groups(&self, cx: &App) -> Vec<(String, String, Vec<usize>)> {
+        let mut projects: Vec<(String, String, Vec<usize>)> = Vec::new();
+        for (ix, s) in self.sessions.iter().enumerate() {
+            let cwd = s.cwd(cx).unwrap_or_default();
+            let name = project_name_for_cwd(&cwd);
+            match projects.iter_mut().find(|(n, _, _)| *n == name) {
+                Some(p) => p.2.push(ix),
+                None => projects.push((name, cwd, vec![ix])),
+            }
+        }
+        projects
+    }
+
+    /// 拖拽排序：把 dragged 会话挪到 target 会话旁边（before=true 插到它前面，否则插到
+    /// 它后面）。只在同一项目内生效——这是「项目内排序」，不是「跨项目挪会话」，
+    /// dragged/target 分属不同项目时直接不动。用 entity_id 找位置而非缓存的下标：拖拽
+    /// 跨越多帧，下标可能因为其间的关会话等操作失效。
+    fn move_session_near(
+        &mut self,
+        dragged: EntityId,
+        target: EntityId,
+        before: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged == target {
+            return;
+        }
+        let groups = self.project_groups(cx);
+        let group_of = |id: EntityId| {
+            groups
+                .iter()
+                .position(|(_, _, ixs)| ixs.iter().any(|&ix| self.sessions[ix].active.entity_id() == id))
+        };
+        let (Some(dragged_group), Some(target_group)) = (group_of(dragged), group_of(target)) else {
+            return;
+        };
+        if dragged_group != target_group {
+            return;
+        }
+        let Some(from_ix) = self.sessions.iter().position(|s| s.active.entity_id() == dragged) else {
+            return;
+        };
+        let Some(target_ix) = self.sessions.iter().position(|s| s.active.entity_id() == target) else {
+            return;
+        };
+
+        let active_id = self.cur().map(|s| s.active.entity_id());
+        let session = self.sessions.remove(from_ix);
+        let adjusted_target_ix = if from_ix < target_ix { target_ix - 1 } else { target_ix };
+        let insert_at = adjusted_target_ix + if before { 0 } else { 1 };
+        self.sessions.insert(insert_at, session);
+
+        if let Some(id) = active_id {
+            if let Some(ix) = self.sessions.iter().position(|s| s.active.entity_id() == id) {
+                self.active_session = ix;
+            }
+        }
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// 拖拽排序：把 from 项目的所有会话（保持相对顺序）整体挪到 to 项目最前面。
+    fn move_project_near(&mut self, from_name: SharedString, to_name: SharedString, cx: &mut Context<Self>) {
+        if from_name == to_name {
+            return;
+        }
+        let groups = self.project_groups(cx);
+        let Some((_, _, from_ixs)) = groups.iter().find(|(n, _, _)| n.as_str() == from_name.as_ref())
+        else {
+            return;
+        };
+        if !groups.iter().any(|(n, _, _)| n.as_str() == to_name.as_ref()) {
+            return;
+        }
+        let mut from_ixs = from_ixs.clone();
+        from_ixs.sort_unstable();
+
+        let active_id = self.cur().map(|s| s.active.entity_id());
+        // 降序 remove 保证前面下标不受后面删除影响；收集完再倒回原相对顺序。
+        let mut moved: Vec<Session> = from_ixs.iter().rev().map(|&ix| self.sessions.remove(ix)).collect();
+        moved.reverse();
+
+        let insert_at = self
+            .sessions
+            .iter()
+            .position(|s| {
+                let cwd = s.cwd(cx).unwrap_or_default();
+                project_name_for_cwd(&cwd) == to_name.as_ref()
+            })
+            .unwrap_or(self.sessions.len());
+        for (i, s) in moved.into_iter().enumerate() {
+            self.sessions.insert(insert_at + i, s);
+        }
+
+        if let Some(id) = active_id {
+            if let Some(ix) = self.sessions.iter().position(|s| s.active.entity_id() == id) {
+                self.active_session = ix;
+            }
+        }
+        self.save_state(cx);
+        cx.notify();
+    }
+
     /// 「+」/新建：开一个独立新会话（单终端），并切过去。
     fn add_session(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| TerminalView::new(cx, cwd, new_sid()));
+        self.add_session_with_launch(cwd, None, cx);
+    }
+
+    /// 项目行「+」悬浮菜单的 Claude Code / Codex 快捷入口：`launch` 编进 shell 的
+    /// 启动命令行（见 terminal.rs::spawn / smeltd.rs::spawn_session），不是等
+    /// shell 起来后再补发按键，从根上没有时序竞态。
+    fn add_session_with_launch(
+        &mut self,
+        cwd: Option<String>,
+        launch: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|cx| TerminalView::new(cx, cwd, new_sid(), launch));
         self.sessions.push(Session::single(view));
         self.active_session = self.sessions.len() - 1;
         self.save_state(cx);
         cx.notify();
+    }
+
+    /// 项目行「+」悬浮菜单的开关状态机：进入立即打开；离开不立即关，延迟一小段再看
+    /// 世代号有没有被后续的悬浮进入打断——没打断才真的收起。鼠标从「+」移向下面菜单项
+    /// 途中会先离开「+」的悬浮区，这段延迟就是留给这趟"路上"的容错。
+    fn set_launch_hover(&mut self, pix: usize, entered: bool, cx: &mut Context<Self>) {
+        self.hover_launch_gen = self.hover_launch_gen.wrapping_add(1);
+        if entered {
+            self.hover_launch_menu = Some(pix);
+            cx.notify();
+            return;
+        }
+        if self.hover_launch_menu != Some(pix) {
+            return;
+        }
+        let gen = self.hover_launch_gen;
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(std::time::Duration::from_millis(220)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.hover_launch_gen == gen && this.hover_launch_menu == Some(pix) {
+                    this.hover_launch_menu = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// 在当前会话的活动 pane 上分屏：Horizontal=右侧并排，Vertical=下方堆叠。
@@ -1123,7 +1326,7 @@ impl Workspace {
         let Some(sess) = self.cur() else { return };
         let cwd = sess.active.read(cx).cwd().or_else(current_dir);
         let old = sess.active.entity_id();
-        let view = cx.new(|cx| TerminalView::new(cx, cwd, new_sid()));
+        let view = cx.new(|cx| TerminalView::new(cx, cwd, new_sid(), None));
         let state = cx.new(|_| ResizableState::default());
         let sess = &mut self.sessions[self.active_session];
         split_leaf(&mut sess.layout, old, axis, state, view.clone());
@@ -3019,6 +3222,8 @@ impl Render for Workspace {
             .collect();
         // 各会话状态（预算好，避免在侧栏 map 闭包里借用 cx）。与总览页共用同一套五态配色。
         let statuses: Vec<AgentStatus> = self.sessions.iter().map(|s| s.status(cx)).collect();
+        // 各会话的稳定身份（拖拽排序用：下标会因增删/排序失效，entity_id 不会）。
+        let entity_ids: Vec<EntityId> = self.sessions.iter().map(|s| s.active.entity_id()).collect();
         // 待处理通知总数（标题栏铃铛用）。
         let notif_count = self.collect_notifications(cx).len();
         // 当前活动会话的标题：放到标题栏右侧作为上下文提示。
@@ -3029,29 +3234,8 @@ impl Render for Workspace {
             .unwrap_or_default();
 
         // 左侧会话侧栏：按会话的 cwd 分组成项目（保持出现顺序），
-        // 记住每组的完整 cwd 供「在该项目新建终端」用。
-        // 临时终端（cwd 落在 scratch_dir，即 $HOME）单独归一组「临时终端」，
-        // 不跟真实项目混在一起、也不会被当成"名叫用户名的项目"。
-        let home = scratch_dir();
-        let mut projects: Vec<(String, String, Vec<usize>)> = Vec::new();
-        for (ix, _title) in titles.iter() {
-            let cwd = self.sessions[*ix].cwd(cx).unwrap_or_default();
-            let is_scratch = home.as_deref().is_some_and(|h| h == cwd);
-            let name = if is_scratch {
-                "临时终端".to_string()
-            } else {
-                cwd.trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("项目")
-                    .to_string()
-            };
-            match projects.iter_mut().find(|(n, _, _)| *n == name) {
-                Some(p) => p.2.push(*ix),
-                None => projects.push((name, cwd, vec![*ix])),
-            }
-        }
+        // 记住每组的完整 cwd 供「在该项目新建终端」用。分组算法见 project_groups。
+        let projects = self.project_groups(cx);
 
         // 项目 → 会话 两级菜单（gpui-component Sidebar）。
         // Sidebar 组件的回调是 Fn(&_, &mut Window, &mut App)，拿不到 Context<Self>，
@@ -3078,20 +3262,43 @@ impl Render for Workspace {
                             }
                         });
                         let e_act = this.clone();
-                        let mut item = SidebarMenuItem::new(title)
+                        let entity_id = entity_ids[ix];
+                        let drag_title: SharedString = title.clone().into();
+                        let e_drop = this.clone();
+                        let e_close = this.clone();
+                        let item = SidebarMenuItem::new(title)
                             .icon(IconName::SquareTerminal)
                             .active(ix == active)
                             .on_click(move |_ev, window, cx| {
                                 e_act.update(cx, |ws, cx| ws.activate(ix, window, cx));
-                            });
-                        // suffix：状态点 + 关闭按钮（有其一就挂）。
-                        if status_dot.is_some() || can_close {
-                            let e_close = this.clone();
-                            item = item.suffix(move |_w, _cx| {
-                                let e = e_close.clone();
+                            })
+                            // suffix：拖拽手柄（项目内排序）+ 状态点 + 关闭按钮。
+                            .suffix(move |_w, _cx| {
+                                let e_close = e_close.clone();
+                                let e_drop = e_drop.clone();
+                                let drag_title = drag_title.clone();
                                 h_flex()
                                     .items_center()
                                     .gap_1()
+                                    .child(
+                                        div()
+                                            .id(("sess-drag", ix))
+                                            .cursor_grab()
+                                            .on_drag(
+                                                SessionDrag { id: entity_id, title: drag_title },
+                                                |drag, _, _, cx| cx.new(|_| drag.clone()),
+                                            )
+                                            .drag_over::<SessionDrag>(|style, _, _, _cx| {
+                                                style.border_t_2().border_color(rgb(0x4a9eff))
+                                            })
+                                            .on_drop(move |drag: &SessionDrag, _window, cx| {
+                                                let dragged = drag.id;
+                                                e_drop.update(cx, |ws, cx| {
+                                                    ws.move_session_near(dragged, entity_id, true, cx)
+                                                });
+                                            })
+                                            .child(Icon::new(IconName::Menu).size_3().text_color(c_muted)),
+                                    )
                                     .children(
                                         status_dot
                                             .map(|c| div().size_2().rounded_full().bg(c)),
@@ -3104,37 +3311,105 @@ impl Render for Workspace {
                                             .on_click(move |_ev, _w, cx| {
                                                 // 别把点击冒泡成「切换到该会话」
                                                 cx.stop_propagation();
-                                                e.update(cx, |ws, cx| ws.close_session(ix, cx));
+                                                e_close.update(cx, |ws, cx| ws.close_session(ix, cx));
                                             })
                                     }))
                             });
-                        }
                         item
                     })
                     .collect();
-                // 项目行右侧「+」：在该项目目录下新建终端会话。
+                // 项目行右侧「+」：悬浮弹出 Claude Code / Codex 快捷入口，直接点「+」
+                // 本身还是新建普通终端。悬浮态记在 hover_launch_menu，按钮和悬浮菜单
+                // 项各自的 on_hover 都会重新置位，只要鼠标还压在其中一个上就不关。
                 let e_new = this.clone();
+                let e_hover = this.clone();
+                let e_proj_drop = this.clone();
+                let project_name: SharedString = name.clone().into();
                 let new_cwd = cwd.clone();
                 let is_scratch_group = name == "临时终端";
+                let hovered = self.hover_launch_menu == Some(pix);
+                let flyout_cwd = (!cwd.is_empty()).then(|| cwd.clone());
+                let flyout_items: Vec<SidebarMenuItem> = if hovered {
+                    let e_claude = this.clone();
+                    let e_codex = this.clone();
+                    let cwd_claude = flyout_cwd.clone();
+                    let cwd_codex = flyout_cwd.clone();
+                    vec![
+                        SidebarMenuItem::new("Claude Code")
+                            .icon(IconName::Bot)
+                            .on_click(move |_ev, _window, cx| {
+                                let cwd = cwd_claude.clone();
+                                e_claude.update(cx, |ws, cx| {
+                                    ws.hover_launch_menu = None;
+                                    ws.add_session_with_launch(cwd, Some("claude"), cx);
+                                });
+                            }),
+                        SidebarMenuItem::new("Codex")
+                            .icon(IconName::SquareTerminal)
+                            .on_click(move |_ev, _window, cx| {
+                                let cwd = cwd_codex.clone();
+                                e_codex.update(cx, |ws, cx| {
+                                    ws.hover_launch_menu = None;
+                                    ws.add_session_with_launch(cwd, Some("codex"), cx);
+                                });
+                            }),
+                    ]
+                } else {
+                    Vec::new()
+                };
                 SidebarMenuItem::new(name.clone())
                     .icon(if is_scratch_group { IconName::SquareTerminal } else { IconName::Folder })
                     .default_open(true)
                     .click_to_toggle(true)
                     .suffix(move |_w, _cx| {
                         let e = e_new.clone();
+                        let e_hover_cb = e_hover.clone();
+                        let e_proj_drop = e_proj_drop.clone();
+                        let project_name = project_name.clone();
                         let cwd = new_cwd.clone();
-                        Button::new(("new-in-project", pix))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .on_click(move |_ev, _w, cx| {
-                                // 别把点击冒泡成「折叠/展开分组」
-                                cx.stop_propagation();
-                                let cwd = (!cwd.is_empty()).then(|| cwd.clone());
-                                e.update(cx, |ws, cx| ws.add_session(cwd, cx));
-                            })
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                // 拖拽手柄：项目分组之间排序。
+                                div()
+                                    .id(("project-drag", pix))
+                                    .cursor_grab()
+                                    .on_drag(ProjectDrag { name: project_name.clone() }, |drag, _, _, cx| {
+                                        cx.new(|_| drag.clone())
+                                    })
+                                    .drag_over::<ProjectDrag>(|style, _, _, _cx| {
+                                        style.border_t_2().border_color(rgb(0x4a9eff))
+                                    })
+                                    .on_drop(move |drag: &ProjectDrag, _window, cx| {
+                                        let from = drag.name.clone();
+                                        let to = project_name.clone();
+                                        e_proj_drop.update(cx, |ws, cx| ws.move_project_near(from, to, cx));
+                                    })
+                                    .child(Icon::new(IconName::Menu).size_3().text_color(c_muted)),
+                            )
+                            .child(
+                                div()
+                                    .id(("new-in-project-hover", pix))
+                                    .on_hover(move |is_over, _window, cx| {
+                                        let is_over = *is_over;
+                                        e_hover_cb.update(cx, |ws, cx| ws.set_launch_hover(pix, is_over, cx));
+                                    })
+                                    .child(
+                                        Button::new(("new-in-project", pix))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Plus)
+                                            .on_click(move |_ev, _w, cx| {
+                                                // 别把点击冒泡成「折叠/展开分组」
+                                                cx.stop_propagation();
+                                                let cwd = (!cwd.is_empty()).then(|| cwd.clone());
+                                                e.update(cx, |ws, cx| ws.add_session(cwd, cx));
+                                            }),
+                                    ),
+                            )
                     })
-                    .children(sess_items)
+                    .children(flyout_items.into_iter().chain(sess_items))
             })
             .collect();
 
@@ -5080,6 +5355,22 @@ fn scratch_dir() -> Option<String> {
     dirs::home_dir().and_then(|p| p.to_str().map(String::from))
 }
 
+/// cwd → 侧栏项目分组显示名。跟 scratch_dir 命中的落到「临时终端」，否则取目录末段。
+/// Workspace::project_groups（侧栏渲染）和拖拽排序（找会话/插入点归属的项目）共用。
+fn project_name_for_cwd(cwd: &str) -> String {
+    let is_scratch = scratch_dir().as_deref().is_some_and(|h| h == cwd);
+    if is_scratch {
+        "临时终端".to_string()
+    } else {
+        cwd.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("项目")
+            .to_string()
+    }
+}
+
 /// file:// URL → 本地路径（percent 解码，支持中文 / 空格目录名）。
 fn file_url_to_path(url: &str) -> Option<std::path::PathBuf> {
     let rest = url.strip_prefix("file://")?;
@@ -5115,6 +5406,11 @@ fn open_workspace_window(cx: &mut App, window_bg: WindowBackgroundAppearance) ->
     };
     let mut workspace = None;
     cx.open_window(window_options, |window, cx| {
+        // 界面文字（侧边栏/标签页/状态栏等）用的都是 text_xs/text_sm 这类相对 rem
+        // 单位，默认 rem_size=16px 偏小；这里统一调大，全局跟着等比例放大，不用
+        // 逐个改 .text_xs()/.text_sm()。终端内容本身的字号另由 terminal_view.rs
+        // 的 FONT_PX 控制，不受这个影响。
+        window.set_rem_size(px(18.));
         let view = cx.new(|cx| Workspace::new(cx));
         workspace = Some(view.clone());
         // 顶层视图必须包一层 Root（组件库的主题/遮罩系统要求）。
