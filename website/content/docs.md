@@ -6,7 +6,10 @@ prototype，接口和默认行为可能会变。
 
 ## 快速开始
 
-需要 Rust 工具链和 Xcode Command Line Tools（不需要完整 Xcode）。
+从 [GitHub Releases](https://github.com/zzfn/smelt/releases) 下载 `Smelt.dmg`，拖进
+应用程序文件夹即可，只支持 Apple Silicon Mac。
+
+**从源码构建**（需要 Rust 工具链和 Xcode Command Line Tools，不需要完整 Xcode）：
 
 ```sh
 cargo run --bin workspace   # GUI 主程序

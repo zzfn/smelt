@@ -1,8 +1,5 @@
-import { CopyButton } from "./CopyButton";
 import { TerminalWindow } from "./TerminalWindow";
 import { Tok } from "./Syntax";
-
-const INSTALL_CMD = "cargo run --bin workspace";
 
 export function Hero() {
   return (
@@ -28,18 +25,21 @@ export function Hero() {
         </p>
 
         <div className="mt-8 flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-2 rounded-lg border border-border bg-surface pl-4 pr-2 py-2 font-mono text-sm">
-            <span className="text-dim">$</span>
-            <span className="text-foreground">{INSTALL_CMD}</span>
-            <CopyButton text={INSTALL_CMD} />
-          </div>
+          <a
+            href="https://github.com/zzfn/smelt/releases"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="rounded-lg bg-gradient-to-r from-accent to-accent-2 px-5 py-2.5 text-sm font-medium text-[#08090c] transition-opacity hover:opacity-90"
+          >
+            下载 Smelt.dmg（macOS）
+          </a>
           <a
             href="https://github.com/zzfn/smelt"
             target="_blank"
             rel="noopener noreferrer"
             className="rounded-lg px-4 py-2.5 text-sm font-medium text-muted transition-colors hover:text-foreground"
           >
-            查看源码 →
+            或从源码构建 →
           </a>
         </div>
       </div>

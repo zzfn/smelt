@@ -40,22 +40,13 @@ export function Nav() {
 
         <nav className="hidden items-center gap-6 text-sm text-muted sm:flex">
           {isHome ? (
-            <>
-              <button
-                type="button"
-                onClick={() => scrollToId("features")}
-                className="cursor-pointer transition-colors hover:text-foreground"
-              >
-                功能
-              </button>
-              <button
-                type="button"
-                onClick={() => scrollToId("comparison")}
-                className="cursor-pointer transition-colors hover:text-foreground"
-              >
-                对比
-              </button>
-            </>
+            <button
+              type="button"
+              onClick={() => scrollToId("features")}
+              className="cursor-pointer transition-colors hover:text-foreground"
+            >
+              功能
+            </button>
           ) : (
             <Link href="/" className="transition-colors hover:text-foreground">
               首页
