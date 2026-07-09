@@ -3,7 +3,7 @@
 //! 供「用量」页画按工具 / 按模型 / 按项目拆分 + 今日走势 + 活动热力图。
 //! 只读本地已有文件，不需要额外 hook；只看 token 数量，不折算价格（单价表会过时）。
 
-use chrono::{DateTime, Local, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -184,34 +184,6 @@ fn sorted_desc(m: HashMap<String, u64>) -> Vec<(String, u64)> {
     v
 }
 
-/// 今天（本地时区）按 `bucket_minutes` 分钟分桶的 token 用量走势；返回
-/// `24*60/bucket_minutes` 个桶，标签是桶起始的本地时间 "HH:MM"（早于当前时间的桶
-/// 已定，之后的桶留空 0，画出"到现在为止"的走势）。全局口径，不分项目。
-pub fn daily_buckets(events: &[UsageEvent], bucket_minutes: i64) -> Vec<(String, u64)> {
-    let today = Local::now().date_naive();
-    let bucket_count = (24 * 60 / bucket_minutes).max(1) as usize;
-    let mut buckets = vec![0u64; bucket_count];
-    for e in events {
-        let local_ts = e.ts.with_timezone(&Local);
-        if local_ts.date_naive() != today {
-            continue;
-        }
-        let minute_of_day = local_ts.hour() as i64 * 60 + local_ts.minute() as i64;
-        let idx = (minute_of_day / bucket_minutes) as usize;
-        if idx < buckets.len() {
-            buckets[idx] += e.tokens;
-        }
-    }
-    buckets
-        .into_iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let total_min = i as i64 * bucket_minutes;
-            (format!("{:02}:{:02}", total_min / 60, total_min % 60), v)
-        })
-        .collect()
-}
-
 /// 过去 `weeks` 周每天的 token 总量（本地时区，含今天），按日期升序；供活动热力图用。
 /// 全局口径，不分项目。
 pub fn daily_heatmap(events: &[UsageEvent], weeks: i64) -> Vec<(NaiveDate, u64)> {
@@ -333,21 +305,6 @@ mod tests {
         let data = scan_root(&tmp);
         std::fs::remove_dir_all(&tmp).unwrap();
         assert_eq!(data.events.len(), 1);
-    }
-
-    #[test]
-    fn daily_buckets_group_by_local_half_hour() {
-        let events = vec![
-            UsageEvent {
-                ts: Local::now().with_timezone(&Utc),
-                project_label: "p".to_string(),
-                model: "m".to_string(),
-                tokens: 42,
-            },
-        ];
-        let buckets = daily_buckets(&events, 30);
-        assert_eq!(buckets.len(), 48);
-        assert_eq!(buckets.iter().map(|(_, v)| v).sum::<u64>(), 42);
     }
 
     #[test]
