@@ -35,11 +35,13 @@ use gpui_component::sidebar::{
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::Input;
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::badge::Badge;
+use gpui_component::notification::Notification;
 use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::setting::{Settings, SettingField, SettingGroup, SettingItem, SettingPage};
 use gpui_component::slider::{Slider, SliderEvent, SliderState, SliderValue};
+use gpui_component::table::{Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState};
 use gpui_component::text::TextView;
 use gpui_component::resizable::{
     h_resizable, resizable_panel, v_resizable, ResizablePanelEvent, ResizableState,
@@ -3452,6 +3454,26 @@ impl Render for Workspace {
         if self.dock_badge_count != Some(attention_count) {
             self.dock_badge_count = Some(attention_count);
             dock::set_badge(attention_count);
+        }
+
+        // 组件 toast：app 前台但没在看的 pane 有新通知时弹一条（右上角浮层，5s
+        // 自动消失）。完全切到别的 app 时不弹 toast，走 terminal_view.rs 里的系统
+        // 通知；正在看的那个 pane 直接吃掉待发消息，不弹——你自己看得见。
+        // 每帧都要来取（不管是否前台），否则待发消息会一直攒着，等哪天恰好前台又
+        // 不是当前 pane 时全冒出来。
+        let window_active = window.is_window_active();
+        for (ix, sess) in self.sessions.iter().enumerate() {
+            let mut leaves = Vec::new();
+            collect_leaves(&sess.layout, &mut leaves);
+            let active_pane_id = sess.active.entity_id();
+            for leaf in &leaves {
+                let toast = leaf.update(cx, |t, _cx| t.take_pending_toast());
+                let Some(msg) = toast else { continue };
+                let is_current_view = ix == active && leaf.entity_id() == active_pane_id;
+                if window_active && !is_current_view {
+                    window.push_notification(Notification::info(msg), cx);
+                }
+            }
         }
 
         // Git 页：后台刷新改动列表（git status 慢，绝不在 render 里同步跑）。

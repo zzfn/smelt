@@ -91,6 +91,10 @@ pub struct TerminalView {
     /// 最近一次系统通知的 (文本, 时刻)：同文本 60s 内不重发（Claude Code 会反复
     /// 上报 waiting for input，不去重就是通知轰炸）。
     last_notified: Option<(String, Instant)>,
+    /// app 前台但用户没在看这个 pane 时的 toast 待发消息（组件 Notification）；
+    /// Workspace::render 每帧来取，取走即清空。跟 last_notified 共用同一条
+    /// 60s 同文本去重（见轮询循环），系统通知 / toast 二选一，不会重复弹。
+    pending_toast: Option<String>,
     /// 最近一次比较过的外观设置：定时刷新时用于判断"背景色/图/透明度/模糊"是否被
     /// 改过（这些跟 PTY 内容无关，Terminal::take_damage 感知不到）。
     /// None = 还没比较过，首次一律当作"变了"以确保能显示当前外观。
@@ -193,8 +197,14 @@ impl TerminalView {
                         .last_notified
                         .as_ref()
                         .is_some_and(|(m, t)| *m == msg && now.duration_since(*t) < NOTIFY_DEDUP);
-                    if cx.active_window().is_none() && !dup {
-                        system_notify(&this.title, task.as_deref(), &msg);
+                    if !dup {
+                        if cx.active_window().is_none() {
+                            system_notify(&this.title, task.as_deref(), &msg);
+                        } else {
+                            // app 在前台：系统通知不弹，改交给 Workspace::render 判断——
+                            // 只有「没在看这个 pane」才真弹 toast，正在看的直接吃掉。
+                            this.pending_toast = Some(msg.clone());
+                        }
                         this.last_notified = Some((msg.clone(), now));
                     }
                     // 宠物播报照常（应用内的轻提示，不算系统级打扰；宠物自己有气泡节流）。
@@ -285,6 +295,7 @@ impl TerminalView {
             session_id,
             completed_unread: false,
             last_notified: None,
+            pending_toast: None,
             last_appearance: None,
             scroll_accum: 0.0,
             launch_kind,
@@ -365,6 +376,11 @@ impl TerminalView {
     /// 通知消息文本（供通知面板显示）。
     pub fn notification(&self) -> Option<&str> {
         self.notification.as_deref()
+    }
+
+    /// 取走待发的 toast 消息（见 pending_toast）；Workspace::render 每帧调用一次。
+    pub fn take_pending_toast(&mut self) -> Option<String> {
+        self.pending_toast.take()
     }
 
     /// agent 报告的终端标题（含任务名 + 状态符号）；供侧栏 / 总览显示。
