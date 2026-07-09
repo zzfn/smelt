@@ -280,6 +280,29 @@ impl TerminalView {
         &self.session_id
     }
 
+    /// 守护整个重启后（旧会话随守护进程一起死掉，见 `terminal::restart_daemon`），
+    /// 换一个全新会话顶替冻结的旧连接——同 id 在全新守护里查无此会话，走 `handle_open`
+    /// 的新建分支，等效于重开一个终端。旧网格尺寸不丢：grid_size 仍是上次量到的值，
+    /// 下一帧 render() 会照常把新终端 resize 到位，用户侧只是内容被清空重开。
+    /// 连不上守护就原地不动（仍是冻结的旧终端），不 panic。
+    pub fn reconnect(&mut self, cx: &mut Context<Self>) {
+        let Ok(terminal) = Terminal::spawn(24, 80, self.cwd.as_deref(), &self.session_id, None)
+        else {
+            return;
+        };
+        self.terminal = terminal;
+        self.notification = None;
+        self.notified_at = None;
+        self.was_running = false;
+        self.running_frames = 0;
+        self.stuck_notified = false;
+        self.completed_unread = false;
+        self.last_notified = None;
+        self.sel = None;
+        self.cursor = None;
+        cx.notify();
+    }
+
     /// 最近通知时刻（总览页「N 分钟前」用）。
     pub fn notified_at(&self) -> Option<Instant> {
         self.notified_at

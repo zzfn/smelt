@@ -1620,7 +1620,8 @@ impl Workspace {
 
     /// 用户在弹窗里点了「确定重启」：让守护退出（断开所有会话）、拉起磁盘上最新的
     /// smeltd、再刷新状态。三步都涉及阻塞 IO（socket 往返 + 最坏 5s 轮询），全扔
-    /// 后台线程，不卡 UI。
+    /// 后台线程，不卡 UI。新守护起来后，旧会话已经全死了（网格冻结、敲键盘没反应），
+    /// 逐个 pane 调 reconnect() 换新会话顶上，不然只能靠用户手动发现、重开 GUI 才恢复。
     fn confirm_restart_daemon(&mut self, cx: &mut Context<Self>) {
         self.show_daemon_restart_confirm = false;
         self.daemon_outdated = None;
@@ -1636,6 +1637,13 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.daemon_outdated = Some(outdated);
+                for sess in &this.sessions {
+                    let mut leaves = Vec::new();
+                    collect_leaves(&sess.layout, &mut leaves);
+                    for leaf in leaves {
+                        leaf.update(cx, |view, cx| view.reconnect(cx));
+                    }
+                }
                 cx.notify();
             });
         })
