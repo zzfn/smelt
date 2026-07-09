@@ -10,6 +10,7 @@ mod dock;
 mod hotspot;
 mod pet;
 mod session_history;
+mod status_item;
 mod terminal;
 mod terminal_view;
 mod updater;
@@ -5903,6 +5904,9 @@ fn main() {
     app.on_open_urls(move |urls| {
         let _ = url_tx.send_blocking(urls);
     });
+    // 菜单栏常驻图标点击：见 status_item.rs 顶部注释，回调发生在纯 AppKit 层
+    // （没有 GPUI 的 cx），一样经 channel 转发到下面 run() 里 drain。
+    let (status_tx, status_rx) = smol::channel::unbounded::<()>();
 
     // 当前存活的主窗口（weak，随窗口关闭自然失效）。首启时在 run() 里写入；
     // URL 投递循环和「点 Dock 图标重开」都读它判断当前有没有主窗口。
@@ -5955,12 +5959,15 @@ fn main() {
         cx.set_global(pet::PetMailbox::default());
         cx.set_global(agent::load_llm_config());
         pet::open_pet_window(cx);
+        // 菜单栏常驻图标：点击唤出/前置主窗口，见 status_item.rs。
+        status_item::setup(status_tx);
 
         // 首启主窗口，记入 current_ws（reopen 回调 / URL 投递循环都靠它判断当前主窗口）。
         *current_ws.borrow_mut() = Some(open_workspace_window(cx, window_bg));
 
         // 消费 Dock / Finder 投递的目录：每个开一个会话（文件取父目录）。常驻到应用退出，
         // 不因主窗口一度被关掉而停——重开窗口后应继续能接文件投递。
+        let current_ws_status = current_ws.clone();
         cx.spawn(async move |cx| {
             while let Ok(urls) = url_rx.recv().await {
                 let paths: Vec<std::path::PathBuf> =
@@ -5971,6 +5978,26 @@ fn main() {
                 let ws = current_ws.borrow().clone();
                 if let Some(ws) = ws {
                     let _ = ws.update(cx, |ws, cx| ws.open_paths(&paths, cx));
+                }
+            }
+        })
+        .detach();
+
+        // 菜单栏图标点击：主窗口还活着就前置 app，没了就跟 on_reopen 一样重开一扇。
+        cx.spawn(async move |cx| {
+            while status_rx.recv().await.is_ok() {
+                let alive = current_ws_status.borrow().as_ref().is_some_and(|w| w.upgrade().is_some());
+                if alive {
+                    status_item::activate_app();
+                } else {
+                    cx.update(|cx| {
+                        let window_bg = cx
+                            .try_global::<Appearance>()
+                            .map(|a| a.window_bg())
+                            .unwrap_or(WindowBackgroundAppearance::Opaque);
+                        let ws = open_workspace_window(cx, window_bg);
+                        *current_ws_status.borrow_mut() = Some(ws);
+                    });
                 }
             }
         })
