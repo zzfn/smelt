@@ -29,7 +29,6 @@ use gpui::prelude::FluentBuilder;
 use gpui::InteractiveElement;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::chart::BarChart;
-use gpui_component::plot::shape::BarAlignment;
 use gpui_component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenu, SidebarMenuItem,
 };
@@ -1938,7 +1937,7 @@ impl Workspace {
 
                 div()
                     .id(("ov-card", ix))
-                    .w(px(380.))
+                    .w(px(300.))
                     .p_4()
                     .rounded(px(18.))
                     .border_1()
@@ -2008,10 +2007,9 @@ impl Workspace {
                                 div().text_color(c_amber).child(format!("● {changed} 改动"))
                             }))
                     }))
-                    // 当前会话：跑了多久 / token 用量 / 最近工具调用。卡片加宽后仍装不下
-                    // 就换行，不再单行截断吞掉后半截（工具名常常最有用，之前恰恰被切没）。
+                    // 当前会话：跑了多久 / token 用量 / 最近工具调用
                     .children(live_line.map(|line| {
-                        div().text_xs().text_color(muted).child(line)
+                        div().text_xs().text_color(muted).truncate().child(line)
                     }))
                     // 需要处理时显示通知消息（红底胶囊，更醒目）
                     .children(notif.map(|m| {
@@ -2025,9 +2023,7 @@ impl Workspace {
                             .truncate()
                             .child(m)
                     }))
-                    // 迷你终端预览（末尾几行）：改自动换行，装不下的原始终端行（尤其
-                    // starship/oh-my-posh 这类花哨 prompt）折成两三行也比单行截断吞了
-                    // 大半内容强，卡片高度跟着内容走，不再强行按住一行。
+                    // 迷你终端预览（末尾几行）
                     .children((!preview.is_empty()).then(|| {
                         div()
                             .p_2()
@@ -2038,9 +2034,8 @@ impl Workspace {
                             .text_color(muted)
                             .flex()
                             .flex_col()
-                            .gap_1()
                             .children(preview.into_iter().map(|line| {
-                                div().child(if line.is_empty() {
+                                div().truncate().whitespace_nowrap().child(if line.is_empty() {
                                     " ".to_string()
                                 } else {
                                     line
@@ -4774,21 +4769,7 @@ fn usage_view(
     let cur_tool = cur_project.as_deref().map(|p| usage_stats::by_tool(&data.tools, Some(p))).unwrap_or_default();
     let global_model = usage_stats::by_model(&data.events, None);
     let global_tool = usage_stats::by_tool(&data.tools, None);
-    // 展示用截短成目录末段：project_label 是完整 cwd 路径，横向条形图标签区虽然
-    // 不会叠字了，但整条路径依然又长又占地方，用不着的前缀部分不如省下来。
-    let global_project: Vec<(String, u64)> = usage_stats::by_project(&data.events)
-        .into_iter()
-        .map(|(path, tokens)| {
-            let short = path
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(&path)
-                .to_string();
-            (short, tokens)
-        })
-        .collect();
+    let global_project = usage_stats::by_project(&data.events);
 
     let cur_project_row = h_flex()
         .gap_3()
@@ -4834,13 +4815,9 @@ fn usage_section(title: &str, caption: &str, muted: Hsla, border: Hsla, body: An
 }
 
 /// 用量页的一个「按 X 拆分」柱状图区块；data 为空时显示「无数据」占位。
-///
-/// 横向条形图（`BarAlignment::Left`）：类目名沿 y 轴一行一个排开，标签区宽度按实际
-/// 文字量测预留，不会像竖向柱状图那样把长类目名（`mcp__xxx__yyy` 工具名、项目全路径）
-/// 挤在 x 轴上互相叠字看不清。
 fn bar_section(title: &str, muted: Hsla, border: Hsla, color: Hsla, data: Vec<(String, u64)>) -> Div {
-    // 种类一多（尤其工具名，含各种 mcp__xxx__yyy 前缀）行会太挤，只画头部几项，
-    // 其余合并成一根"其他"条。
+    // 种类一多（尤其工具名，含各种 mcp__xxx__yyy 前缀）柱子会挤成一团、x 轴标签
+    // 叠在一起看不清，只画头部几项，其余合并成一根"其他"柱子。
     let data = cap_top_n(data, 6);
     let total: u64 = data.iter().map(|(_, v)| *v).sum();
     let body = if data.is_empty() {
@@ -4851,7 +4828,6 @@ fn bar_section(title: &str, muted: Hsla, border: Hsla, color: Hsla, data: Vec<(S
                 .band(|d: &(String, u64)| d.0.clone())
                 .value(|d: &(String, u64)| d.1 as f64)
                 .fill(move |_, _, _, _| color)
-                .alignment(BarAlignment::Left)
                 .tick_margin(1),
         )
     };
