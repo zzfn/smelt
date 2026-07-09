@@ -787,17 +787,30 @@ fn save_appearance(a: &Appearance) {
     }
 }
 
-/// Claude Code 快捷启动的权限模式（全局单例，存 ~/.smelt/launch.json）。
+/// Claude Code / Copilot / Codex 快捷启动的权限模式（全局单例，存 ~/.smelt/launch.json）。
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct LaunchConfig {
     /// 开启后项目行「+」的 Claude Code 快捷入口改用
     /// `claude --dangerously-skip-permissions` 启动，跳过所有权限确认。
     claude_full_permissions: bool,
+    /// 开启后项目行「+」的 Copilot 快捷入口改用 `copilot --allow-all` 启动
+    /// （等价于同时开 --allow-all-tools/--allow-all-paths/--allow-all-urls），
+    /// 跳过所有权限确认。新增字段用 serde(default)，读旧存档缺这个键不报错。
+    #[serde(default)]
+    copilot_full_permissions: bool,
+    /// 开启后项目行「+」的 Codex 快捷入口改用
+    /// `codex --dangerously-bypass-approvals-and-sandbox` 启动，跳过所有确认+沙箱。
+    #[serde(default)]
+    codex_full_permissions: bool,
 }
 
 impl Default for LaunchConfig {
     fn default() -> Self {
-        Self { claude_full_permissions: false }
+        Self {
+            claude_full_permissions: false,
+            copilot_full_permissions: false,
+            codex_full_permissions: false,
+        }
     }
 }
 
@@ -832,6 +845,41 @@ fn apply_launch_config(f: impl FnOnce(&mut LaunchConfig), cx: &mut App) {
     f(&mut c);
     save_launch_config(&c);
     cx.set_global(c);
+}
+
+/// Copilot CLI 自己的配置文件路径（不是 smelt 的配置——这是 Copilot 全局设置，
+/// 改了会影响你在任何地方用 copilot，不只是 smelt 里）。
+fn copilot_settings_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".copilot").join("settings.json"))
+}
+
+/// 读 Copilot 的 `beep`（响铃提醒）开关；默认关闭，跟 Copilot 自己的默认值一致。
+/// 每次都现读盘（不缓存）：这份文件可能被 Copilot CLI 自己或用户在别处改动。
+fn read_copilot_beep() -> bool {
+    copilot_settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("beep").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
+/// 写 Copilot 的 `beep` 开关：只改这一个键，其余键（比如已有的 footer 配置）原样保留。
+fn set_copilot_beep(enabled: bool) {
+    let Some(path) = copilot_settings_path() else { return };
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    value["beep"] = serde_json::Value::Bool(enabled);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 /// 改外观全局 + 存盘，不触发 view 重绘（调用方按需自己 notify/refresh）。
@@ -2599,24 +2647,72 @@ impl Workspace {
             ]),
         );
 
-        // —— 启动：项目「+」快捷启动 Claude Code 时用的参数 ——
+        // —— 启动：项目「+」快捷启动 Claude Code / Copilot 时用的参数 ——
         let launch_page = SettingPage::new("启动").group(
-            SettingGroup::new().item(
-                SettingItem::new(
-                    "Claude Code 全权限启动",
-                    SettingField::switch(
-                        |cx: &App| cx.global::<LaunchConfig>().claude_full_permissions,
-                        |v: bool, cx: &mut App| {
-                            apply_launch_config(|c| c.claude_full_permissions = v, cx)
-                        },
+            SettingGroup::new()
+                .item(
+                    SettingItem::new(
+                        "Claude Code 全权限启动",
+                        SettingField::switch(
+                            |cx: &App| cx.global::<LaunchConfig>().claude_full_permissions,
+                            |v: bool, cx: &mut App| {
+                                apply_launch_config(|c| c.claude_full_permissions = v, cx)
+                            },
+                        ),
+                    )
+                    .description(
+                        "开启后项目行「+」的 Claude Code 快捷入口用 \
+                         claude --dangerously-skip-permissions 启动，跳过所有权限确认；\
+                         关闭则正常走 claude。",
                     ),
                 )
-                .description(
-                    "开启后项目行「+」的 Claude Code 快捷入口用 \
-                     claude --dangerously-skip-permissions 启动，跳过所有权限确认；\
-                     关闭则正常走 claude。",
+                .item(
+                    SettingItem::new(
+                        "Copilot 全权限启动",
+                        SettingField::switch(
+                            |cx: &App| cx.global::<LaunchConfig>().copilot_full_permissions,
+                            |v: bool, cx: &mut App| {
+                                apply_launch_config(|c| c.copilot_full_permissions = v, cx)
+                            },
+                        ),
+                    )
+                    .description(
+                        "开启后项目行「+」的 Copilot 快捷入口用 copilot --allow-all 启动\
+                         （等价于 --allow-all-tools --allow-all-paths --allow-all-urls），\
+                         跳过所有权限确认；关闭则正常走 copilot。",
+                    ),
+                )
+                .item(
+                    SettingItem::new(
+                        "Codex 全权限启动",
+                        SettingField::switch(
+                            |cx: &App| cx.global::<LaunchConfig>().codex_full_permissions,
+                            |v: bool, cx: &mut App| {
+                                apply_launch_config(|c| c.codex_full_permissions = v, cx)
+                            },
+                        ),
+                    )
+                    .description(
+                        "开启后项目行「+」的 Codex 快捷入口用 \
+                         codex --dangerously-bypass-approvals-and-sandbox 启动，跳过所有确认\
+                         和沙箱限制；关闭则正常走 codex。",
+                    ),
+                )
+                .item(
+                    SettingItem::new(
+                        "Copilot 响铃通知",
+                        SettingField::switch(
+                            |_cx: &App| read_copilot_beep(),
+                            |v: bool, _cx: &mut App| set_copilot_beep(v),
+                        ),
+                    )
+                    .description(
+                        "开启 Copilot CLI 自己的 beep 设置（默认关闭）：需要你确认或跑完一轮时\
+                         发终端响铃，smelt 能借此点亮侧栏状态点/toast/角标——不开这个 Copilot \
+                         不会主动发任何信号。改的是 ~/.copilot/settings.json，会影响你所有场景下\
+                         用 Copilot，不止 smelt 里。",
+                    ),
                 ),
-            ),
         );
 
         // —— 更新：检查/下载全自动静默，生效推迟到退出时 ——
@@ -3915,11 +4011,15 @@ impl Render for Workspace {
                                         let cwd_new = cwd.clone();
                                         let cwd_claude = cwd.clone();
                                         let cwd_codex = cwd.clone();
-                                        let cwd_copilot = cwd;
+                                        let cwd_codex_resume = cwd.clone();
+                                        let cwd_copilot = cwd.clone();
+                                        let cwd_copilot_resume = cwd;
                                         let e_term = e_new.clone();
                                         let e_claude = e_new.clone();
                                         let e_codex = e_new.clone();
+                                        let e_codex_resume = e_new.clone();
                                         let e_copilot = e_new.clone();
+                                        let e_copilot_resume = e_new.clone();
                                         menu.item(
                                             PopupMenuItem::new("新建终端")
                                                 .icon(IconName::SquareTerminal)
@@ -3952,8 +4052,35 @@ impl Render for Workspace {
                                                 .icon(IconName::Bot)
                                                 .on_click(move |_ev, _window, cx| {
                                                     let cwd = cwd_codex.clone();
+                                                    // 是否跳过权限确认由设置页的开关决定，每次点击都读最新值。
+                                                    let full_perm = cx
+                                                        .try_global::<LaunchConfig>()
+                                                        .is_some_and(|c| c.codex_full_permissions);
+                                                    let launch = if full_perm {
+                                                        "codex --dangerously-bypass-approvals-and-sandbox"
+                                                    } else {
+                                                        "codex"
+                                                    };
                                                     e_codex.update(cx, |ws, cx| {
-                                                        ws.add_session_with_launch(cwd, Some("codex"), cx)
+                                                        ws.add_session_with_launch(cwd, Some(launch), cx)
+                                                    });
+                                                }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new("Codex（继续上次）")
+                                                .icon(IconName::Bot)
+                                                .on_click(move |_ev, _window, cx| {
+                                                    let cwd = cwd_codex_resume.clone();
+                                                    let full_perm = cx
+                                                        .try_global::<LaunchConfig>()
+                                                        .is_some_and(|c| c.codex_full_permissions);
+                                                    let launch = if full_perm {
+                                                        "codex resume --last --dangerously-bypass-approvals-and-sandbox"
+                                                    } else {
+                                                        "codex resume --last"
+                                                    };
+                                                    e_codex_resume.update(cx, |ws, cx| {
+                                                        ws.add_session_with_launch(cwd, Some(launch), cx)
                                                     });
                                                 }),
                                         )
@@ -3962,8 +4089,35 @@ impl Render for Workspace {
                                                 .icon(IconName::Github)
                                                 .on_click(move |_ev, _window, cx| {
                                                     let cwd = cwd_copilot.clone();
+                                                    // 是否跳过权限确认由设置页的开关决定，每次点击都读最新值。
+                                                    let full_perm = cx
+                                                        .try_global::<LaunchConfig>()
+                                                        .is_some_and(|c| c.copilot_full_permissions);
+                                                    let launch = if full_perm {
+                                                        "copilot --allow-all"
+                                                    } else {
+                                                        "copilot"
+                                                    };
                                                     e_copilot.update(cx, |ws, cx| {
-                                                        ws.add_session_with_launch(cwd, Some("copilot"), cx)
+                                                        ws.add_session_with_launch(cwd, Some(launch), cx)
+                                                    });
+                                                }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new("Copilot（继续上次）")
+                                                .icon(IconName::Github)
+                                                .on_click(move |_ev, _window, cx| {
+                                                    let cwd = cwd_copilot_resume.clone();
+                                                    let full_perm = cx
+                                                        .try_global::<LaunchConfig>()
+                                                        .is_some_and(|c| c.copilot_full_permissions);
+                                                    let launch = if full_perm {
+                                                        "copilot --continue --allow-all"
+                                                    } else {
+                                                        "copilot --continue"
+                                                    };
+                                                    e_copilot_resume.update(cx, |ws, cx| {
+                                                        ws.add_session_with_launch(cwd, Some(launch), cx)
                                                     });
                                                 }),
                                         )
