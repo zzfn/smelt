@@ -23,7 +23,7 @@ pub const DEFAULT_BG: u32 = 0x001a_1b26;
 /// 16 色 ANSI 调色板。彩色沿用 Tokyo Night，白/亮白改为灰白/纯白（iTerm2 风格）。
 const PALETTE: [u32; 16] = [
     0x0015_161e, 0x00f7_768e, 0x009e_ce6a, 0x00e0_af68, 0x007a_a2f7, 0x00bb_9af7, 0x007d_cfff,
-    0x00c7_c7c7, 0x0041_4868, 0x00f7_768e, 0x009e_ce6a, 0x00e0_af68, 0x007a_a2f7, 0x00bb_9af7,
+    0x00c7_c7c7, 0x002c_3149, 0x00f7_768e, 0x009e_ce6a, 0x00e0_af68, 0x007a_a2f7, 0x00bb_9af7,
     0x007d_cfff, 0x00ff_ffff,
 ];
 
@@ -612,6 +612,15 @@ impl Terminal {
         }
     }
 
+    /// 滚回底部：真实终端的通行做法——手滑滚了一下历史后忘了滚回去，键盘一敲就该
+    /// 跟手回到最新输出，不然新内容（比如 Claude Code 退出时打的那行提示）默默追加
+    /// 到当前视野之外，用户会误以为「没打印」。
+    pub fn scroll_to_bottom(&mut self) {
+        if let Ok(mut term) = self.term.lock() {
+            term.scroll_display(Scroll::Bottom);
+        }
+    }
+
     /// 滚轮：按终端当前模式分流，`lines` 正数向上、负数向下，`(row,col)` 为 0 基单元格。
     ///
     /// - 应用开了鼠标上报（MOUSE_MODE）→ 把滚轮编码成鼠标滚轮事件发给应用。**Claude Code
@@ -663,6 +672,34 @@ impl Terminal {
         } else if let Ok(mut term) = self.term.lock() {
             term.scroll_display(Scroll::Delta(lines));
         }
+    }
+
+    /// 鼠标左键按下/松开上报：应用开了鼠标上报（MOUSE_MODE）时才编码转发，
+    /// 否则原样返回 false 交给调用方走本地框选。**Claude Code TUI 里可点击的条目
+    /// （比如 fork agent 那一行）就是靠收到这个鼠标事件来响应点击的**——iTerm2 等
+    /// 真终端本就会转发，我们之前只转发了滚轮，点击全被本地框选吃掉了。
+    /// `pressed` true=按下、false=松开；`(row,col)` 0 基单元格。
+    pub fn mouse_button(&mut self, pressed: bool, row: usize, col: usize) -> bool {
+        let mode = match self.term.lock() {
+            Ok(term) => *term.mode(),
+            Err(_) => return false,
+        };
+        if !mode.intersects(TermMode::MOUSE_MODE) {
+            return false;
+        }
+        let cx = col.saturating_add(1);
+        let cy = row.saturating_add(1);
+        let buf = if mode.contains(TermMode::SGR_MOUSE) {
+            format!("\x1b[<0;{cx};{cy}{}", if pressed { 'M' } else { 'm' }).into_bytes()
+        } else {
+            // X10 编码：按下按钮码 0，松开固定用 3（不区分具体按了哪个键）。
+            let cb: u8 = if pressed { 0 } else { 3 };
+            let bx = 32u8.saturating_add(cx.min(223) as u8);
+            let by = 32u8.saturating_add(cy.min(223) as u8);
+            vec![0x1b, b'[', b'M', 32 + cb, bx, by]
+        };
+        self.send_input(&buf);
+        true
     }
 }
 

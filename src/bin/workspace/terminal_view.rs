@@ -458,21 +458,22 @@ impl TerminalView {
         Some(((r, 0), (r, last)))
     }
 
-    /// 点击单元处若落在某个 URL 上，返回该 URL。
+    /// 点击单元处若落在某个 URL / 本地文件路径上，返回该目标（未做 file:// 转换，
+    /// 打开前还要经 [`open_target`]）。
     fn url_at(&self, (r, c): (usize, usize)) -> Option<String> {
         let frame = self.terminal.snapshot();
         let row = frame.rows.get(r)?;
-        find_urls(row)
+        find_links(row)
             .into_iter()
             .find(|&(a, b, _)| c >= a && c <= b)
             .map(|(_, _, url)| url)
     }
 
-    /// 单元处链接的范围 (行, 起列, 止列)，用于悬停高亮。
+    /// 单元处链接（URL 或本地路径）的范围 (行, 起列, 止列)，用于悬停高亮。
     fn link_range_at(&self, (r, c): (usize, usize)) -> Option<(usize, usize, usize)> {
         let frame = self.terminal.snapshot();
         let row = frame.rows.get(r)?;
-        find_urls(row)
+        find_links(row)
             .into_iter()
             .find(|&(a, b, _)| c >= a && c <= b)
             .map(|(a, b, _)| (r, a, b))
@@ -683,6 +684,7 @@ impl Render for TerminalView {
                 }
                 if let Some(bytes) = keystroke_to_bytes(ks) {
                     this.terminal.send_input(&bytes);
+                    this.terminal.scroll_to_bottom(); // 敲键盘即回到最新输出，跟真实终端一致
                     this.notification = None; // 用户按键回应 → 清「需要注意」
                     this.completed_unread = false;
                     cx.notify();
@@ -716,7 +718,7 @@ impl Render for TerminalView {
                     // Cmd+点击打开链接
                     if ev.modifiers.platform {
                         if let Some(url) = this.url_at(cell) {
-                            cx.open_url(&url);
+                            cx.open_url(&open_target(&url));
                             return;
                         }
                     }
@@ -762,14 +764,26 @@ impl Render for TerminalView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
-                    // 单击（锚点==端点，未拖动）清除选区
-                    if let Some((a, b)) = this.sel {
-                        if a == b {
-                            this.sel = None;
-                            cx.notify();
+                cx.listener(|this, ev: &MouseUpEvent, window, cx| {
+                    // 锚点 != 端点：真的拖出了选区，保留本地框选、不转发给应用——拖拽选字
+                    // 的意图比应用的鼠标点击上报优先级更高，这样才跟真实终端行为一致
+                    // （之前版本按下就转发，导致开了鼠标上报的应用里完全没法拖拽选字）。
+                    if this.sel.is_some_and(|(a, b)| a != b) {
+                        return;
+                    }
+                    // 未拖动 = 单纯点击。应用开了鼠标点击上报（比如 Claude Code 里可点的
+                    // agent 行）就把这次点击（按下+松开）转发过去——按下时故意没转发，
+                    // 就是为了先看这一下到底是点击还是拖拽。按住 Shift 强制走本地单击
+                    // （绕开应用抢鼠标，通用终端约定）。
+                    if !ev.modifiers.shift {
+                        let cell = this.pos_to_cell(ev.position, window);
+                        if this.terminal.mouse_button(true, cell.0, cell.1) {
+                            this.terminal.mouse_button(false, cell.0, cell.1);
                         }
                     }
+                    // 单击（未拖动）清除选区
+                    this.sel = None;
+                    cx.notify();
                 }),
             )
             // 背景层（最底）：底色 / 背景图 / 透明度
@@ -1010,6 +1024,79 @@ fn find_urls(row: &[terminal::Cell]) -> Vec<(usize, usize, String)> {
             i = end.max(i + 1);
         } else {
             i += 1;
+        }
+    }
+    out
+}
+
+/// 合并 URL + 本地文件路径的可点链接，供 [`TerminalView::url_at`]/[`TerminalView::link_range_at`] 共用。
+fn find_links(row: &[terminal::Cell]) -> Vec<(usize, usize, String)> {
+    let mut out = find_urls(row);
+    out.extend(find_paths(row));
+    out
+}
+
+/// 在一行里找出所有本地文件路径（绝对路径 / `~/` 开头），返回 (起列, 止列含, 展开后的
+/// 绝对路径)。跟 URL 一样按「连续非空白 token」扫描，但额外要求磁盘上真实存在——否则
+/// 随便一段带斜杠的文本（命令参数、注释里的 a/b/c）都会被当成可点链接，误判太多。
+fn find_paths(row: &[terminal::Cell]) -> Vec<(usize, usize, String)> {
+    let n = row.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let starts = row[i].ch == '/' || (row[i].ch == '~' && i + 1 < n && row[i + 1].ch == '/');
+        if starts {
+            let mut j = i;
+            while j < n && is_url_char(row[j].ch) {
+                j += 1;
+            }
+            let mut end = j;
+            while end > i
+                && matches!(
+                    row[end - 1].ch,
+                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+                )
+            {
+                end -= 1;
+            }
+            if end > i {
+                let token: String = (i..end).map(|k| row[k].ch).collect();
+                if let Some(path) = expand_existing_path(&token) {
+                    out.push((i, end - 1, path));
+                }
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `~` 展开成 home 目录，并确认路径在磁盘上真实存在（文件或目录）；不存在则不认为
+/// 是可点路径，避免误判。
+fn expand_existing_path(token: &str) -> Option<String> {
+    let expanded = match token.strip_prefix('~') {
+        Some(rest) => dirs::home_dir()?.join(rest.trim_start_matches('/')).to_string_lossy().into_owned(),
+        None => token.to_string(),
+    };
+    std::path::Path::new(&expanded).exists().then_some(expanded)
+}
+
+/// 把 [`TerminalView::url_at`] 返回的目标转成 `cx.open_url` 能吃的字符串：http(s)
+/// 链接原样返回；本地路径转成 `file://` URL 并 percent-encode 每个非常规字节——
+/// `NSURL::initWithString:` 对未编码的 UTF-8（中文路径）很挑剔，不编码直接建不出 NSURL。
+fn open_target(target: &str) -> String {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return target.to_string();
+    }
+    let mut out = String::from("file://");
+    for b in target.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
     out
