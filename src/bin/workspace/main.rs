@@ -287,22 +287,7 @@ impl Session {
     /// 会话标题：仅当终端标题是 Claude Code 风格（✳ 或 Braille spinner 开头）时用它的
     /// 任务名，否则回退 cwd 末段——避免把普通 shell 的 user@host:path 标题当任务名。
     fn title(&self, cx: &App) -> String {
-        let t = self.active.read(cx);
-        if let Some(raw) = t.agent_title() {
-            let head = raw.trim_start();
-            let is_agent = head.starts_with('✳')
-                || head
-                    .chars()
-                    .next()
-                    .is_some_and(|c| ('\u{2801}'..='\u{28FF}').contains(&c));
-            if is_agent {
-                let task = strip_status(&raw);
-                if !task.is_empty() && task != "Claude Code" && task != "claude" {
-                    return task;
-                }
-            }
-        }
-        t.title().to_string()
+        pane_title(&self.active, cx)
     }
 
     /// 会话工作目录：活动终端的 cwd（侧栏分组用）。
@@ -370,6 +355,61 @@ impl Session {
         }
         AgentStatus::Idle
     }
+}
+
+/// 状态点颜色：等审批(红) > 需要处理(橙) > 运行中(蓝) > 已完成未读(绿)。
+/// 会话行状态点、侧栏展开出的分屏 pane 状态点共用同一套配色。
+fn status_color(status: AgentStatus) -> gpui::Rgba {
+    match status {
+        AgentStatus::WaitingApproval => rgb(0xef4444),
+        AgentStatus::NeedsAttention => rgb(0xf59e0b),
+        AgentStatus::Running => rgb(0x4a9eff),
+        AgentStatus::Done => rgb(0x22c55e),
+        AgentStatus::Idle => unreachable!(),
+    }
+}
+
+/// 单个终端 pane 的标题：逻辑同 Session::title，但对任意 pane（不一定是会话活动
+/// pane）都能算——侧栏展开会话的分屏子行要分别显示每个 pane 的标题。
+fn pane_title(view: &Entity<TerminalView>, cx: &App) -> String {
+    let t = view.read(cx);
+    if let Some(raw) = t.agent_title() {
+        let head = raw.trim_start();
+        let is_agent = head.starts_with('✳')
+            || head
+                .chars()
+                .next()
+                .is_some_and(|c| ('\u{2801}'..='\u{28FF}').contains(&c));
+        if is_agent {
+            let task = strip_status(&raw);
+            if !task.is_empty() && task != "Claude Code" && task != "claude" {
+                return task;
+            }
+        }
+    }
+    t.title().to_string()
+}
+
+/// 单个终端 pane 的状态：逻辑同 Session::status，但只看这一个 pane 自己
+/// （Session::status 是取会话内所有 pane 的最高态）。
+fn pane_status(view: &Entity<TerminalView>, cx: &App) -> AgentStatus {
+    let t = view.read(cx);
+    match t.attention_kind() {
+        Some(terminal_view::AttentionKind::Approval) => return AgentStatus::WaitingApproval,
+        Some(terminal_view::AttentionKind::Attention) => return AgentStatus::NeedsAttention,
+        None => {}
+    }
+    if let Some(raw) = t.agent_title() {
+        if let Some(c) = raw.trim_start().chars().next() {
+            if ('\u{2801}'..='\u{28FF}').contains(&c) {
+                return AgentStatus::Running;
+            }
+        }
+    }
+    if t.completed_unread() {
+        return AgentStatus::Done;
+    }
+    AgentStatus::Idle
 }
 
 /// 相对时间：「刚刚 / N 秒前 / N 分钟前 / N 小时前」。
@@ -1535,6 +1575,19 @@ impl Workspace {
             let h = sess.active.read(cx).focus_handle();
             window.focus(&h, cx);
         }
+    }
+
+    /// 侧栏展开会话看到的分屏子行：点击某个 pane → 切到它所在会话，并把该 pane
+    /// 设为会话内的活动 pane（分屏树本身不变，只是换了「当前看哪个」）。
+    fn activate_session_pane(
+        &mut self,
+        ix: usize,
+        pane: Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate(ix, window, cx);
+        self.activate_pane(&pane, window, cx);
     }
 
     /// 切换到第 ix 个会话并聚焦。
@@ -3605,15 +3658,8 @@ impl Render for Workspace {
                         let status = statuses.get(ix).copied().unwrap_or(AgentStatus::Idle);
                         // 只在「非活动」会话上亮点：正在看的那个不提醒（但通知仍留着）。
                         // 空闲不点，其余四态用与总览页一致的颜色，一眼区分等审批/需处理/运行中/已完成。
-                        let status_dot = (status != AgentStatus::Idle && ix != active).then(|| {
-                            match status {
-                                AgentStatus::WaitingApproval => rgb(0xef4444),
-                                AgentStatus::NeedsAttention => rgb(0xf59e0b),
-                                AgentStatus::Running => rgb(0x4a9eff),
-                                AgentStatus::Done => rgb(0x22c55e),
-                                AgentStatus::Idle => unreachable!(),
-                            }
-                        });
+                        let status_dot = (status != AgentStatus::Idle && ix != active)
+                            .then(|| status_color(status));
                         let e_act = this.clone();
                         let entity_id = entity_ids[ix];
                         let drag_title: SharedString = title.clone().into();
@@ -3631,9 +3677,53 @@ impl Render for Workspace {
                             terminal_view::LaunchKind::Copilot => IconName::Github,
                             terminal_view::LaunchKind::Terminal => IconName::SquareTerminal,
                         };
+                        // 会话内有分屏（>1 个 pane）时，展开出子行：一 pane 一行，各自标题 +
+                        // 状态点，点击直接切到该会话并聚焦该 pane。只有 1 个 pane 的会话
+                        // pane_items 为空，SidebarMenuItem 判定无 children 就不长出展开箭头，
+                        // 行为跟改动前完全一样。
+                        let pane_items: Vec<SidebarMenuItem> = if self.sessions[ix].pane_count() > 1 {
+                            let mut leaves = Vec::new();
+                            collect_leaves(&self.sessions[ix].layout, &mut leaves);
+                            let active_pane_id = self.sessions[ix].active.entity_id();
+                            leaves
+                                .into_iter()
+                                .map(|view| {
+                                    let p_title = pane_title(&view, cx);
+                                    let p_status = pane_status(&view, cx);
+                                    let is_current_view =
+                                        ix == active && view.entity_id() == active_pane_id;
+                                    let p_dot = (p_status != AgentStatus::Idle && !is_current_view)
+                                        .then(|| status_color(p_status));
+                                    let e_pane_act = this.clone();
+                                    let pane = view.clone();
+                                    SidebarMenuItem::new(p_title)
+                                        .icon(IconName::SquareTerminal)
+                                        .active(is_current_view)
+                                        .on_click(move |_ev, window, cx| {
+                                            let pane = pane.clone();
+                                            e_pane_act.update(cx, |ws, cx| {
+                                                ws.activate_session_pane(ix, pane, window, cx)
+                                            });
+                                        })
+                                        .suffix(move |_w, _cx| {
+                                            div().children(
+                                                p_dot.map(|c| div().size_2().rounded_full().bg(c)),
+                                            )
+                                        })
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         let item = SidebarMenuItem::new(title)
                             .icon(row_icon)
                             .active(ix == active)
+                            // 分屏子行第一次出现（1 pane → >1 pane）时默认展开：SidebarMenuItem
+                            // 内部用 window 按 id 记的持久 open 状态，default_open 只在该 id
+                            // 首次创建（也就是 is_submenu 第一次为 true）时生效，之后用户手动
+                            // 收起会一直记住，不会被这里重置。
+                            .default_open(true)
+                            .children(pane_items)
                             .on_click(move |_ev, window, cx| {
                                 e_act.update(cx, |ws, cx| ws.activate(ix, window, cx));
                             })
