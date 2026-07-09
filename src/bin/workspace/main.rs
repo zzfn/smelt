@@ -34,10 +34,11 @@ use gpui_component::sidebar::{
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::Input;
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::setting::{Settings, SettingField, SettingGroup, SettingItem, SettingPage};
 use gpui_component::slider::{Slider, SliderEvent, SliderState, SliderValue};
-use gpui_component::text::markdown;
+use gpui_component::text::TextView;
 use gpui_component::resizable::{
     h_resizable, resizable_panel, v_resizable, ResizablePanelEvent, ResizableState,
 };
@@ -176,7 +177,6 @@ enum MainView {
     Hotspot,
     History,
     Usage,
-    Settings,
 }
 
 /// 会话里 agent 的状态（用于总览页状态徽章）。借鉴 codex 的 ThreadStatus 细分：
@@ -229,6 +229,12 @@ impl Render for SessionDrag {
             .text_xs()
             .text_color(t.foreground)
             .child(self.title.clone())
+            // 拖起瞬间淡入，别让 chip "啪"地闪现
+            .with_animation(
+                "session-drag-in",
+                Animation::new(std::time::Duration::from_millis(120)).with_easing(ease_out_quint()),
+                |this, delta| this.opacity(delta),
+            )
     }
 }
 
@@ -253,6 +259,12 @@ impl Render for ProjectDrag {
             .text_xs()
             .text_color(t.foreground)
             .child(self.name.clone())
+            // 拖起瞬间淡入，同 SessionDrag
+            .with_animation(
+                "project-drag-in",
+                Animation::new(std::time::Duration::from_millis(120)).with_easing(ease_out_quint()),
+                |this, delta| this.opacity(delta),
+            )
     }
 }
 
@@ -804,6 +816,10 @@ struct Workspace {
     diff_gen: u64,
     /// diff 是否用并排（split）视图；false 为统一（unified）视图。
     diff_split: bool,
+    /// 交互式 diff：选中待评论的行号集合（对应 GitDiff.lines 下标），换文件/重开 diff 时清空。
+    diff_selected: HashSet<usize>,
+    /// 交互式 diff 的评论输入框（懒创建，随 Git 视图渲染出待发送的 diff 时创建）。
+    diff_comment_input: Option<Entity<gpui_component::input::InputState>>,
     /// 左侧会话侧栏是否展开（Cmd+B 切换）。
     sidebar_open: bool,
     /// 上一次的视图（用于从设置返回）。
@@ -892,13 +908,16 @@ struct Workspace {
     usage_cache: Option<(Instant, Rc<usage_stats::UsageData>)>,
     /// 正在后台扫描用量数据（防重复并发 spawn）。
     usage_inflight: bool,
-    /// 项目行「+」悬浮出的 Claude Code / Codex 快捷菜单——记的是项目在 `projects`
-    /// 分组列表里的序号（`pix`）。
-    hover_launch_menu: Option<usize>,
-    /// 悬浮菜单的去抖动世代号：每次悬浮进/出都自增，鼠标离开按钮时不立即关菜单，
-    /// 而是延迟一小段再看世代号有没有变——没变才真的关，避免鼠标从按钮移向菜单项
-    /// 途中经过的空隙被判定成"已离开"而提前收起（见 set_launch_hover）。
-    hover_launch_gen: u64,
+    /// 会话拖拽悬停中的插入位置：(目标会话, 插它前面?)。由 drop 层的 on_drag_move
+    /// 维护，驱动插入指示条的出现动画；起拖时清空，避免上次拖拽的残留闪一帧。
+    sess_drop_hint: Option<(EntityId, bool)>,
+    /// 项目分组拖拽悬停中的目标项目名，作用同上。
+    proj_drop_hint: Option<SharedString>,
+    /// 守护进程是否落后于磁盘上的 smeltd 二进制（重装/重编译后常见，需手动重启守护
+    /// 才生效新代码）；None 表示还没查过，驱动设置页「更新」分区的重启提示。
+    daemon_outdated: Option<bool>,
+    /// 「重启守护进程」二次确认弹窗开关：点确定会断开所有当前终端会话。
+    show_daemon_restart_confirm: bool,
 }
 
 /// 宠物大脑配置的四个输入框（base_url / api_key / model / persona）。
@@ -967,6 +986,8 @@ impl Workspace {
             git_diff: None,
             diff_gen: 0,
             diff_split: false,
+            diff_selected: HashSet::new(),
+            diff_comment_input: None,
             sidebar_open: true,
             prev_view: MainView::Terminal,
             notifications_open: false,
@@ -1008,8 +1029,10 @@ impl Workspace {
             dock_badge_count: None,
             usage_cache: None,
             usage_inflight: false,
-            hover_launch_menu: None,
-            hover_launch_gen: 0,
+            sess_drop_hint: None,
+            proj_drop_hint: None,
+            daemon_outdated: None,
+            show_daemon_restart_confirm: false,
         };
         // 立即写盘：把本次启动生成/沿用的会话 id 落到存档。否则首启（或旧存档迁移）
         // 生成的新 id 只在内存里，若用户不做任何布局操作就退出，重开会因无 id 而
@@ -1017,6 +1040,7 @@ impl Workspace {
         ws.save_state(cx);
         updater::cleanup_stale_backup();
         ws.check_for_update(true, cx);
+        ws.check_daemon_outdated(cx);
         ws
     }
 
@@ -1279,7 +1303,7 @@ impl Workspace {
         self.add_session_with_launch(cwd, None, cx);
     }
 
-    /// 项目行「+」悬浮菜单的 Claude Code / Codex 快捷入口：`launch` 编进 shell 的
+    /// 项目行「+」下拉菜单的 Claude Code / Codex 快捷入口：`launch` 编进 shell 的
     /// 启动命令行（见 terminal.rs::spawn / smeltd.rs::spawn_session），不是等
     /// shell 起来后再补发按键，从根上没有时序竞态。
     fn add_session_with_launch(
@@ -1293,32 +1317,6 @@ impl Workspace {
         self.active_session = self.sessions.len() - 1;
         self.save_state(cx);
         cx.notify();
-    }
-
-    /// 项目行「+」悬浮菜单的开关状态机：进入立即打开；离开不立即关，延迟一小段再看
-    /// 世代号有没有被后续的悬浮进入打断——没打断才真的收起。鼠标从「+」移向下面菜单项
-    /// 途中会先离开「+」的悬浮区，这段延迟就是留给这趟"路上"的容错。
-    fn set_launch_hover(&mut self, pix: usize, entered: bool, cx: &mut Context<Self>) {
-        self.hover_launch_gen = self.hover_launch_gen.wrapping_add(1);
-        if entered {
-            self.hover_launch_menu = Some(pix);
-            cx.notify();
-            return;
-        }
-        if self.hover_launch_menu != Some(pix) {
-            return;
-        }
-        let gen = self.hover_launch_gen;
-        cx.spawn(async move |this, cx| {
-            smol::Timer::after(std::time::Duration::from_millis(220)).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.hover_launch_gen == gen && this.hover_launch_menu == Some(pix) {
-                    this.hover_launch_menu = None;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
     }
 
     /// 在当前会话的活动 pane 上分屏：Horizontal=右侧并排，Vertical=下方堆叠。
@@ -1606,6 +1604,44 @@ impl Workspace {
         .detach();
     }
 
+    /// 后台查一次守护是否落后于磁盘上的 smeltd 二进制，决定要不要在设置页/齿轮上
+    /// 给出「重启守护」提示。本地 Unix socket 往返很快，但仍走后台线程，跟
+    /// check_for_update 同款结构，别在 UI 线程里做阻塞 IO。
+    fn check_daemon_outdated(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let outdated = cx.background_executor().spawn(async { terminal::daemon_outdated() }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.daemon_outdated = Some(outdated);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 用户在弹窗里点了「确定重启」：让守护退出（断开所有会话）、拉起磁盘上最新的
+    /// smeltd、再刷新状态。三步都涉及阻塞 IO（socket 往返 + 最坏 5s 轮询），全扔
+    /// 后台线程，不卡 UI。
+    fn confirm_restart_daemon(&mut self, cx: &mut Context<Self>) {
+        self.show_daemon_restart_confirm = false;
+        self.daemon_outdated = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outdated = cx
+                .background_executor()
+                .spawn(async {
+                    terminal::restart_daemon();
+                    terminal::ensure_daemon_running();
+                    terminal::daemon_outdated()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.daemon_outdated = Some(outdated);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 弹原生选择框选一张背景图。
     fn pick_bg_image(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
@@ -1816,7 +1852,7 @@ impl Workspace {
                     }
                 }
                 if let Some(tokens) = live.map(|s| s.total_tokens).filter(|t| *t > 0) {
-                    live_parts.push(format!("🔢 {tokens} tokens"));
+                    live_parts.push(format!("🔢 {} tokens", format_count(tokens)));
                 }
                 if let Some(tool) = live.and_then(|s| s.last_tool.clone()) {
                     live_parts.push(format!("🔧 最近 {tool}"));
@@ -2064,6 +2100,88 @@ impl Workspace {
             )
     }
 
+    /// 「重启守护进程」二次确认弹窗：明确告知会断开所有当前终端会话。与
+    /// render_quit_confirm 同款视觉（居中卡片 + 半透明遮罩）。
+    fn render_daemon_restart_confirm(&self, cx: &mut Context<Self>) -> Div {
+        let (fg, muted, border, popover) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground, t.border, t.popover)
+        };
+        let c_red_tint: Hsla = rgba(0xef444424).into();
+        let c_red_hover: Hsla = rgba(0xef444440).into();
+        let c_neutral_bg: Hsla = rgba(0xffffff0a).into();
+        let c_neutral_hover: Hsla = rgba(0xffffff1f).into();
+
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x000000aa))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                v_flex()
+                    .w(px(320.))
+                    .p_5()
+                    .bg(popover)
+                    .border_1()
+                    .border_color(border)
+                    .rounded_lg()
+                    .shadow_lg()
+                    .gap_4()
+                    .child(div().font_bold().text_color(fg).text_lg().child("确定重启守护进程吗？"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("守护进程升级后才会生效新版本。重启会立即断开并终止当前所有终端会话（包括正在跑的 agent），且无法恢复。"),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("cancel-daemon-restart")
+                                    .px_3()
+                                    .py(px(5.))
+                                    .rounded_lg()
+                                    .bg(c_neutral_bg)
+                                    .border_1()
+                                    .border_color(rgba(0xffffff12))
+                                    .text_sm()
+                                    .text_color(fg)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(c_neutral_hover))
+                                    .child("取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_daemon_restart_confirm = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-daemon-restart")
+                                    .px_3()
+                                    .py(px(5.))
+                                    .rounded_lg()
+                                    .bg(c_red_tint)
+                                    .border_1()
+                                    .border_color(rgba(0xffffff12))
+                                    .text_sm()
+                                    .text_color(rgb(0xff8f8f))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(c_red_hover))
+                                    .child("确定重启")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_restart_daemon(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     /// 当前文件有未保存改动、又点了别的文件时弹的确认弹窗：取消 / 不保存直接切换 /
     /// 保存并切换。与 render_quit_confirm 同款视觉（居中卡片 + 半透明遮罩）。
     fn render_unsaved_file_confirm(&self, target: String, cx: &mut Context<Self>) -> Div {
@@ -2182,7 +2300,9 @@ impl Workspace {
     }
 
     /// 渲染独立设置页面：铺满主区、居中限宽、支持滚动。
-    fn render_settings_page(&self, cx: &mut Context<Self>) -> Div {
+    /// 设置页主体：外观 / 桌面宠物 / 更新三个分组。供嵌入式设置页（主窗口右上角齿轮，
+    /// 带「返回」头）和独立设置窗口（原生标题栏，无需「返回」）共用，各自决定外层怎么包。
+    fn render_settings_content(&self, cx: &mut Context<Self>) -> Div {
         let (fg, muted, border, popover) = {
             let t = cx.theme();
             (t.foreground, t.muted_foreground, t.border, t.popover)
@@ -2373,8 +2493,10 @@ impl Workspace {
 
         // —— 更新：检查/下载全自动静默，生效推迟到退出时 ——
         let update_entity = entity.clone();
+        let daemon_entity = entity.clone();
         let update_page = SettingPage::new("更新").resettable(false).group(
-            SettingGroup::new().item(SettingItem::render(move |_, _, cx: &mut App| {
+            SettingGroup::new()
+                .item(SettingItem::render(move |_, _, cx: &mut App| {
                 let status = update_entity.read(cx).update_status.clone();
                 let status_text = match &status {
                     updater::UpdateStatus::Idle => String::new(),
@@ -2446,48 +2568,90 @@ impl Workspace {
                     .children((!status_text.is_empty()).then(|| {
                         div().text_xs().text_color(muted).child(status_text)
                     }))
-            })),
+            }))
+                .item(SettingItem::render(move |_, _, cx: &mut App| {
+                    let outdated = daemon_entity.read(cx).daemon_outdated;
+                    let restart_entity = daemon_entity.clone();
+                    let restart_daemon_btn = (outdated == Some(true)).then(|| {
+                        btn("restart-daemon", "重启守护进程".into())
+                            .text_color(rgb(0xff8f8f))
+                            .bg(Hsla::from(rgba(0xef444424)))
+                            .hover(|s| s.bg(Hsla::from(rgba(0xef444440))))
+                            .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
+                                restart_entity.update(cx, |this, cx| {
+                                    this.show_daemon_restart_confirm = true;
+                                    cx.notify();
+                                });
+                            })
+                    });
+                    let status_text = match outdated {
+                        Some(true) => "版本落后于当前安装包，新功能/修复需手动重启守护才生效。".to_string(),
+                        Some(false) => "已是最新，无需重启。".to_string(),
+                        None => "检测中…".to_string(),
+                    };
+
+                    v_flex()
+                        .w_full()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .child(div().text_sm().text_color(fg).child("守护进程（smeltd）"))
+                                .children(restart_daemon_btn),
+                        )
+                        .child(div().text_xs().text_color(muted).child(status_text))
+                        .children((outdated == Some(true)).then(|| {
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0xff8f8f))
+                                .child("重启会立即断开并终止当前所有终端会话（含正在跑的 agent），无法恢复。")
+                        }))
+                })),
         );
 
-        let back_entity = entity.clone();
-        div().size_full().child(
-            v_flex()
-                .size_full()
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .items_center()
-                        .px_4()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(border)
-                        .child(
-                            div()
-                                .id("back-from-settings")
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .text_xs()
-                                .text_color(muted)
-                                .border_1()
-                                .border_color(border)
-                                .hover(|s| s.bg(popover).text_color(fg))
-                                .child("返回")
-                                .on_click(move |_, _window, cx: &mut App| {
-                                    back_entity.update(cx, |this, cx| {
-                                        this.view = this.prev_view;
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Settings::new("settings").pages(vec![appearance_page, pet_page, update_page])),
-                ),
-        )
+        div()
+            .size_full()
+            .child(Settings::new("settings").pages(vec![appearance_page, pet_page, update_page]))
+    }
+
+    /// 打开独立设置窗口：已经开着就聚焦提到前台，不重复开第二扇。窗口只是个薄壳
+    /// （[`SettingsWindow`]），真正的状态（颜色选择器/LLM 输入框等）还挂在这个
+    /// Workspace 实体上没挪窝，薄壳每次渲染都转手调回来，天然跟主窗口保持同步。
+    ///
+    /// 必须用 `cx.defer` 推迟到当前这轮 `Workspace::update` 彻底返回之后再开窗：
+    /// 这里被点齿轮的 `cx.listener` 调用时，`Workspace` 这个 entity 正被 update
+    /// 占着；若同步 `cx.open_window`，新窗口首帧 `SettingsWindow::render` 里会
+    /// 马上又对同一个 `Workspace` entity 调 `update`，两层嵌套 update 撞上 GPUI
+    /// 的重入保护直接 panic 崩溃（"cannot update ... while it is already being
+    /// updated"）——这就是「点齿轮整个 app 崩溃」的真正原因。
+    fn open_settings_window(&self, cx: &mut Context<Self>) {
+        let workspace = cx.entity();
+        cx.defer(move |cx| {
+            if let Some(handle) = cx.try_global::<SettingsWindowHandle>().and_then(|h| h.0) {
+                if handle.update(cx, |_, window, _| window.activate_window()).is_ok() {
+                    return;
+                }
+            }
+            let bounds = WindowBounds::centered(size(px(640.), px(560.)), cx);
+            let options = WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some("设置".into()),
+                    ..Default::default()
+                }),
+                window_bounds: Some(bounds),
+                ..Default::default()
+            };
+            let handle = cx
+                .open_window(options, |window, cx| {
+                    window.set_rem_size(px(18.));
+                    let view = cx.new(|_cx| SettingsWindow { workspace: workspace.clone() });
+                    cx.new(|cx| Root::new(view, window, cx))
+                })
+                .expect("打开设置窗口失败");
+            cx.set_global(SettingsWindowHandle(Some(handle)));
+        });
     }
 
     /// 文件树：展开/收起一个文件夹。
@@ -2940,6 +3104,7 @@ impl Workspace {
         self.diff_gen = self.diff_gen.wrapping_add(1);
         let gen = self.diff_gen;
         self.git_diff = Some(GitDiff { path: path.clone(), lines: Rc::new(Vec::new()) });
+        self.diff_selected.clear(); // 换文件/重开 diff：旧的行选区不再对应新内容
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -2972,6 +3137,56 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// 点击 diff 行：切换该行（按 GitDiff.lines 下标）是否被选中待评论。
+    fn toggle_diff_line(&mut self, i: usize, cx: &mut Context<Self>) {
+        if !self.diff_selected.remove(&i) {
+            self.diff_selected.insert(i);
+        }
+        cx.notify();
+    }
+
+    /// 把选中的 diff 行 + 评论输入框内容拼成一段文本，写进当前激活终端的 PTY
+    /// （不带回车，留给用户自己看一眼再发送）。
+    fn send_diff_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff_selected.is_empty() {
+            return;
+        }
+        let Some(diff) = &self.git_diff else { return };
+        let comment = self
+            .diff_comment_input
+            .as_ref()
+            .map(|s| s.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+
+        let mut selected: Vec<usize> = self.diff_selected.iter().copied().collect();
+        selected.sort_unstable();
+        let mut msg = format!("对 {} 的这几行有反馈：\n", diff.path);
+        for i in selected {
+            if let Some(l) = diff.lines.get(i) {
+                let ln = l.new_ln.or(l.old_ln).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+                let marker = match l.kind {
+                    DiffKind::Add => "+",
+                    DiffKind::Del => "-",
+                    _ => " ",
+                };
+                msg.push_str(&format!("  L{ln} {marker} {}\n", l.text));
+            }
+        }
+        if !comment.is_empty() {
+            msg.push_str(&format!("\n{comment}\n"));
+        }
+
+        let target = self.cur().map(|s| s.active.clone());
+        if let Some(view) = target {
+            view.update(cx, |tv, cx| tv.send_text(&msg, cx));
+        }
+        self.diff_selected.clear();
+        if let Some(state) = self.diff_comment_input.clone() {
+            state.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        cx.notify();
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3043,14 +3258,12 @@ impl Workspace {
                 let active = self
                     .cur()
                     .is_some_and(|s| s.active.entity_id() == t.entity_id());
-                // 叠加层（absolute，不占布局、不挡点击）区分状态：
-                // 活动 pane 用 ring 色描边；响铃待处理的非活动 pane 描蓝环；其余压暗。
-                let overlay = if active {
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .border_2()
-                        .border_color(cx.theme().ring)
+                // 不给活动 pane 描边（iTerm2 也不描）：分屏时靠「压暗非活动 pane」来区分
+                // 谁是活动的就够了，活动 pane 保持原样最亮眼；单 pane 时更是压根没有别的
+                // pane 可比，不需要任何叠加层。响铃待处理的非活动 pane 单独描蓝环提醒。
+                let multi_pane = self.cur().is_some_and(|s| s.pane_count() > 1);
+                let overlay = if !multi_pane || active {
+                    div().absolute().inset_0()
                 } else if t.read(cx).has_attention() {
                     div()
                         .absolute()
@@ -3111,11 +3324,6 @@ impl Render for Workspace {
         if self.dock_badge_count != Some(attention_count) {
             self.dock_badge_count = Some(attention_count);
             dock::set_badge(attention_count);
-        }
-
-        // 首次打开设置面板时懒创建宠物大脑配置的输入框（需要 window）。
-        if self.view == MainView::Settings && self.llm_inputs.is_none() {
-            self.init_llm_inputs(window, cx);
         }
 
         // Git 页：后台刷新改动列表（git status 慢，绝不在 render 里同步跑）。
@@ -3266,6 +3474,10 @@ impl Render for Workspace {
                         let drag_title: SharedString = title.clone().into();
                         let e_drop = this.clone();
                         let e_close = this.clone();
+                        // 拖拽悬停指示：本行上/下边缘是否是当前插入位置（快照进 suffix
+                        // 闭包；hint 变化会 notify 重渲染，快照不会过期）。
+                        let hint_before = self.sess_drop_hint == Some((entity_id, true));
+                        let hint_after = self.sess_drop_hint == Some((entity_id, false));
                         let item = SidebarMenuItem::new(title)
                             .icon(IconName::SquareTerminal)
                             .active(ix == active)
@@ -3273,31 +3485,72 @@ impl Render for Workspace {
                                 e_act.update(cx, |ws, cx| ws.activate(ix, window, cx));
                             })
                             // suffix：拖拽手柄（项目内排序）+ 状态点 + 关闭按钮。
-                            .suffix(move |_w, _cx| {
+                            .suffix(move |_w, cx| {
                                 let e_close = e_close.clone();
-                                let e_drop = e_drop.clone();
+                                let e_drop_before = e_drop.clone();
+                                let e_drop_after = e_drop.clone();
+                                let e_clear = e_drop.clone();
                                 let drag_title = drag_title.clone();
+                                // 拖拽进行中才渲染整行 drop 接收层：suffix 位于行右端，
+                                // 用负 left 往左铺满整行（超出部分被行容器裁掉），上半段
+                                // 插到目标前、下半段插到目标后。平时不渲染，不挡点击。
+                                let dragging = cx.has_active_drag();
+                                // 插入位置指示条：淡入 + 从左展开的动画"插槽"。由
+                                // on_drag_move 维护的 hint 状态驱动，不用 drag_over 样式
+                                //（样式刷新是瞬时的，做不了出现动画）。
+                                let make_hint = move |before: bool, e_hint: Entity<Workspace>| {
+                                    move |ev: &DragMoveEvent<SessionDrag>, _w: &mut Window, cx: &mut App| {
+                                        let inside = ev.bounds.contains(&ev.event.position);
+                                        e_hint.update(cx, |ws, cx| {
+                                            let this_hint = Some((entity_id, before));
+                                            if inside && ws.sess_drop_hint != this_hint {
+                                                ws.sess_drop_hint = this_hint;
+                                                cx.notify();
+                                            } else if !inside && ws.sess_drop_hint == this_hint {
+                                                ws.sess_drop_hint = None;
+                                                cx.notify();
+                                            }
+                                        });
+                                    }
+                                };
+                                let indicator = |anim_id: (&'static str, usize), at_top: bool| {
+                                    div()
+                                        .absolute()
+                                        .left(px(4.))
+                                        .h(px(5.))
+                                        .rounded(px(2.5))
+                                        .bg(rgb(0x4a9eff))
+                                        .map(|d| if at_top { d.top(px(2.)) } else { d.bottom(px(2.)) })
+                                        .with_animation(
+                                            anim_id,
+                                            Animation::new(std::time::Duration::from_millis(160))
+                                                .with_easing(ease_out_quint()),
+                                            |this, delta| {
+                                                this.opacity(0.4 + 0.6 * delta).w(relative(delta))
+                                            },
+                                        )
+                                };
                                 h_flex()
+                                    .relative()
                                     .items_center()
                                     .gap_1()
                                     .child(
+                                        // 拖拽手柄：不露图标，留一块看不见但比原 12px 图标明显更大的
+                                        // 抓取区（原图标太小不好点住）；按住这里拖拽排序，行内其余
+                                        // 点击（切换会话/关闭）走各自正常逻辑，互不影响。
                                         div()
                                             .id(("sess-drag", ix))
+                                            .w(px(28.))
+                                            .h(px(20.))
                                             .cursor_grab()
                                             .on_drag(
                                                 SessionDrag { id: entity_id, title: drag_title },
-                                                |drag, _, _, cx| cx.new(|_| drag.clone()),
-                                            )
-                                            .drag_over::<SessionDrag>(|style, _, _, _cx| {
-                                                style.border_t_2().border_color(rgb(0x4a9eff))
-                                            })
-                                            .on_drop(move |drag: &SessionDrag, _window, cx| {
-                                                let dragged = drag.id;
-                                                e_drop.update(cx, |ws, cx| {
-                                                    ws.move_session_near(dragged, entity_id, true, cx)
-                                                });
-                                            })
-                                            .child(Icon::new(IconName::Menu).size_3().text_color(c_muted)),
+                                                move |drag, _, _, cx| {
+                                                    // 起拖先清掉上次拖拽残留的指示位置
+                                                    e_clear.update(cx, |ws, _| ws.sess_drop_hint = None);
+                                                    cx.new(|_| drag.clone())
+                                                },
+                                            ),
                                     )
                                     .children(
                                         status_dot
@@ -3314,102 +3567,200 @@ impl Render for Workspace {
                                                 e_close.update(cx, |ws, cx| ws.close_session(ix, cx));
                                             })
                                     }))
+                                    .when(dragging, |this| {
+                                        this.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(-6.))
+                                                .bottom(px(-6.))
+                                                .left(px(-1000.))
+                                                .right(px(-8.))
+                                                .child(
+                                                    div()
+                                                        .id(("sess-drop-before", ix))
+                                                        .absolute()
+                                                        .top_0()
+                                                        .left_0()
+                                                        .right_0()
+                                                        .h_1_2()
+                                                        .on_drag_move(make_hint(true, e_drop_before.clone()))
+                                                        .on_drop(move |drag: &SessionDrag, _window, cx| {
+                                                            let dragged = drag.id;
+                                                            e_drop_before.update(cx, |ws, cx| {
+                                                                ws.sess_drop_hint = None;
+                                                                ws.move_session_near(dragged, entity_id, true, cx)
+                                                            });
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(("sess-drop-after", ix))
+                                                        .absolute()
+                                                        .bottom_0()
+                                                        .left_0()
+                                                        .right_0()
+                                                        .h_1_2()
+                                                        .on_drag_move(make_hint(false, e_drop_after.clone()))
+                                                        .on_drop(move |drag: &SessionDrag, _window, cx| {
+                                                            let dragged = drag.id;
+                                                            e_drop_after.update(cx, |ws, cx| {
+                                                                ws.sess_drop_hint = None;
+                                                                ws.move_session_near(dragged, entity_id, false, cx)
+                                                            });
+                                                        }),
+                                                )
+                                                .when(hint_before, |this| {
+                                                    this.child(indicator(("sess-ind-b", ix), true))
+                                                })
+                                                .when(hint_after, |this| {
+                                                    this.child(indicator(("sess-ind-a", ix), false))
+                                                }),
+                                        )
+                                    })
                             });
                         item
                     })
                     .collect();
-                // 项目行右侧「+」：悬浮弹出 Claude Code / Codex 快捷入口，直接点「+」
-                // 本身还是新建普通终端。悬浮态记在 hover_launch_menu，按钮和悬浮菜单
-                // 项各自的 on_hover 都会重新置位，只要鼠标还压在其中一个上就不关。
+                // 项目行右侧「+」：点击弹出下拉菜单（新建终端 / Claude Code / Codex）。
+                // 用 gpui-component 的 DropdownMenu 真浮层，不再用 hover 状态机模拟——
+                // hover 版鼠标移向菜单项途中就会被延时收起，菜单项根本点不到。
                 let e_new = this.clone();
-                let e_hover = this.clone();
                 let e_proj_drop = this.clone();
                 let project_name: SharedString = name.clone().into();
                 let new_cwd = cwd.clone();
                 let is_scratch_group = name == "临时终端";
-                let hovered = self.hover_launch_menu == Some(pix);
-                let flyout_cwd = (!cwd.is_empty()).then(|| cwd.clone());
-                let flyout_items: Vec<SidebarMenuItem> = if hovered {
-                    let e_claude = this.clone();
-                    let e_codex = this.clone();
-                    let cwd_claude = flyout_cwd.clone();
-                    let cwd_codex = flyout_cwd.clone();
-                    vec![
-                        SidebarMenuItem::new("Claude Code")
-                            .icon(IconName::Bot)
-                            .on_click(move |_ev, _window, cx| {
-                                let cwd = cwd_claude.clone();
-                                e_claude.update(cx, |ws, cx| {
-                                    ws.hover_launch_menu = None;
-                                    ws.add_session_with_launch(cwd, Some("claude"), cx);
-                                });
-                            }),
-                        SidebarMenuItem::new("Codex")
-                            .icon(IconName::SquareTerminal)
-                            .on_click(move |_ev, _window, cx| {
-                                let cwd = cwd_codex.clone();
-                                e_codex.update(cx, |ws, cx| {
-                                    ws.hover_launch_menu = None;
-                                    ws.add_session_with_launch(cwd, Some("codex"), cx);
-                                });
-                            }),
-                    ]
-                } else {
-                    Vec::new()
-                };
+                // 拖拽悬停指示：本项目行是否是当前插入位置。
+                let proj_hinted = self.proj_drop_hint.as_deref() == Some(name.as_str());
                 SidebarMenuItem::new(name.clone())
                     .icon(if is_scratch_group { IconName::SquareTerminal } else { IconName::Folder })
                     .default_open(true)
                     .click_to_toggle(true)
-                    .suffix(move |_w, _cx| {
-                        let e = e_new.clone();
-                        let e_hover_cb = e_hover.clone();
+                    .suffix(move |_w, cx| {
+                        let e_new = e_new.clone();
                         let e_proj_drop = e_proj_drop.clone();
                         let project_name = project_name.clone();
                         let cwd = new_cwd.clone();
+                        let dragging = cx.has_active_drag();
                         h_flex()
+                            .relative()
                             .items_center()
                             .gap_1()
                             .child(
-                                // 拖拽手柄：项目分组之间排序。
+                                // 拖拽手柄：项目分组之间排序。不露图标，留一块看不见但比原 12px
+                                // 图标明显更大的抓取区，跟「+」下拉按钮各自独立不冲突。
                                 div()
                                     .id(("project-drag", pix))
+                                    .w(px(28.))
+                                    .h(px(20.))
                                     .cursor_grab()
-                                    .on_drag(ProjectDrag { name: project_name.clone() }, |drag, _, _, cx| {
-                                        cx.new(|_| drag.clone())
-                                    })
-                                    .drag_over::<ProjectDrag>(|style, _, _, _cx| {
-                                        style.border_t_2().border_color(rgb(0x4a9eff))
-                                    })
-                                    .on_drop(move |drag: &ProjectDrag, _window, cx| {
-                                        let from = drag.name.clone();
-                                        let to = project_name.clone();
-                                        e_proj_drop.update(cx, |ws, cx| ws.move_project_near(from, to, cx));
-                                    })
-                                    .child(Icon::new(IconName::Menu).size_3().text_color(c_muted)),
+                                    .on_drag(ProjectDrag { name: project_name.clone() }, {
+                                        let e_clear = e_proj_drop.clone();
+                                        move |drag, _, _, cx| {
+                                            // 起拖先清掉上次拖拽残留的指示位置
+                                            e_clear.update(cx, |ws, _| ws.proj_drop_hint = None);
+                                            cx.new(|_| drag.clone())
+                                        }
+                                    }),
                             )
                             .child(
-                                div()
-                                    .id(("new-in-project-hover", pix))
-                                    .on_hover(move |is_over, _window, cx| {
-                                        let is_over = *is_over;
-                                        e_hover_cb.update(cx, |ws, cx| ws.set_launch_hover(pix, is_over, cx));
-                                    })
-                                    .child(
-                                        Button::new(("new-in-project", pix))
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::Plus)
-                                            .on_click(move |_ev, _w, cx| {
-                                                // 别把点击冒泡成「折叠/展开分组」
-                                                cx.stop_propagation();
-                                                let cwd = (!cwd.is_empty()).then(|| cwd.clone());
-                                                e.update(cx, |ws, cx| ws.add_session(cwd, cx));
-                                            }),
-                                    ),
+                                Button::new(("new-in-project", pix))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Plus)
+                                    .dropdown_menu(move |menu, _window, _cx| {
+                                        let cwd = (!cwd.is_empty()).then(|| cwd.clone());
+                                        let cwd_new = cwd.clone();
+                                        let cwd_claude = cwd.clone();
+                                        let cwd_codex = cwd;
+                                        let e_term = e_new.clone();
+                                        let e_claude = e_new.clone();
+                                        let e_codex = e_new.clone();
+                                        menu.item(
+                                            PopupMenuItem::new("新建终端")
+                                                .icon(IconName::SquareTerminal)
+                                                .on_click(move |_ev, _window, cx| {
+                                                    let cwd = cwd_new.clone();
+                                                    e_term.update(cx, |ws, cx| ws.add_session(cwd, cx));
+                                                }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new("Claude Code")
+                                                .icon(IconName::Bot)
+                                                .on_click(move |_ev, _window, cx| {
+                                                    let cwd = cwd_claude.clone();
+                                                    e_claude.update(cx, |ws, cx| {
+                                                        ws.add_session_with_launch(cwd, Some("claude"), cx)
+                                                    });
+                                                }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new("Codex")
+                                                .icon(IconName::SquareTerminal)
+                                                .on_click(move |_ev, _window, cx| {
+                                                    let cwd = cwd_codex.clone();
+                                                    e_codex.update(cx, |ws, cx| {
+                                                        ws.add_session_with_launch(cwd, Some("codex"), cx)
+                                                    });
+                                                }),
+                                        )
+                                    }),
                             )
+                            .when(dragging, |this| {
+                                // 拖拽进行中的整行 drop 接收层，同会话行的做法。
+                                let e_hint = e_proj_drop.clone();
+                                let hint_name = project_name.clone();
+                                this.child(
+                                    div()
+                                        .id(("project-drop", pix))
+                                        .absolute()
+                                        .top(px(-6.))
+                                        .bottom(px(-6.))
+                                        .left(px(-1000.))
+                                        .right(px(-8.))
+                                        .on_drag_move(move |ev: &DragMoveEvent<ProjectDrag>, _w, cx| {
+                                            let inside = ev.bounds.contains(&ev.event.position);
+                                            let hint_name = hint_name.clone();
+                                            e_hint.update(cx, |ws, cx| {
+                                                if inside && ws.proj_drop_hint.as_ref() != Some(&hint_name) {
+                                                    ws.proj_drop_hint = Some(hint_name);
+                                                    cx.notify();
+                                                } else if !inside && ws.proj_drop_hint.as_ref() == Some(&hint_name) {
+                                                    ws.proj_drop_hint = None;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        })
+                                        .on_drop(move |drag: &ProjectDrag, _window, cx| {
+                                            let from = drag.name.clone();
+                                            let to = project_name.clone();
+                                            e_proj_drop.update(cx, |ws, cx| {
+                                                ws.proj_drop_hint = None;
+                                                ws.move_project_near(from, to, cx)
+                                            });
+                                        })
+                                        .when(proj_hinted, |this| {
+                                            this.child(
+                                                div()
+                                                    .absolute()
+                                                    .top(px(2.))
+                                                    .left(px(4.))
+                                                    .h(px(5.))
+                                                    .rounded(px(2.5))
+                                                    .bg(rgb(0x4a9eff))
+                                                    .with_animation(
+                                                        ("proj-ind", pix),
+                                                        Animation::new(std::time::Duration::from_millis(160))
+                                                            .with_easing(ease_out_quint()),
+                                                        |this, delta| {
+                                                            this.opacity(0.4 + 0.6 * delta).w(relative(delta))
+                                                        },
+                                                    ),
+                                            )
+                                        }),
+                                )
+                            })
                     })
-                    .children(flyout_items.into_iter().chain(sess_items))
+                    .children(sess_items)
             })
             .collect();
 
@@ -3695,12 +4046,14 @@ impl Render for Workspace {
                                         .size_6()
                                         .rounded_md()
                                         .cursor_pointer()
-                                        // 有新版本在下载/已就绪 → 齿轮变蓝，照抄铃铛的"有待处理事项"配色。
+                                        // 有新版本在下载/已就绪，或守护落后于磁盘二进制 → 齿轮变蓝，
+                                        // 照抄铃铛的"有待处理事项"配色。
                                         .text_color(if matches!(
                                             self.update_status,
                                             updater::UpdateStatus::Downloading { .. }
                                                 | updater::UpdateStatus::ReadyToInstall { .. }
-                                        ) {
+                                        ) || self.daemon_outdated == Some(true)
+                                        {
                                             rgb(0x4a9eff).into()
                                         } else {
                                             c_muted
@@ -3709,15 +4062,13 @@ impl Render for Workspace {
                                         .child(Icon::new(IconName::Settings))
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(|this, _, _w, cx| {
+                                            cx.listener(|this, _, window, cx| {
                                                 cx.stop_propagation();
-                                                if this.view == MainView::Settings {
-                                                    this.view = this.prev_view;
-                                                } else {
-                                                    this.prev_view = this.view;
-                                                    this.view = MainView::Settings;
+                                                this.check_daemon_outdated(cx);
+                                                if this.llm_inputs.is_none() {
+                                                    this.init_llm_inputs(window, cx);
                                                 }
-                                                cx.notify();
+                                                this.open_settings_window(cx);
                                             }),
                                         ),
                                 ),
@@ -3747,9 +4098,7 @@ impl Render for Workspace {
                     .flex()
                     .flex_col()
                     // 会话视图 tab（终端/文件树/Git）——总览是全局视图，走侧栏入口，不在这排里。
-                    .children((self.view != MainView::Overview
-                        && self.view != MainView::Settings
-                        && self.view != MainView::Usage)
+                    .children((self.view != MainView::Overview && self.view != MainView::Usage)
                         .then(|| {
                         TabBar::new("main-view-tabs")
                             .underline()
@@ -3833,11 +4182,22 @@ impl Render for Workspace {
                             let cwd = self.cur().and_then(|s| s.cwd(cx));
                             let status =
                                 cwd.as_ref().and_then(|r| self.git_status.get(r).map(|(_, d)| d));
+                            // 评论输入框懒创建（需要 window），跟文件树搜索框同一套模式。
+                            if self.git_diff.is_some() && self.diff_comment_input.is_none() {
+                                use gpui_component::input::InputState;
+                                let state = cx.new(|cx| {
+                                    InputState::new(window, cx)
+                                        .placeholder("给选中的行写评论，发送前可以再改改…")
+                                });
+                                self.diff_comment_input = Some(state);
+                            }
                             git_view(
                                 cwd.clone(),
                                 status,
                                 &self.git_diff,
                                 self.diff_split,
+                                &self.diff_selected,
+                                self.diff_comment_input.as_ref(),
                                 &self.git_files_scroll,
                                 &self.diff_scroll,
                                 cx,
@@ -3860,7 +4220,6 @@ impl Render for Workspace {
                             let data = self.usage_cache.as_ref().map(|(_, d)| d.clone());
                             usage_view(cur_project, data, cx)
                         }
-                        MainView::Settings => self.render_settings_page(cx),
                     }),
                     )),
                 ),
@@ -3869,6 +4228,8 @@ impl Render for Workspace {
             .children(palette_overlay)
             // 退出确认拦截弹层
             .children(self.show_quit_confirm.then(|| self.render_quit_confirm(cx)))
+            // 重启守护进程确认拦截弹层
+            .children(self.show_daemon_restart_confirm.then(|| self.render_daemon_restart_confirm(cx)))
             // 文件未保存切换确认拦截弹层
             .children(
                 self.pending_file_switch
@@ -4110,7 +4471,7 @@ fn history_view(
             .flex_col()
             .gap_3()
             .p_3()
-            .children(d.turns.iter().map(|t| {
+            .children(d.turns.iter().enumerate().map(|(i, t)| {
                 let role = if t.is_user { "用户" } else { "Claude" };
                 let role_color = if t.is_user { accent } else { fg };
                 let bubble_bg = if t.is_user { accent.opacity(0.12) } else { secondary };
@@ -4153,7 +4514,15 @@ fn history_view(
                                     .child(ts.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
                             })),
                     )
-                    .child(div().text_sm().text_color(fg).child(markdown(t.text.clone())))
+                    // 必须逐气泡给唯一 id：便捷函数 text::markdown() 拿调用处代码位置
+                    // 当 id，循环里所有气泡会共享同一份 TextView 状态（文本互踩、高度
+                    // 测量错乱，气泡整个叠在一起）。
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(fg)
+                            .child(TextView::markdown(("turn-md", i), t.text.clone())),
+                    )
                     .children(tool_summary.map(|s| {
                         div().text_xs().text_color(muted).child(format!("🔧 {s}"))
                     }))
@@ -4222,7 +4591,7 @@ fn usage_view(
         .collect();
     let heatmap_section = usage_section(
         "活动热力图（近 12 周）",
-        &format!("共 {heat_total} tokens"),
+        &format!("共 {} tokens", format_count(heat_total)),
         muted,
         c_border,
         h_flex().gap(px(2.)).p_2().children(week_columns).into_any_element(),
@@ -4295,7 +4664,18 @@ fn bar_section(title: &str, muted: Hsla, border: Hsla, color: Hsla, data: Vec<(S
                 .tick_margin(1),
         )
     };
-    usage_section(title, &format!("共 {total}"), muted, border, body.into_any_element())
+    usage_section(title, &format!("共 {}", format_count(total)), muted, border, body.into_any_element())
+}
+
+/// 大数字加 K/M 单位（千/百万才简化，保留一位小数），token 数 / 调用数这类展示都拿它过一遍。
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// 只保留输入里的头部 N 项，其余合并成一项"其他"（调用方传入的 data 已经按值降序，
@@ -4708,6 +5088,8 @@ fn git_view(
     status: Option<&GitStatusData>,
     git_diff: &Option<GitDiff>,
     split: bool,
+    diff_selected: &HashSet<usize>,
+    diff_comment_input: Option<&Entity<gpui_component::input::InputState>>,
     files_scroll: &ScrollHandle,
     diff_scroll: &UniformListScrollHandle,
     cx: &mut Context<Workspace>,
@@ -4817,14 +5199,17 @@ fn git_view(
         .min_h_0()
         .flex()
         .child(left)
-        .child(git_diff_pane(git_diff, split, diff_scroll, cx))
+        .child(git_diff_pane(git_diff, split, diff_selected, diff_comment_input, diff_scroll, cx))
 }
 
 /// Git diff 查看面板：uniform_list 虚拟滚动。split 为 true 时并排（左旧右新），
-/// 否则统一视图。顶部文件名右侧有「统一/并排」切换按钮。
+/// 否则统一视图。顶部文件名右侧有「统一/并排」切换按钮。改动行（+/-）可点选，
+/// 选中后配合底部评论框「发送到终端」，把反馈批量写进当前激活终端的 PTY。
 fn git_diff_pane(
     git_diff: &Option<GitDiff>,
     split: bool,
+    diff_selected: &HashSet<usize>,
+    diff_comment_input: Option<&Entity<gpui_component::input::InputState>>,
     diff_scroll: &UniformListScrollHandle,
     cx: &mut Context<Workspace>,
 ) -> Div {
@@ -4837,18 +5222,27 @@ fn git_diff_pane(
         Some(d) => {
             let name = d.path.rsplit('/').next().unwrap_or(d.path.as_str()).to_string();
             let lines = d.lines.clone();
+            let ws = cx.entity();
 
             let list = if split {
                 let rows = Rc::new(build_split_rows(&lines));
                 let count = rows.len();
                 let lines2 = lines.clone();
+                let sel2 = diff_selected.clone();
+                let ws2 = ws.clone();
                 uniform_list("git-diff-split", count, move |range, _w, _cx| {
-                    range.map(|i| render_split_row(&rows[i], &lines2)).collect::<Vec<_>>()
+                    range
+                        .map(|i| render_split_row(i, &rows[i], &lines2, &sel2, &ws2))
+                        .collect::<Vec<_>>()
                 })
             } else {
                 let count = lines.len();
+                let sel2 = diff_selected.clone();
+                let ws2 = ws.clone();
                 uniform_list("git-diff", count, move |range, _w, _cx| {
-                    range.map(|i| render_diff_line(&lines[i])).collect::<Vec<_>>()
+                    range
+                        .map(|i| render_diff_line(i, &lines[i], sel2.contains(&i), &ws2))
+                        .collect::<Vec<_>>()
                 })
             }
             .flex_1()
@@ -4907,8 +5301,47 @@ fn git_diff_pane(
                         .child(list)
                         .vertical_scrollbar(diff_scroll),
                 )
+                .child(diff_comment_bar(diff_selected, diff_comment_input, cx))
         }
     }
+}
+
+/// 交互式 diff 底部工具条：已选行数提示 + 评论输入框 + 「发送到终端」按钮，
+/// 发送目标固定是当前激活的终端标签（不跨项目匹配，简单直接）。
+fn diff_comment_bar(
+    selected: &HashSet<usize>,
+    input: Option<&Entity<gpui_component::input::InputState>>,
+    cx: &mut Context<Workspace>,
+) -> Div {
+    let (muted, border) = {
+        let t = cx.theme();
+        (t.muted_foreground, t.border)
+    };
+    let n = selected.len();
+    let can_send = n > 0;
+    let hint =
+        if n == 0 { "点选中改动行（+/-），可选写评论，发给当前终端".to_string() } else { format!("已选 {n} 行") };
+    let ws = cx.entity();
+
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .border_t_1()
+        .border_color(border)
+        .child(div().flex_none().text_xs().text_color(muted).child(hint))
+        .children(input.map(|state| div().flex_1().min_w_0().child(Input::new(state).small())))
+        .child(
+            Button::new("diff-send")
+                .small()
+                .label("发送到终端")
+                .disabled(!can_send)
+                .on_click(move |_ev, window, cx| {
+                    ws.update(cx, |this, cx| this.send_diff_comments(window, cx));
+                }),
+        )
 }
 
 /// 把 git diff 文本解析成结构化的行：从 @@ 段头取起始行号，逐行推进旧/新行号，
@@ -5038,15 +5471,10 @@ fn parse_hunk(line: &str) -> (u32, u32) {
 
 /// 渲染一行 diff：左侧色条 + 旧/新行号槽 + 文本；整行按类型上淡背景。
 /// 若有 segments（行内 diff 结果），变化片段再叠一层更深的底色。
-fn render_diff_line(l: &DiffLine) -> Div {
-    // (前景, 整行背景, 色条, 行内变化片段深底) —— None 表示不上色。
-    let (fg, bg, bar, hl): (Rgba, Option<Rgba>, Option<Rgba>, Rgba) = match l.kind {
-        DiffKind::Add => (rgb(0xb5e08a), Some(rgb(0x16261a)), Some(rgb(0x4ba14b)), rgb(0x2f6b34)),
-        DiffKind::Del => (rgb(0xf7a3ae), Some(rgb(0x2a1620)), Some(rgb(0xc75c6a)), rgb(0x7a2836)),
-        DiffKind::Context => (rgb(0xc0caf5), None, None, rgb(0)),
-        DiffKind::Hunk => (rgb(0x7dcfff), Some(rgb(0x16202e)), None, rgb(0)),
-        DiffKind::Meta => (rgb(0x565f89), None, None, rgb(0)),
-    };
+/// 增/删行（i 为 GitDiff.lines 下标）可点选：选中态描边，点击切给 Workspace
+/// 的 toggle_diff_line，配合底部评论框批量发给当前终端。
+fn render_diff_line(i: usize, l: &DiffLine, selected: bool, ws: &Entity<Workspace>) -> Stateful<Div> {
+    let (fg, bg, bar, hl) = diff_colors(l.kind);
     let gutter = |n: Option<u32>| {
         div()
             .w(px(44.))
@@ -5057,28 +5485,24 @@ fn render_diff_line(l: &DiffLine) -> Div {
             .child(n.map(|v| v.to_string()).unwrap_or_default())
     };
 
-    // 文本区：有行内 diff 就拆成多段（变化段上深底），否则整行一个文本。
-    let text_area = match &l.segments {
-        Some(segs) => div().flex_1().px_2().text_color(fg).flex().children(
-            segs.iter().map(|(s, changed)| {
-                let span = div().child(s.clone());
-                if *changed {
-                    span.bg(hl).rounded_sm()
-                } else {
-                    span
-                }
-            }),
-        ),
-        None => div()
-            .flex_1()
-            .px_2()
-            .text_color(fg)
-            .child(if l.text.is_empty() { "\u{00a0}".to_string() } else { l.text.clone() }),
-    };
-
-    let mut row = div().flex().items_center().h(px(FILE_LINE_H)).whitespace_nowrap();
+    let mut row = div()
+        .id(("diff-line", i))
+        .flex()
+        .items_center()
+        .h(px(FILE_LINE_H))
+        .whitespace_nowrap();
     if let Some(b) = bg {
         row = row.bg(b);
+    }
+    if matches!(l.kind, DiffKind::Add | DiffKind::Del) {
+        row = row.cursor_pointer();
+        if selected {
+            row = row.border_2().border_color(rgb(0x4a9eff));
+        }
+        let ws = ws.clone();
+        row = row.on_click(move |_ev, _window, cx| {
+            ws.update(cx, |this, cx| this.toggle_diff_line(i, cx));
+        });
     }
     row
         // 左侧色条：增/删才有，其它用等宽透明占位保持对齐。
@@ -5088,7 +5512,7 @@ fn render_diff_line(l: &DiffLine) -> Div {
         })
         .child(gutter(l.old_ln))
         .child(gutter(l.new_ln))
-        .child(text_area)
+        .child(diff_text_area(l, fg, hl))
 }
 
 /// 并排视图的一行：Both = 左(旧侧)/右(新侧)各一行（None 为空侧占位）；
@@ -5177,10 +5601,26 @@ fn diff_text_area(l: &DiffLine, fg: Rgba, hl: Rgba) -> Div {
 }
 
 /// 渲染并排的半行（左或右，flex_1）。idx 为 None 时是空侧占位（暗底）。
-/// left=true 用旧行号，否则用新行号。
-fn render_half(idx: Option<usize>, left: bool, lines: &[DiffLine]) -> Div {
+/// left=true 用旧行号，否则用新行号。ri 是并排行在 rows 里的下标，只用来拼 id
+/// （idx 本身在 Both(None, Some(i)) 这类情况下左右可能撞号，ri+left 才唯一）。
+/// 增/删行同 render_diff_line 一样可点选，选中态描边。
+fn render_half(
+    ri: usize,
+    idx: Option<usize>,
+    left: bool,
+    lines: &[DiffLine],
+    selected: &HashSet<usize>,
+    ws: &Entity<Workspace>,
+) -> Stateful<Div> {
     // overflow_hidden：长行必须裁剪在本半区内，否则会溢出盖住另一半，并排就糊了。
-    let base = div().flex_1().min_w_0().overflow_hidden().flex().items_center().h_full();
+    let base = div()
+        .id(("diff-half", ri * 2 + left as usize))
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .h_full();
     let Some(i) = idx else {
         // 空侧：略暗的底表示「此侧无对应行」。
         return base.bg(rgb(0x101218));
@@ -5191,6 +5631,16 @@ fn render_half(idx: Option<usize>, left: bool, lines: &[DiffLine]) -> Div {
     let mut row = base;
     if let Some(b) = bg {
         row = row.bg(b);
+    }
+    if matches!(l.kind, DiffKind::Add | DiffKind::Del) {
+        row = row.cursor_pointer();
+        if selected.contains(&i) {
+            row = row.border_2().border_color(rgb(0x4a9eff));
+        }
+        let ws = ws.clone();
+        row = row.on_click(move |_ev, _window, cx| {
+            ws.update(cx, |this, cx| this.toggle_diff_line(i, cx));
+        });
     }
     row.child(match bar {
         Some(c) => div().w(px(2.)).h_full().bg(c),
@@ -5208,8 +5658,14 @@ fn render_half(idx: Option<usize>, left: bool, lines: &[DiffLine]) -> Div {
     .child(diff_text_area(l, fg, hl))
 }
 
-/// 渲染并排视图的一行。
-fn render_split_row(row: &SplitRow, lines: &[DiffLine]) -> Div {
+/// 渲染并排视图的一行。ri 是该行在 rows 里的下标，透传给 render_half 拼 id。
+fn render_split_row(
+    ri: usize,
+    row: &SplitRow,
+    lines: &[DiffLine],
+    selected: &HashSet<usize>,
+    ws: &Entity<Workspace>,
+) -> Div {
     match row {
         SplitRow::Full(i) => {
             let l = &lines[*i];
@@ -5234,9 +5690,9 @@ fn render_split_row(row: &SplitRow, lines: &[DiffLine]) -> Div {
             // 否则容器 hug content，grow 失效，空侧塌成 0 宽、内容顶到最左。
             .w_full()
             .whitespace_nowrap()
-            .child(render_half(*l, true, lines))
+            .child(render_half(ri, *l, true, lines, selected, ws))
             .child(div().w(px(1.)).h_full().bg(rgb(0x2a2e3d))) // 中缝分隔
-            .child(render_half(*r, false, lines)),
+            .child(render_half(ri, *r, false, lines, selected, ws)),
     }
 }
 
@@ -5392,6 +5848,22 @@ fn file_url_to_path(url: &str) -> Option<std::path::PathBuf> {
     }
     Some(std::path::PathBuf::from(String::from_utf8(bytes).ok()?))
 }
+
+/// 独立设置窗口的根 view：只是个薄壳，真正状态都还在传进来的 Workspace 实体上，
+/// 每次渲染转手调 `render_settings_content`，天然跟主窗口设置页保持同步。
+struct SettingsWindow {
+    workspace: Entity<Workspace>,
+}
+
+impl Render for SettingsWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.workspace.update(cx, |ws, cx| ws.render_settings_content(cx))
+    }
+}
+
+/// 独立设置窗口的单例句柄：已经开着就聚焦复用，避免重复开出好几扇一样的窗口。
+struct SettingsWindowHandle(Option<WindowHandle<Root>>);
+impl Global for SettingsWindowHandle {}
 
 /// 开一扇主工作台窗口（Workspace + Root 包装），返回其 weak 引用。
 /// 首启和「点 Dock 图标重开」共用这一份：`Workspace::new` 本来就会从存档 + smeltd

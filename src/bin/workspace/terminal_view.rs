@@ -332,6 +332,14 @@ impl TerminalView {
         self.cwd.clone()
     }
 
+    /// 从外部写一段文本到 PTY（等价于粘贴），供 diff 视图「发到终端」等场景复用。
+    pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.terminal.send_input(text.as_bytes());
+        self.notification = None;
+        self.completed_unread = false;
+        cx.notify();
+    }
+
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
