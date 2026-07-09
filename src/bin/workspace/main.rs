@@ -3266,18 +3266,12 @@ impl Workspace {
                 let active = self
                     .cur()
                     .is_some_and(|s| s.active.entity_id() == t.entity_id());
-                // 不给活动 pane 描边（iTerm2 也不描）：分屏时靠「压暗非活动 pane」来区分
-                // 谁是活动的就够了，活动 pane 保持原样最亮眼；单 pane 时更是压根没有别的
-                // pane 可比，不需要任何叠加层。响铃待处理的非活动 pane 单独描蓝环提醒。
+                // 不给任何 pane 描边（iTerm2 也不描，之前的蓝框提醒也拿掉了）：分屏时靠
+                // 「压暗非活动 pane」区分谁是活动的就够了；单 pane 时压根没有别的 pane
+                // 可比，不需要任何叠加层。
                 let multi_pane = self.cur().is_some_and(|s| s.pane_count() > 1);
                 let overlay = if !multi_pane || active {
                     div().absolute().inset_0()
-                } else if t.read(cx).has_attention() {
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .border_2()
-                        .border_color(rgb(0x4a9eff))
                 } else {
                     div().absolute().inset_0().bg(hsla(0., 0., 0., 0.28))
                 };

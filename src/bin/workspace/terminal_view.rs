@@ -331,11 +331,6 @@ impl TerminalView {
         lines[start..].to_vec()
     }
 
-    /// 是否有待处理通知（agent 需要注意）。
-    pub fn has_attention(&self) -> bool {
-        self.notification.is_some()
-    }
-
     /// 通知消息文本（供通知面板显示）。
     pub fn notification(&self) -> Option<&str> {
         self.notification.as_deref()
