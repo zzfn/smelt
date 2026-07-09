@@ -1064,6 +1064,14 @@ struct Workspace {
     daemon_outdated: Option<bool>,
     /// 「重启守护进程」二次确认弹窗开关：点确定会断开所有当前终端会话。
     show_daemon_restart_confirm: bool,
+    /// 根节点自己的焦点句柄：总览/文件树/Git/热力图/历史会话这些页面自身没有可
+    /// 聚焦的元素，切过去后如果谁都不 focus，窗口的 focus 仍停在切走前那个（可能
+    /// 已经不在当前渲染树里的）终端上——GPUI 找不到就把 focus 兜底纠正到 window 的
+    /// 真正根节点，而 Workspace 这层的 on_key_down（Cmd+Shift+F 等全局快捷键）挂在
+    /// Root 组件之下、并非那个根节点，于是收不到事件，表现为"切到别的页面后快捷键
+    /// 全部失灵"。切到非终端页面时把 focus 显式认领到这个句柄上，保证 Workspace 的
+    /// on_key_down 始终在 dispatch 路径上。
+    focus_handle: FocusHandle,
 }
 
 /// 宠物大脑配置的四个输入框（base_url / api_key / model / persona）。
@@ -1181,6 +1189,7 @@ impl Workspace {
             proj_drop_hint: None,
             daemon_outdated: None,
             show_daemon_restart_confirm: false,
+            focus_handle: cx.focus_handle(),
         };
         // 立即写盘：把本次启动生成/沿用的会话 id 落到存档。否则首启（或旧存档迁移）
         // 生成的新 id 只在内存里，若用户不做任何布局操作就退出，重开会因无 id 而
@@ -4288,12 +4297,16 @@ impl Render for Workspace {
                         SidebarMenuItem::new("总览")
                             .icon(IconName::LayoutDashboard)
                             .active(overview_active)
-                            .on_click(move |_ev, _window, cx| {
+                            .on_click(move |_ev, window, cx| {
                                 e_overview.update(cx, |ws, cx| {
                                     ws.view = MainView::Overview;
                                     ws.refresh_git(cx); // 进总览 → 后台刷新 git
                                     cx.notify();
                                 });
+                                // 总览页没有可聚焦元素，focus 显式认领到根节点，
+                                // 不然 Cmd+Shift+F 等全局快捷键在这页会收不到事件。
+                                let h = e_overview.read(cx).focus_handle.clone();
+                                window.focus(&h, cx);
                             }),
                     ]),
                 ),
@@ -4424,6 +4437,9 @@ impl Render for Workspace {
             .size_full()
             .bg(c_bg)
             .font_family(terminal_view::FONT_FAMILY)
+            // 见 focus_handle 字段注释：非终端页面没有可聚焦的子元素时，靠这个把
+            // window 的 focus 兜底钉在这层，保证下面的全局 on_key_down 收得到事件。
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Quit, _window, cx| {
                 this.show_quit_confirm = true;
                 cx.notify();
@@ -4644,7 +4660,7 @@ impl Render for Workspace {
                                 MainView::Hotspot => 3,
                                 _ => 4,
                             })
-                            .on_click(cx.listener(|this, ix: &usize, _window, cx| {
+                            .on_click(cx.listener(|this, ix: &usize, window, cx| {
                                 this.view = match *ix {
                                     0 => MainView::Terminal,
                                     1 => MainView::Files,
@@ -4652,6 +4668,12 @@ impl Render for Workspace {
                                     3 => MainView::Hotspot,
                                     _ => MainView::History,
                                 };
+                                // 切到非终端页面时把 focus 认领到根节点：这几页自己
+                                // 没有可聚焦元素，不然全局快捷键在这些页面会失灵。
+                                // 终端页留给 TerminalView 自己的点击/激活逻辑去抢焦点。
+                                if this.view != MainView::Terminal {
+                                    window.focus(&this.focus_handle, cx);
+                                }
                                 cx.notify();
                             }))
                             .child(Tab::new().label("终端"))
@@ -5610,6 +5632,10 @@ fn hotspot_view(
                         ws.view = MainView::Files;
                         ws.view_file(abs_path.clone(), window, cx);
                     });
+                    // 见总览入口同款注释：文件树页没有可聚焦元素，focus 显式
+                    // 认领到根节点，不然全局快捷键在这页会收不到事件。
+                    let h = this.read(cx).focus_handle.clone();
+                    window.focus(&h, cx);
                 });
 
             // 太小的方块放不下文字，索性留白，靠颜色传达信息即可。
