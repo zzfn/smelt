@@ -1423,7 +1423,7 @@ impl Workspace {
         self.add_session(scratch_dir(), cx);
     }
 
-    /// 顶部「临时终端」入口：已有临时终端就切过去，没有才新开一个
+    /// 顶部「新建终端」入口：已有临时终端就切过去，没有才新开一个
     /// （避免每次点这个常驻入口都新建一个空终端）。这个入口能从总览/设置页直接点，
     /// `activate`/`add_session` 都不管 `self.view`，这里补上，否则点了但看不到终端。
     fn activate_or_new_scratch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3764,7 +3764,7 @@ impl Render for Workspace {
                 let e_proj_drop = this.clone();
                 let project_name: SharedString = name.clone().into();
                 let new_cwd = cwd.clone();
-                let is_scratch_group = name == "临时终端";
+                let is_scratch_group = scratch_dir().as_deref() == Some(cwd.as_str());
                 // 拖拽悬停指示：本项目行是否是当前插入位置。
                 let proj_hinted = self.proj_drop_hint.as_deref() == Some(name.as_str());
                 SidebarMenuItem::new(name.clone())
@@ -3928,10 +3928,10 @@ impl Render for Workspace {
             // 宽度交给外层 resizable_panel 控制（可拖），这里填满 panel。
             // 品牌已移到顶部标题栏，侧栏直接从「会话」开始，避免重复。
             .w(relative(1.))
-            // 总览 + 临时终端：不挂在任何项目下的全局入口，跟当前在哪个项目无关，
-            // 随时点得到（临时终端不用先切项目、也不用等 sidebar 里已有临时终端分组）。
-            .child({
-                let e_scratch = this.clone();
+            // 总览：不挂在任何项目下的全局入口，跟当前在哪个项目无关，随时点得到。
+            // 新建终端挪到底部跟「打开项目」放一起了（见 footer），都是「开个新地方干活」
+            // 这一类操作，归在一块更好找。
+            .child(
                 SidebarGroup::new("").child(
                     SidebarMenu::new().children([
                         SidebarMenuItem::new("总览")
@@ -3944,14 +3944,9 @@ impl Render for Workspace {
                                     cx.notify();
                                 });
                             }),
-                        SidebarMenuItem::new("临时终端")
-                            .icon(IconName::SquareTerminal)
-                            .on_click(move |_ev, window, cx| {
-                                e_scratch.update(cx, |ws, cx| ws.activate_or_new_scratch(window, cx));
-                            }),
                     ]),
-                )
-            })
+                ),
+            )
             .child(SidebarGroup::new("会话").child(SidebarMenu::new().children(menu_items)))
             // 不用 SidebarFooter：它会给整块 footer 挂 hover 背景（sidebar_accent），
             // 盖住按钮自己的 hover。直接放普通容器，让每个按钮各自 hover 可见。
@@ -3966,7 +3961,14 @@ impl Render for Workspace {
                     .pb_1()
                     .border_t_1()
                     .border_color(rgba(0xffffff0d))
-                    .child(div().flex().w_full().child(open_project_button(cx)))
+                    // 「打开项目」+「新建终端」并排：都是"开个新地方干活"，归一块好找。
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(open_project_button(cx))
+                            .child(scratch_terminal_button(cx)),
+                    )
                     // 版本号居中：编译期取 Cargo.toml 的 version；点一下跳 GitHub 仓库。
                     .child(
                         div()
@@ -5987,6 +5989,19 @@ fn open_project_button(cx: &mut Context<Workspace>) -> Stateful<Div> {
     })
 }
 
+/// 「新建终端」按钮：不用先选项目，直接落在 $HOME 开/切一个终端（原先是顶部
+/// 独立入口，挪到跟「打开项目」并排，都是"开个新地方干活"，归一块好找）。
+fn scratch_terminal_button(cx: &mut Context<Workspace>) -> Stateful<Div> {
+    tool_button(
+        "scratch-terminal",
+        IconName::SquareTerminal,
+        "新建终端",
+        false,
+        cx,
+        |this, window, cx| this.activate_or_new_scratch(window, cx),
+    )
+}
+
 /// 当前工作目录字符串。
 fn current_dir() -> Option<String> {
     std::env::current_dir()
@@ -6000,20 +6015,16 @@ fn scratch_dir() -> Option<String> {
     dirs::home_dir().and_then(|p| p.to_str().map(String::from))
 }
 
-/// cwd → 侧栏项目分组显示名。跟 scratch_dir 命中的落到「临时终端」，否则取目录末段。
+/// cwd → 侧栏项目分组显示名，统一取目录末段——scratch_dir 就是 $HOME，末段天然是
+/// 用户名（比如 c.chen），不用再特判成「临时终端」这种跟其他项目组风格不一致的名字。
 /// Workspace::project_groups（侧栏渲染）和拖拽排序（找会话/插入点归属的项目）共用。
 fn project_name_for_cwd(cwd: &str) -> String {
-    let is_scratch = scratch_dir().as_deref().is_some_and(|h| h == cwd);
-    if is_scratch {
-        "临时终端".to_string()
-    } else {
-        cwd.trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("项目")
-            .to_string()
-    }
+    cwd.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("项目")
+        .to_string()
 }
 
 /// file:// URL → 本地路径（percent 解码，支持中文 / 空格目录名）。
