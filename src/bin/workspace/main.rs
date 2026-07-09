@@ -1029,6 +1029,13 @@ struct Workspace {
     session_detail: Option<(PathBuf, Rc<session_history::SessionDetail>)>,
     /// 加载会话详情的自增序号：后台解析完成时用它判断结果是否已过期（切了别的会话）。
     session_detail_gen: u64,
+    /// 历史会话表格的 Entity（懒建，见 ensure_session_table）；None = 还没建过。
+    session_table: Option<Entity<TableState<SessionHistoryDelegate>>>,
+    /// session_table 当前装的是哪个项目（cwd），项目切换时判定要不要重建 Entity
+    /// （重置排序/滚动位置——体感上是"进了一个新页面"，同项目内刷新则保留这些状态）。
+    session_table_key: Option<String>,
+    /// TableEvent 订阅句柄，session_table 重建时一起换。
+    session_table_sub: Option<Subscription>,
     /// 调试 HUD 开关（Cmd+Shift+F 切换）：开启时右上角显示帧率 + 帧耗时。
     debug_hud: bool,
     /// 上一帧渲染时刻（算帧间隔用）。
@@ -1152,6 +1159,9 @@ impl Workspace {
             session_list_inflight: HashSet::new(),
             session_detail: None,
             session_detail_gen: 0,
+            session_table: None,
+            session_table_key: None,
+            session_table_sub: None,
             llm_inputs: None,
             llm_subs: Vec::new(),
             opacity_slider: None,
@@ -3158,6 +3168,39 @@ impl Workspace {
         .detach();
     }
 
+    /// 历史会话表格懒建 / 刷新：同项目（key 不变）只换 delegate 里的数据（保留排序/
+    /// 滚动/选中状态）；换项目（key 变）整个重建 Entity（重置这些状态，体感上是
+    /// "进了一个新页面"）。
+    fn ensure_session_table(
+        &mut self,
+        key: &str,
+        sessions: Rc<Vec<session_history::SessionSummary>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TableState<SessionHistoryDelegate>> {
+        if self.session_table_key.as_deref() == Some(key) {
+            if let Some(table) = &self.session_table {
+                table.update(cx, |t, cx| {
+                    t.delegate_mut().sessions = sessions;
+                    t.refresh(cx);
+                });
+                return table.clone();
+            }
+        }
+        let table = cx.new(|cx| TableState::new(SessionHistoryDelegate::new(sessions), window, cx));
+        self.session_table_sub =
+            Some(cx.subscribe_in(&table, window, |this, table, ev: &TableEvent, _window, cx| {
+                if let TableEvent::SelectRow(ix) = ev {
+                    if let Some(s) = table.read(cx).delegate().sessions.get(*ix) {
+                        this.open_session_detail(s.path.clone(), cx);
+                    }
+                }
+            }));
+        self.session_table_key = Some(key.to_string());
+        self.session_table = Some(table.clone());
+        table
+    }
+
     /// 文件树搜索：按 query 匹配文件名 + 文件内容，后台遍历项目、命中写回 search_results。
     /// 与 view_file 同款「background_executor + 自增 gen 丢弃过期结果」模式，绝不阻塞 render。
     /// query 未变（已有对应结果或正在跑同一 query）就跳过，避免每帧重扫。
@@ -4710,7 +4753,15 @@ impl Render for Workspace {
                         MainView::History => {
                             let cwd = self.cur().and_then(|s| s.cwd(cx));
                             let sessions = cwd.as_ref().and_then(|r| self.session_list.get(r).map(|(_, d)| d.clone()));
-                            history_view(sessions, &self.session_detail, cx)
+                            let list_state = match (&cwd, sessions) {
+                                (_, None) => HistoryListState::Loading,
+                                (Some(_), Some(s)) if s.is_empty() => HistoryListState::Empty,
+                                (Some(cwd), Some(s)) => {
+                                    HistoryListState::Ready(self.ensure_session_table(cwd, s, window, cx))
+                                }
+                                (None, _) => HistoryListState::Empty,
+                            };
+                            history_view(list_state, &self.session_detail, cx)
                         }
                     }),
                     )),
@@ -4897,11 +4948,111 @@ fn file_tree(
         .into_any_element()
 }
 
+/// 历史会话表格「时间」列文案：有明显跨度（>1 分钟）就顺带标一下这个会话跑了多久，
+/// 纯单条消息的会话就只显示时间点，不必画蛇添足展示"0 分钟"。
+fn session_when(s: &session_history::SessionSummary) -> String {
+    match (s.started_at, s.last_active_at) {
+        (Some(start), Some(last)) if (last - start).num_minutes() >= 1 => format!(
+            "{} · 跑了 {} 分钟",
+            last.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+            (last - start).num_minutes()
+        ),
+        (_, Some(last)) => last.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 历史会话表格的数据委托：持有当前项目的会话列表 + 列定义，渲染/排序都在这实现。
+struct SessionHistoryDelegate {
+    sessions: Rc<Vec<session_history::SessionSummary>>,
+    columns: Vec<Column>,
+}
+
+impl SessionHistoryDelegate {
+    fn new(sessions: Rc<Vec<session_history::SessionSummary>>) -> Self {
+        Self {
+            sessions,
+            columns: vec![
+                Column::new("title", "标题").width(px(260.)),
+                Column::new("when", "时间").width(px(180.)).sortable(),
+                Column::new("messages", "消息数").width(px(90.)).sortable(),
+                Column::new("tokens", "Tokens").width(px(90.)).sortable(),
+            ],
+        }
+    }
+}
+
+impl TableDelegate for SessionHistoryDelegate {
+    fn columns_count(&self, _cx: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, _cx: &App) -> usize {
+        self.sessions.len()
+    }
+
+    fn column(&self, col_ix: usize, _cx: &App) -> Column {
+        self.columns[col_ix].clone()
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let s = &self.sessions[row_ix];
+        let (fg, muted) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground)
+        };
+        match self.columns[col_ix].key.as_ref() {
+            "title" => div().text_color(fg).child(s.title.clone()).into_any_element(),
+            "when" => div().text_color(muted).child(session_when(s)).into_any_element(),
+            "messages" => {
+                div().text_color(muted).child(s.message_count.to_string()).into_any_element()
+            }
+            "tokens" => div().text_color(muted).child(format_count(s.total_tokens)).into_any_element(),
+            _ => Empty.into_any_element(),
+        }
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        let key = self.columns[col_ix].key.clone();
+        let rows = Rc::make_mut(&mut self.sessions);
+        match (key.as_ref(), sort) {
+            ("when", ColumnSort::Ascending) => rows.sort_by_key(|s| s.last_active_at),
+            ("when", ColumnSort::Descending) => rows.sort_by_key(|s| std::cmp::Reverse(s.last_active_at)),
+            ("messages", ColumnSort::Ascending) => rows.sort_by_key(|s| s.message_count),
+            ("messages", ColumnSort::Descending) => rows.sort_by_key(|s| std::cmp::Reverse(s.message_count)),
+            ("tokens", ColumnSort::Ascending) => rows.sort_by_key(|s| s.total_tokens),
+            ("tokens", ColumnSort::Descending) => rows.sort_by_key(|s| std::cmp::Reverse(s.total_tokens)),
+            // Default：不重排，维持 list_sessions 原始顺序（按时间新→旧）。
+            _ => {}
+        }
+    }
+}
+
+/// 历史会话列表的三种状态：还没扫描完 / 扫描完但没有历史会话 / 拿到数据（表格 Entity
+/// 已经就绪，见 Workspace::ensure_session_table）。
+enum HistoryListState {
+    Loading,
+    Empty,
+    Ready(Entity<TableState<SessionHistoryDelegate>>),
+}
+
 /// 历史会话页：左侧列出当前项目下 Claude Code 保存的历史会话，右侧显示选中会话的
 /// 对话内容（只读浏览，不支持 resume）。数据来自 session_history 模块，跟「用量」
 /// 页读的是同一份 `~/.claude/projects/**/*.jsonl`，但这里还原对话本身而非统计聚合。
 fn history_view(
-    sessions: Option<Rc<Vec<session_history::SessionSummary>>>,
+    list: HistoryListState,
     detail: &Option<(PathBuf, Rc<session_history::SessionDetail>)>,
     cx: &mut Context<Workspace>,
 ) -> Div {
@@ -4909,59 +5060,15 @@ fn history_view(
         let t = cx.theme();
         (t.muted_foreground, t.foreground, t.border, t.primary, t.secondary)
     };
-    let selected_path = detail.as_ref().map(|(p, _)| p.clone());
-    let this = cx.entity();
 
-    let list_body: AnyElement = match &sessions {
-        None => placeholder_view("加载中…", muted).into_any_element(),
-        Some(sessions) if sessions.is_empty() => {
+    let list_body: AnyElement = match list {
+        HistoryListState::Loading => placeholder_view("加载中…", muted).into_any_element(),
+        HistoryListState::Empty => {
             placeholder_view("这个项目还没有本地保存的历史会话", muted).into_any_element()
         }
-        Some(sessions) => div()
-            .id("session-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .children(sessions.iter().enumerate().map(|(i, s)| {
-                let is_selected = selected_path.as_deref() == Some(s.path.as_path());
-                let this = this.clone();
-                let path = s.path.clone();
-                // 有明显跨度（>1 分钟）就顺带标一下这个会话跑了多久，纯单条消息的
-                // 会话就只显示时间点，不必画蛇添足展示"0 分钟"。
-                let when = match (s.started_at, s.last_active_at) {
-                    (Some(start), Some(last)) if (last - start).num_minutes() >= 1 => format!(
-                        "{} · 跑了 {} 分钟",
-                        last.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
-                        (last - start).num_minutes()
-                    ),
-                    (_, Some(last)) => last.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string(),
-                    _ => String::new(),
-                };
-                div()
-                    .id(("session-row", i))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .px_3()
-                    .py_2()
-                    .cursor_pointer()
-                    .when(is_selected, |el| el.bg(c_border))
-                    .hover(move |s| s.bg(c_border))
-                    .on_click(move |_ev, _window, cx| {
-                        this.update(cx, |ws, cx| ws.open_session_detail(path.clone(), cx));
-                    })
-                    .child(div().text_sm().text_color(fg).child(s.title.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("{when} · {} 条消息", s.message_count)),
-                    )
-                    .into_any_element()
-            }))
-            .into_any_element(),
+        HistoryListState::Ready(table) => {
+            div().flex_1().min_h_0().child(DataTable::new(&table).stripe(true)).into_any_element()
+        }
     };
 
     let detail_body: AnyElement = match detail {

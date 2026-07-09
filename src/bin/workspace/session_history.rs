@@ -20,6 +20,7 @@ fn projects_root() -> PathBuf {
 }
 
 /// 一份历史会话的概览（列表用）。
+#[derive(Clone)]
 pub struct SessionSummary {
     pub path: PathBuf,
     /// 首条用户消息文本（截断），取不到就回退用 session id（文件名去掉扩展名）。
