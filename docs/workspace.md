@@ -1,8 +1,10 @@
 # smelt workspace
 
 基于 [GPUI](https://gpui.rs) 的个人工作台桌面应用：内嵌一个真正的终端，让你在自己的项目里跑
-`claude code` 等交互式命令，定位是「AI coding 驾驶舱 / Claude Code 指挥中心」——多项目 × 多终端
-的外壳，后续叠加 agent 会话监控（读 `~/.claude/projects/*.jsonl`）。
+`claude` / `codex` / `gemini` 等交互式 agent，定位是「AI coding 驾驶舱」——多项目 × 多终端的外壳。
+
+外壳本身与具体 agent 无关；在此之上叠加的 agent 会话监控 / 用量统计 / 历史会话浏览
+（读 `~/.claude/projects/**/*.jsonl`）目前仅支持 Claude Code。
 
 运行：
 

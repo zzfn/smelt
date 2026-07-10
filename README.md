@@ -4,9 +4,10 @@
 
 # smelt
 
-**Mac 上的 AI coding 驾驶舱 —— 一个专为「同时指挥多个 Claude Code agent 干活」设计的桌面工作台。**
+**Mac 上的 AI coding 驾驶舱 —— 一个专为「同时指挥多个 CLI coding agent 干活」设计的桌面工作台。**
 
-基于 [GPUI](https://gpui.rs) 的原生应用，内嵌真终端，多项目 × 多标签，会话状态一目了然。
+基于 [GPUI](https://gpui.rs) 的原生应用，内嵌真终端，多项目 × 多标签。
+Claude Code、Codex、Gemini CLI……凡是跑在终端里的 agent，都能在这里并排看住。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/zzfn/smelt)](https://github.com/zzfn/smelt/releases)
@@ -35,16 +36,20 @@ smelt 把终端——agent 真正干活的地方——变成主战场。
 
 ## 功能
 
-**工作台**
-- 多项目 × 多标签内嵌真终端，可跑 `claude`、`vim`、`htop` 等交互式程序与全屏 TUI
+**工作台**（与具体 agent 无关）
+- 多项目 × 多标签内嵌真终端，`claude`、`codex`、`gemini`、`vim`、`htop` 等交互式程序与全屏 TUI 都能跑
 - 分屏：竖切 / 横切，一个会话里并排看多个 agent
 - 命令面板（`Cmd+K`）、可折叠侧栏
-
-**看住 agent**
-- 会话状态监控：解析 Claude Code 本地 transcript，标出哪个会话在等你输入
 - 「需要关注」角标同时出现在 Dock 图标和菜单栏常驻图标上，切走 smelt 也能瞥见
+
+**深度集成**（目前仅 Claude Code）
+
+下面三项靠解析 Claude Code 写在本地的 transcript（`~/.claude/projects/**/*.jsonl`）实现，
+其它 agent 暂时只能当普通终端用：
+
+- 会话状态监控：标出哪个会话在跑、哪个在等你输入
 - 用量统计：按工具 / 模型 / 项目拆分 token 用量，含今日走势与活动热力图
-- 历史会话浏览：翻看 `~/.claude/projects/**/*.jsonl` 里的完整对话（只读）
+- 历史会话浏览：翻看完整对话（只读）
 
 **读写代码**
 - 文件树 + 文件名/内容搜索，内置编辑器（tree-sitter 语法高亮、行号、`Cmd+S` 保存）

@@ -1,7 +1,11 @@
 # smelt
 
-Mac 上的 AI coding 驾驶舱 / Claude Code 指挥中心：一个专为「指挥多个 Claude Code
-agent 干活」设计的桌面工作台。基于 GPUI，内嵌真终端，多项目 × 多标签。
+Mac 上的 AI coding 驾驶舱：一个专为「同时指挥多个 CLI coding agent 干活」设计的桌面
+工作台。基于 GPUI，内嵌真终端，多项目 × 多标签。
+
+终端外壳与具体 agent 无关（`claude` / `codex` / `gemini` 都能跑）；但会话状态监控、
+用量统计、历史会话浏览三项靠解析 `~/.claude/projects/**/*.jsonl`，**目前仅支持
+Claude Code**。改这三处时注意别把 Claude Code 专属假设泄漏到通用终端层。
 
 ## 二进制
 - `workspace`（`src/bin/workspace/`）—— GUI 主程序，`cargo run --bin workspace`
