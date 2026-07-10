@@ -135,11 +135,34 @@ rm -f "$BG1" "$BG2"
 
 VOL="$APP_NAME"
 RW="$DIST/.rw.dmg"
+
+# 上次若中途失败没 detach 干净，残留挂载会把这次的新盘挤成 "Smelt 1"，下面认死
+# "$VOL" 这个名字的 AppleScript 会定制到旧盘上，新盘反而悄悄产出朴素无定制的 dmg——
+# 这是「有时候定制没效果」的一个真实根因。开工前先清掉同名残留，保证这次 attach
+# 出来的就是 "/Volumes/$VOL"。（极端情况下若你真有块外置盘恰好也叫 Smelt 会被一并
+# 弹出，但这种命名巧合概率极低，权衡后可接受。）
+if [[ -d "/Volumes/$VOL" ]]; then
+  echo "  … 清理上次残留的挂载 /Volumes/$VOL"
+  hdiutil detach "/Volumes/$VOL" -force >/dev/null 2>&1 || true
+fi
+
 rm -f "$RW"
 hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RW" >/dev/null
 
 DEV="$(hdiutil attach -readwrite -noverify -noautoopen "$RW" | grep -E '^/dev/' | head -1 | awk '{print $1}')"
-sleep 1
+MOUNT="/Volumes/$VOL"
+
+# attach 到 Finder 认出这个卷中间有个空档，固定 sleep 1 机器一忙就可能不够——
+# 轮询等挂载点真的出现，比赌一个固定时长靠谱。
+for _ in $(seq 1 20); do
+  [[ -d "$MOUNT" ]] && break
+  sleep 0.5
+done
+if [[ ! -d "$MOUNT" ]]; then
+  echo "✗ 挂载卷 $MOUNT 迟迟没出现，打包终止" >&2
+  hdiutil detach "$DEV" -force >/dev/null 2>&1 || true
+  exit 1
+fi
 
 # 有背景 tiff 才设背景，否则只做布局定制。
 if [[ -f "$STAGE/.background/bg.tiff" ]]; then
@@ -149,7 +172,9 @@ else
 fi
 
 # AppleScript 定制挂载窗口：隐藏工具栏/状态栏、固定尺寸、图标摆位（app 左 / 应用程序 右）。
-osascript <<EOA || echo "  ⚠ Finder 定制被跳过（首次可能需在「系统设置→隐私与安全性→自动化」允许终端控制 Finder）；dmg 仍可用"
+# 用 2>&1 >/dev/null 只留错误文本（osascript 正常路径没有 stdout 输出可看），
+# 失败原因直接打出来，别再让"可能需要授权"这种猜测式提示背锅。
+if ! OSA_ERR="$(osascript <<EOA 2>&1 >/dev/null
 tell application "Finder"
   tell disk "$VOL"
     open
@@ -169,6 +194,30 @@ tell application "Finder"
   end tell
 end tell
 EOA
+)"; then
+  echo "  ⚠ Finder 定制失败，dmg 仍会正常产出，只是没有背景/图标摆位。原因：${OSA_ERR:-未知}"
+  echo "    （常见原因：首次运行需在「系统设置→隐私与安全性→自动化」允许终端控制 Finder）"
+fi
+
+# .DS_Store（背景/布局/图标坐标全存这里）是 Finder 异步写盘的，AppleScript 的
+# close 只是发了指令，不代表已经落盘。轮询等它出现、且连续两次读到的大小不变
+# 再 sync + detach，否则赶上机器忙，写一半就被卸载，定制悄悄丢失且没有任何报错。
+DS_STORE="$MOUNT/.DS_Store"
+prev_size=-1
+stable=0
+for _ in $(seq 1 20); do
+  if [[ -f "$DS_STORE" ]]; then
+    cur_size="$(stat -f%z "$DS_STORE" 2>/dev/null || echo -1)"
+    if [[ "$cur_size" == "$prev_size" && "$cur_size" -gt 0 ]]; then
+      stable=$((stable + 1))
+      [[ $stable -ge 2 ]] && break
+    else
+      stable=0
+    fi
+    prev_size="$cur_size"
+  fi
+  sleep 0.3
+done
 sync
 
 hdiutil detach "$DEV" >/dev/null 2>&1 || { sleep 2; hdiutil detach "$DEV" -force >/dev/null 2>&1 || true; }
