@@ -417,10 +417,20 @@ fn handle_open(
         if let Some(old) = out.client.take() {
             let _ = old.shutdown(Shutdown::Both); // 顶掉旧连接（同 id 只允许一个 GUI）
         }
-        if writeln!(c, "{}", serde_json::json!({ "cols": cur_cols, "rows": cur_rows })).is_err() {
+        // replay_len 告诉客户端接下来这段字节是重放的历史，不是刚发生的：客户端拿它
+        // 划一条边界，重放范围内扫到的 OSC 9/777 通知（可能是几天前就已经处理过的
+        // 权限确认之类）不会被当成新事件重新弹出来，见 terminal.rs::spawn 里的用法。
+        let replay_len = out.buf.len();
+        if writeln!(
+            c,
+            "{}",
+            serde_json::json!({ "cols": cur_cols, "rows": cur_rows, "replay_len": replay_len })
+        )
+        .is_err()
+        {
             return;
         }
-        if !out.buf.is_empty() && c.write_all(&out.buf).is_err() {
+        if replay_len > 0 && c.write_all(&out.buf).is_err() {
             return;
         }
         out.client = Some(c);

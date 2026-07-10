@@ -551,7 +551,7 @@ impl Terminal {
         // 我们这边会读到 EOF/解析失败。整个交接是百毫秒到 1 秒量级的一次性抖动，
         // 短重试几次基本能把这个窗口盖掉，调用方不必为这种瞬时性错误崩溃整个 GUI
         // （调用方目前对失败仍是 `.expect()`，见 terminal_view.rs 的注释）。
-        let (buffered, size) = {
+        let (buffered, size, replay_len) = {
             let mut last_err = None;
             let mut result = None;
             for attempt in 0..HANDSHAKE_RETRIES {
@@ -596,14 +596,26 @@ impl Terminal {
             let mut parser: Processor = Processor::new();
             let mut osc = OscScan::default();
             let mut buf = [0u8; 4096];
+            let mut bytes_seen: usize = 0;
+            // 重放缓冲里的历史字节可能藏着早就处理完的 OSC 9/777 通知（比如 Claude
+            // 之前问过的权限确认，用户当时已经批准、任务也跑完了）——reattach 时如果
+            // 原样喂给通知扫描，会把它们当成刚发生的事件重新弹出来，把明明已完成的
+            // 会话错误标红（"重开 app 状态变红"那个 bug）。sink 接住落在 replay_len
+            // 范围内关闭的 OSC 序列，只有真正在重放边界之后关闭的才写进 notify_reader；
+            // 每个字节仍然逐一喂给 osc（状态机不断流），只是根据这个字节的绝对位置
+            // 决定它触发的通知该进哪个槽，边界处不会解析错位。
+            let sink: Mutex<Option<String>> = Mutex::new(None);
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF：shell 退出
                     Ok(n) => {
                         // OSC 9/777 通知：alacritty 不解析，自己扫字节提取
-                        for &b in &buf[..n] {
-                            osc.feed(b, &notify_reader);
+                        for (i, &b) in buf[..n].iter().enumerate() {
+                            let target =
+                                if bytes_seen + i < replay_len { &sink } else { &notify_reader };
+                            osc.feed(b, target);
                         }
+                        bytes_seen += n;
                         if let Ok(mut term) = term_reader.lock() {
                             parser.advance(&mut *term, &buf[..n]);
                         }
@@ -622,14 +634,16 @@ impl Terminal {
         })
     }
 
-    /// 一次性握手：连守护 + 声明会话 + 读首行尺寸，不重试（重试策略在 `spawn` 里）。
+    /// 一次性握手：连守护 + 声明会话 + 读首行尺寸 + 重放字节数，不重试（重试策略在
+    /// `spawn` 里）。replay_len 是 reattach 时守护即将吐给我们的历史字节数（新建
+    /// 会话是 0），供 spawn() 的读线程划一条"重放 / 实时"边界，见那边的用法。
     fn handshake(
         rows: usize,
         cols: usize,
         cwd: Option<&str>,
         id: &str,
         launch: Option<&str>,
-    ) -> anyhow::Result<(BufReader<UnixStream>, TermSize)> {
+    ) -> anyhow::Result<(BufReader<UnixStream>, TermSize, usize)> {
         let mut writer = connect_daemon()?;
         writeln!(
             writer,
@@ -644,7 +658,8 @@ impl Terminal {
             rows: v["rows"].as_u64().unwrap_or(rows as u64) as usize,
             cols: v["cols"].as_u64().unwrap_or(cols as u64) as usize,
         };
-        Ok((buffered, size))
+        let replay_len = v["replay_len"].as_u64().unwrap_or(0) as usize;
+        Ok((buffered, size, replay_len))
     }
 
     /// 取走最新通知消息（读并清）：响铃或 OSC 9/777 上报的「需要注意」文本。
