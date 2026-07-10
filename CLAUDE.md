@@ -3,9 +3,12 @@
 Mac 上的 AI coding 驾驶舱：一个专为「同时指挥多个 CLI coding agent 干活」设计的桌面
 工作台。基于 GPUI，内嵌真终端，多项目 × 多标签。
 
-终端外壳与具体 agent 无关（`claude` / `codex` / `gemini` 都能跑）；但会话状态监控、
-用量统计、历史会话浏览三项靠解析 `~/.claude/projects/**/*.jsonl`，**目前仅支持
-Claude Code**。改这三处时注意别把 Claude Code 专属假设泄漏到通用终端层。
+分层（改代码时别弄混）：
+- **通用终端层**：外壳、分屏、快捷启动（Claude Code / Codex / Copilot 都有入口）。
+- **状态感知层**：靠终端标题（OSC 0/2）+ OSC 9/777 通知 + 响铃，是终端协议而非某家私有
+  格式，任何遵守约定的 agent 都能被识别。别在这层写死 Claude Code 假设。
+- **Claude Code 专属**：用量统计、历史会话浏览，读 `~/.claude/projects/**/*.jsonl`
+  （只有 `usage_stats.rs` / `session_history.rs` 该碰这份数据）。
 
 ## 二进制
 - `workspace`（`src/bin/workspace/`）—— GUI 主程序，`cargo run --bin workspace`

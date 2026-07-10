@@ -36,18 +36,24 @@ smelt 把终端——agent 真正干活的地方——变成主战场。
 
 ## 功能
 
-**工作台**（与具体 agent 无关）
-- 多项目 × 多标签内嵌真终端，`claude`、`codex`、`gemini`、`vim`、`htop` 等交互式程序与全屏 TUI 都能跑
+**工作台**
+- 多项目 × 多标签内嵌真终端，`claude`、`codex`、`copilot`、`vim`、`htop` 等交互式程序与全屏 TUI 都能跑
+- 快捷启动：项目「+」菜单直接开 Claude Code / Codex / Copilot，各自可配「全权限」模式
 - 分屏：竖切 / 横切，一个会话里并排看多个 agent
 - 命令面板（`Cmd+K`）、可折叠侧栏
+
+**看住 agent**
+- 会话状态监控：区分「等你批准」「等你输入」「跑着呢」「有结果可看」四档，总览页一眼扫完
 - 「需要关注」角标同时出现在 Dock 图标和菜单栏常驻图标上，切走 smelt 也能瞥见
+- 系统通知：agent 干完活或需要你时主动提醒，app 在前台时自动噤声
 
-**深度集成**（目前仅 Claude Code）
+  状态靠终端标题（OSC 0/2）与 OSC 9/777 通知、响铃感知，不依赖任何一家的私有格式——
+  凡是按这套终端约定输出的 agent 都能被识别（Claude Code 开箱即用）。
 
-下面三项靠解析 Claude Code 写在本地的 transcript（`~/.claude/projects/**/*.jsonl`）实现，
-其它 agent 暂时只能当普通终端用：
+**Claude Code 专属**
 
-- 会话状态监控：标出哪个会话在跑、哪个在等你输入
+这两项要读 Claude Code 写在本地的 transcript（`~/.claude/projects/**/*.jsonl`）：
+
 - 用量统计：按工具 / 模型 / 项目拆分 token 用量，含今日走势与活动热力图
 - 历史会话浏览：翻看完整对话（只读）
 
