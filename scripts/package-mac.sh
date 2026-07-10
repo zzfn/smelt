@@ -30,11 +30,11 @@ if [[ "${1:-}" == "--build" ]]; then
 fi
 
 if [[ ! -f "$BIN" ]]; then
-  echo "✗ 找不到 $BIN，先跑一次：cargo build --release --bin $BIN_NAME（或加 --build）" >&2
+  echo "✗ 找不到 ${BIN}，先跑一次：cargo build --release --bin $BIN_NAME（或加 --build）" >&2
   exit 1
 fi
 if [[ ! -f "$DAEMON_BIN" ]]; then
-  echo "✗ 找不到 $DAEMON_BIN（终端持久化守护），先：cargo build --release --bin smeltd" >&2
+  echo "✗ 找不到 ${DAEMON_BIN}（终端持久化守护），先：cargo build --release --bin smeltd" >&2
   exit 1
 fi
 
@@ -108,14 +108,25 @@ PLIST
 # 去掉本机 quarantine，方便自测双击打开
 xattr -cr "$APP" || true
 
-# ad-hoc 签名（免费，不需要开发者证书）：只为给这个 app 一个稳定的身份锚点
-# （固定 bundle id + 签名),避免每次重新编译后 系统设置→隐私与安全性 里的辅助功能
-# 授权（划词翻译用到）失效——之前直接 `cargo run` 裸二进制没有 bundle/签名，
-# macOS 的 TCC 认不准身份，一重新编译权限就跑丢。注意：ad-hoc 签名不能让 Gatekeeper
-# 免弹「来自身份不明开发者」的警告（那个需要付费 Developer ID 证书 + 公证），
+# 签名：优先用 scripts/setup-codesign-identity.sh 生成的自签名身份——它的
+# designated requirement 锚定在证书哈希上，重新编译/升级二进制内容变了也不影响，
+# macOS TCC（完全磁盘访问权限等）授权能跨版本保留。找不到该身份（没跑过那个脚本
+# 的贡献者机器、或没配置的 CI）就回退到 ad-hoc（免费但每次内容一变身份就变，权限
+# 跟着失效）。CI 可通过 SMELT_CODESIGN_IDENTITY 环境变量指定身份名。
+# 注意：不管哪种签名都过不了 Gatekeeper 公证（那个需要付费 Developer ID + 公证），
 # 这里只解决权限持久化，自用/局域网分发够用。
-echo "▶ ad-hoc 签名（免费，仅用于稳定权限身份，不影响 Gatekeeper 警告）…"
-codesign --force --deep --sign - "$APP"
+IDENTITY="${SMELT_CODESIGN_IDENTITY:-Smelt Local Signing}"
+if ! security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
+  echo "⚠ 未找到签名身份「${IDENTITY}」，回退到 ad-hoc 签名（权限会在重新编译后失效）"
+  echo "  一次性修复：./scripts/setup-codesign-identity.sh"
+  IDENTITY="-"
+fi
+if [[ "$IDENTITY" == "-" ]]; then
+  echo "▶ ad-hoc 签名（免费，仅用于稳定权限身份，不影响 Gatekeeper 警告）…"
+else
+  echo "▶ 签名（身份：${IDENTITY}）…"
+fi
+codesign --force --deep --sign "$IDENTITY" "$APP"
 codesign --verify --deep --strict "$APP" && echo "  ✓ 签名校验通过"
 
 echo "▶ 打 dmg（定制安装窗口）…"
