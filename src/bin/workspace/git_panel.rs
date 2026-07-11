@@ -86,8 +86,10 @@ pub struct GitStatusData {
     ahead: u32,
     /// 落后上游的提交数（上游有、本地没有）。
     behind: u32,
-    /// 改动文件：(porcelain 两位状态码, 路径)。
-    files: Vec<(String, String)>,
+    /// 改动文件：(porcelain 两位状态码, 路径)。file_tree.rs 借它给改动文件标红点，
+    /// 所以是 pub（main.rs 转手把这份列表传过去，file_tree.rs 不需要认识
+    /// GitStatusData 本身，只拿这个字段）。
+    pub files: Vec<(String, String)>,
 }
 
 /// 一次 `git for-each-ref` 探测的分支列表，给 Git 页头部的分支切换下拉用。
@@ -682,6 +684,7 @@ fn render_split_row(
 /// 否则统一视图。顶部文件名右侧有「统一/并排」切换按钮。改动行（+/-）可点选，
 /// 选中后配合底部评论框「发送到终端」，把反馈批量写进当前激活终端的 PTY。
 fn git_diff_pane(
+    root: &str,
     git_diff: &Option<GitDiff>,
     split: bool,
     diff_selected: &HashSet<usize>,
@@ -699,6 +702,26 @@ fn git_diff_pane(
             let name = d.path.rsplit('/').next().unwrap_or(d.path.as_str()).to_string();
             let lines = d.lines.clone();
             let ws = cx.entity();
+            // 完整文件路径：diff 里的 path 是相对仓库根的，拼上 root 才是 view_file
+            // 要的绝对路径。
+            let full_path = Path::new(root).join(&d.path).to_string_lossy().to_string();
+            let ws_open = ws.clone();
+            let open_full_file = div()
+                .id("diff-view-full-file")
+                .px_2()
+                .py(px(1.0))
+                .text_xs()
+                .cursor_pointer()
+                .text_color(muted)
+                .hover(|s| s.text_color(fg))
+                .child("查看完整文件 ↗")
+                .on_click(move |_ev, window, cx| {
+                    let path = full_path.clone();
+                    ws_open.update(cx, |wsx, cx| {
+                        wsx.view = crate::MainView::Files;
+                        wsx.view_file(path, window, cx);
+                    });
+                });
 
             let list = if split {
                 let rows = Rc::new(build_split_rows(&lines));
@@ -764,6 +787,7 @@ fn git_diff_pane(
                         .border_b_1()
                         .border_color(border)
                         .child(div().flex_1().min_w_0().child(name))
+                        .child(open_full_file)
                         .child(toggle),
                 )
                 // 包一层 relative 容器承载 gpui-component 竖向滚动条（覆盖在 diff 上）。
@@ -1079,7 +1103,7 @@ pub fn git_view(
         .min_h_0()
         .flex()
         .child(left)
-        .child(git_diff_pane(git_diff, split, diff_selected, diff_comment_input, diff_scroll, cx))
+        .child(git_diff_pane(&root, git_diff, split, diff_selected, diff_comment_input, diff_scroll, cx))
 }
 
 // ===================== Workspace 方法 =====================
@@ -1270,7 +1294,7 @@ impl Workspace {
                         cx,
                     )),
             );
-        Self::modal_shell(360., content, cx)
+        Self::modal_shell(360., true, content, cx)
     }
 
     /// 「删除 Worktree」确认弹窗：dirty 探测完之前（None）按钮禁用显示"检查中…"；
@@ -1335,7 +1359,7 @@ impl Workspace {
                         }),
                     ),
             );
-        Self::modal_shell(360., content, cx)
+        Self::modal_shell(360., true, content, cx)
     }
 
     /// 给某个 root 建一次性的文件监听（notify crate，macOS 走 FSEvents）：仓库目录树

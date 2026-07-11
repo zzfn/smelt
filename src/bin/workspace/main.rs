@@ -2060,15 +2060,21 @@ impl Workspace {
     /// 弹窗遮罩 + 居中卡片壳：宽度 `width`，颜色取当前主题。`content` 是调用方已经
     /// 拼好的标题/正文/按钮行（`v_flex().child(...)...`），这里只负责外层半透明遮罩
     /// 和卡片本身的边框/圆角/阴影/内边距——是所有确认弹窗共享的视觉容器。
-    fn modal_shell(width: f32, content: Div, cx: &mut Context<Self>) -> Div {
+    ///
+    /// `heavy` 控制遮罩压暗程度：真正不可逆/高后果的操作（退出、删除 worktree、
+    /// 重启守护进程、丢弃未保存改动）用 `true`——全屏压暗，明确打断当前操作；
+    /// 纯输入类的低风险操作（重命名）用 `false`——只留一层很淡的遮罩防止误点
+    /// 背景，不用完全打断视觉，跟操作本身的后果对齐（见交互设计讨论）。
+    fn modal_shell(width: f32, heavy: bool, content: Div, cx: &mut Context<Self>) -> Div {
         let (border, popover) = {
             let t = cx.theme();
             (t.border, t.popover)
         };
+        let backdrop = if heavy { rgba(0x000000aa) } else { rgba(0x00000026) };
         div()
             .absolute()
             .inset_0()
-            .bg(rgba(0x000000aa))
+            .bg(backdrop)
             .flex()
             .items_center()
             .justify_center()
@@ -2194,7 +2200,7 @@ impl Workspace {
                         cx,
                     )),
             );
-        Self::modal_shell(320., content, cx)
+        Self::modal_shell(320., true, content, cx)
     }
 
     /// 侧栏「重命名」弹层：与 render_quit_confirm 同款视觉（居中卡片 + 半透明遮罩），
@@ -2240,7 +2246,7 @@ impl Workspace {
                         cx,
                     )),
             );
-        Self::modal_shell(320., content, cx)
+        Self::modal_shell(320., false, content, cx)
     }
 
     /// 「重启守护进程」二次确认弹窗：明确告知会断开所有当前终端会话。与
@@ -2286,7 +2292,7 @@ impl Workspace {
                         cx,
                     )),
             );
-        Self::modal_shell(320., content, cx)
+        Self::modal_shell(320., true, content, cx)
     }
 
     /// 当前文件有未保存改动、又点了别的文件时弹的确认弹窗：取消 / 不保存直接切换 /
@@ -2362,7 +2368,7 @@ impl Workspace {
                         cx,
                     )),
             );
-        Self::modal_shell(360., content, cx)
+        Self::modal_shell(360., true, content, cx)
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2604,6 +2610,10 @@ impl Render for Workspace {
                 .map(|s| s.read(cx).value().trim().to_string())
                 .unwrap_or_default();
             if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
+                // 改动文件标红点要用 git status；不强制用户先去过 Git 页才有数据，
+                // Files 页自己也确保一份缓存新鲜（ensure_git_status 内部已有 TTL，
+                // 两个页面都在看时不会重复刷两遍）。
+                self.ensure_git_status(root.clone(), cx);
                 if query.is_empty() {
                     // 无查询：正常树形浏览，清空上一次搜索结果。
                     self.search_results = None;
@@ -3703,12 +3713,19 @@ impl Render for Workspace {
                                 }
                             } else {
                                 let open_path = self.open_file.as_ref().map(|of| of.path.as_str());
+                                // 借当前 git status 缓存给改动文件标红点；没有缓存（还没进过
+                                // Git 页 / 非 git 目录）就是 None，file_tree 会当作没有改动处理。
+                                let changed_files = cwd
+                                    .as_ref()
+                                    .and_then(|r| self.git_status.get(r))
+                                    .map(|(_, d)| d.files.as_slice());
                                 file_tree(
                                     cwd,
                                     &self.expanded,
                                     &self.dir_cache,
                                     &self.file_tree_scroll,
                                     open_path,
+                                    changed_files,
                                     cx,
                                 )
                             };

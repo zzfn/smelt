@@ -299,11 +299,14 @@ pub fn file_tree(
     dir_cache: &HashMap<String, (Instant, Rc<Vec<(String, bool)>>)>,
     scroll: &ScrollHandle,
     open_path: Option<&str>,
+    // 当前 git status 的改动文件列表（(porcelain 状态码, 相对 root 的路径)）：不认识
+    // GitStatusData 本身，main.rs 转手把 `&d.files` 传进来即可，只在这一处标红点用。
+    changed_files: Option<&[(String, String)]>,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
-    let (muted, fg, hover, active_bg) = {
+    let (muted, fg, hover, active_bg, warning) = {
         let t = cx.theme();
-        (t.muted_foreground, t.foreground, t.accent, t.border)
+        (t.muted_foreground, t.foreground, t.accent, t.border, t.warning)
     };
     let Some(root) = cwd else {
         return placeholder_view("无项目目录", muted).into_any_element();
@@ -360,6 +363,17 @@ pub fn file_tree(
             let p_menu = p.clone();
             // 当前在右侧内容面板打开的文件：文件树里对应行常驻高亮，不用靠记忆去找。
             let is_open = !is_dir && open_path == Some(path.as_str());
+            // 有未提交改动的文件标个小红点：path 是 "{root}/..." 绝对路径，git status
+            // 记的是相对 root 的路径，去掉前缀比一下就知道。只标文件，不往目录上冒泡
+            // （冒泡要额外一趟遍历，且文件树本来就是按需展开，价值不大）。
+            let is_changed = !is_dir
+                && changed_files.is_some_and(|files| {
+                    Path::new(&path)
+                        .strip_prefix(&root)
+                        .ok()
+                        .and_then(|rel| rel.to_str())
+                        .is_some_and(|rel| files.iter().any(|(_, p)| p == rel))
+                });
             let name_tip: SharedString = name.clone().into();
             div()
                 .id(("file", i))
@@ -399,6 +413,9 @@ pub fn file_tree(
                 .child(arrow)
                 .child(type_icon)
                 .child(div().flex_1().min_w_0().truncate().child(name))
+                .when(is_changed, |el| {
+                    el.child(div().flex_none().size(px(6.)).rounded_full().bg(warning))
+                })
                 .into_any_element()
         })
         .collect();
