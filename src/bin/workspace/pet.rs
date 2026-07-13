@@ -528,9 +528,13 @@ impl Render for PetView {
             self.chrome_stripped = true;
             #[cfg(target_os = "macos")]
             cx.set_global(PetWindowHandle(ns_window_of(window)));
-            // 开窗时默认停在右下角（见 open_pet_window），这里首帧恢复上次拖拽的落点。
+            // 开窗时默认停在右下角（见 open_pet_window），这里首帧恢复上次拖拽的落点；
+            // 但落点可能绑定着已经失效的屏幕拓扑（比如当时拖到过外接显示器、现在拔掉
+            // 了），这种情况不恢复，保留默认右下角位置，避免宠物摆到看不见的地方。
             if let Some((x, y)) = cfg.pos {
-                set_window_origin(window, x, y);
+                if pos_on_any_screen(x, y) {
+                    set_window_origin(window, x, y);
+                }
             }
             // 首帧按当前所在屏幕算一次视觉大小补偿（见 screen_scale_compensation）。
             self.display_scale = screen_scale_compensation(window);
@@ -1033,6 +1037,40 @@ fn screen_scale_compensation(window: &Window) -> f32 {
 #[cfg(not(target_os = "macos"))]
 fn screen_scale_compensation(_window: &Window) -> f32 {
     1.0
+}
+
+/// 检查一个「上次拖拽落点」（AppKit 全局坐标）此刻是否还落在当前任意一块屏幕范围内。
+///
+/// `PetConfig.pos` 存的是全局桌面坐标，跟当时的屏幕拓扑绑定：比如把宠物拖到过外接
+/// 显示器上，拔掉外接显示器后虚拟桌面收缩，这个坐标很可能落在现在根本没有物理屏幕
+/// 覆盖的区域——原生窗口会被摆过去，但用户什么都看不见。所以恢复前先跟当前
+/// `NSScreen.screens` 逐个比对，窗口矩形只要跟其中一块有重叠就当作「看得见」。
+#[cfg(target_os = "macos")]
+fn pos_on_any_screen(x: f32, y: f32) -> bool {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        let screens: *mut Object = msg_send![class!(NSScreen), screens];
+        let count: usize = msg_send![screens, count];
+        for i in 0..count {
+            let screen: *mut Object = msg_send![screens, objectAtIndex: i];
+            let frame: NSRect = msg_send![screen, frame];
+            let left = frame.origin.x as f32;
+            let bottom = frame.origin.y as f32;
+            let right = left + frame.size.width as f32;
+            let top = bottom + frame.size.height as f32;
+            if x < right && x + WIN_W > left && y < top && y + WIN_H > bottom {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pos_on_any_screen(_x: f32, _y: f32) -> bool {
+    true
 }
 
 /// 手动挪窗口到给定的屏幕原点坐标——用来实现「自己接住拖拽」而不是把整个拖动过程
