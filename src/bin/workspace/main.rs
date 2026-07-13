@@ -50,7 +50,9 @@ use gpui_component::*;
 use notify::RecommendedWatcher;
 use terminal_view::TerminalView;
 
-use file_tree::{file_content_pane, file_tree, search_results_view, OpenFile, SearchState};
+use file_tree::{
+    file_content_pane, file_tree, search_results_view, DeleteFileTarget, OpenFile, SearchState,
+};
 use git_panel::{
     git_view, main_repo_root_from_common_dir, repo_label_from_common_dir, run_git, BranchList,
     DeleteWorktreeTarget, GitDiff, GitStatusData, NewWorktreeTarget, RepoInfo,
@@ -702,6 +704,8 @@ struct Workspace {
     /// 当前文件有未保存改动时，用户又点了别的文件——先记下目标路径弹确认弹窗，
     /// 等用户选了"不保存"/"保存并切换"才真正打开，见 render_unsaved_file_confirm。
     pending_file_switch: Option<String>,
+    /// 文件树右键「删除文件」的二次确认目标（None = 没在删）。
+    delete_file_target: Option<DeleteFileTarget>,
     /// 「保存并切换」选择后，等这次 save_open_file 存盘成功再打开的目标路径；
     /// 存盘失败/冲突则放弃切换，留在当前文件上让用户处理。
     pending_switch_after_save: Option<String>,
@@ -950,6 +954,7 @@ impl Workspace {
             open_file: None,
             file_gen: 0,
             pending_file_switch: None,
+            delete_file_target: None,
             pending_switch_after_save: None,
             git_diff: None,
             diff_gen: 0,
@@ -3761,6 +3766,7 @@ impl Render for Workspace {
                                     &self.dir_cache,
                                     &self.file_tree_scroll,
                                     open_path,
+                                    self.file_tree_w,
                                     changed_files,
                                     cx,
                                 )
@@ -3880,6 +3886,8 @@ impl Render for Workspace {
             .children(self.new_worktree_target.is_some().then(|| self.render_new_worktree_dialog(cx)))
             // 删除 Worktree 确认拦截弹层
             .children(self.delete_worktree_target.is_some().then(|| self.render_delete_worktree_confirm(cx)))
+            // 删除文件二次确认拦截弹层
+            .children(self.delete_file_target.is_some().then(|| self.render_delete_file_confirm(cx)))
             // 重启守护进程确认拦截弹层
             .children(self.show_daemon_restart_confirm.then(|| self.render_daemon_restart_confirm(cx)))
             // 文件未保存切换确认拦截弹层

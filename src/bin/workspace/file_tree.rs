@@ -23,6 +23,15 @@ use crate::{placeholder_view, SendSelectionToTerminal, Workspace};
 
 // ===================== 类型 =====================
 
+/// 文件树右键「删除文件」的二次确认目标。
+#[derive(Clone)]
+pub struct DeleteFileTarget {
+    pub path: String,
+    pub is_dir: bool,
+    /// 弹窗里展示的文件/文件夹名（从 path 取 basename）。
+    pub label: String,
+}
+
 /// 打开查看的文件：路径 + 可编辑的代码编辑器状态（gpui-component 的 Editor：
 /// tree-sitter 语法高亮 + 行号 + 搜索，直接可编辑，不再是只读预览）。
 pub struct OpenFile {
@@ -265,6 +274,16 @@ pub fn search_results_view(
 
 // ===================== 目录树 =====================
 
+/// 估算文件名在文件树列里是否会被 `.truncate()` 裁切，用来决定要不要挂 hover tooltip。
+fn name_likely_truncated(name: &str, depth: usize, panel_w: f32) -> bool {
+    // 左内边距 8 + 每层缩进 14 + 箭头 14 + 图标 14 + gap + 右内边距 8
+    let chrome = 56.0 + depth as f32 * 14.0;
+    let text_w = (panel_w - chrome).max(0.0);
+    // text_sm 约 7–8px/字符；略保守，避免短文件名也弹 tooltip。
+    let max_chars = (text_w / 7.5).floor() as usize;
+    name.chars().count() > max_chars
+}
+
 /// 只读缓存的递归收集目录条目（仅进入已展开且已缓存的文件夹）；绝不做任何 fs 调用。
 /// 展开了但尚未缓存的目录会被跳过——render 每帧检查并后台补齐，下一帧自动出现。
 fn walk_dir_cached(
@@ -299,6 +318,7 @@ pub fn file_tree(
     dir_cache: &HashMap<String, (Instant, Rc<Vec<(String, bool)>>)>,
     scroll: &ScrollHandle,
     open_path: Option<&str>,
+    panel_w: f32,
     // 当前 git status 的改动文件列表（(porcelain 状态码, 相对 root 的路径)）：不认识
     // GitStatusData 本身，main.rs 转手把 `&d.files` 传进来即可，只在这一处标红点用。
     changed_files: Option<&[(String, String)]>,
@@ -375,6 +395,7 @@ pub fn file_tree(
                         .is_some_and(|rel| files.iter().any(|(_, p)| p == rel))
                 });
             let name_tip: SharedString = name.clone().into();
+            let show_name_tip = name_likely_truncated(&name, depth, panel_w);
             div()
                 .id(("file", i))
                 .flex()
@@ -396,23 +417,51 @@ pub fn file_tree(
                         }
                     });
                 })
-                // 文件名可能比这一列宽：截断加省略号，hover 用 tooltip 补全名（否则超长
-                // 文件名会视觉溢出到右侧内容面板，既不好看也读不全）。必须在
-                // context_menu 之前挂：context_menu 把元素包成 ContextMenu<E>，
-                // 不再实现 tooltip 所在的 StatefulInteractiveElement。
-                .tooltip(move |window, cx| Tooltip::new(name_tip.clone()).build(window, cx))
                 .context_menu(move |menu, _window, _cx| {
-                    let this = this_menu.clone();
-                    let p = p_menu.clone();
-                    menu.item(
-                        PopupMenuItem::new("发送到终端").on_click(move |_ev, _window, cx| {
-                            this.update(cx, |ws, cx| ws.send_path_to_terminal(p.clone(), cx));
-                        }),
-                    )
+                    let this_term = this_menu.clone();
+                    let p_term = p_menu.clone();
+                    let this_copy = this_menu.clone();
+                    let p_copy = p_menu.clone();
+                    let this_del = this_menu.clone();
+                    let p_del = p_menu.clone();
+                    menu
+                        .item(
+                            PopupMenuItem::new("发送到终端").on_click(move |_ev, _window, cx| {
+                                this_term.update(cx, |ws, cx| ws.send_path_to_terminal(p_term.clone(), cx));
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new("复制文件路径").on_click(move |_ev, _window, cx| {
+                                this_copy.update(cx, |ws, cx| ws.copy_file_path_to_clipboard(p_copy.clone(), cx));
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new("删除文件").on_click(
+                                move |_ev, _window, cx| {
+                                    this_del.update(cx, |ws, cx| {
+                                        ws.start_delete_file(p_del.clone(), is_dir, cx)
+                                    });
+                                },
+                            ),
+                        )
                 })
                 .child(arrow)
                 .child(type_icon)
-                .child(div().flex_1().min_w_0().truncate().child(name))
+                // tooltip 只挂在文件名格子上，且仅当可能被截断时才显示——避免像
+                // Cargo.toml 这种短名也弹 tooltip，跟右键菜单叠在一起。
+                .child(
+                    div()
+                        .id(("file-name", i))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(name)
+                        .when(show_name_tip, |el| {
+                            el.tooltip(move |window, cx| {
+                                Tooltip::new(name_tip.clone()).build(window, cx)
+                            })
+                        }),
+                )
                 .when(is_changed, |el| {
                     el.child(div().flex_none().size(px(6.)).rounded_full().bg(warning))
                 })
@@ -824,6 +873,129 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// 文件树右键「复制文件路径」：把绝对路径写入系统剪贴板。
+    pub fn copy_file_path_to_clipboard(&mut self, path: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(path));
+    }
+
+    /// 文件树右键「删除文件」：先弹二次确认，用户点确定后才真正删盘。
+    pub fn start_delete_file(&mut self, path: String, is_dir: bool, cx: &mut Context<Self>) {
+        let label = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        self.delete_file_target = Some(DeleteFileTarget { path, is_dir, label });
+        cx.notify();
+    }
+
+    /// 确认删除文件/文件夹。
+    pub fn confirm_delete_file(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.delete_file_target.take() else { return };
+        cx.notify();
+        self.perform_delete_file(target.path, target.is_dir, cx);
+    }
+
+    /// 取消删除。
+    pub fn cancel_delete_file(&mut self, cx: &mut Context<Self>) {
+        self.delete_file_target = None;
+        cx.notify();
+    }
+
+    /// 「删除文件」二次确认弹窗。
+    pub fn render_delete_file_confirm(&self, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(true);
+        let Some(target) = self.delete_file_target.as_ref() else { return div() };
+        let fg = cx.theme().foreground;
+
+        let (title, body) = if target.is_dir {
+            (
+                "确定删除这个文件夹吗？",
+                format!(
+                    "将永久删除「{}」及其全部内容，此操作不可撤销。",
+                    target.label
+                ),
+            )
+        } else {
+            (
+                "确定删除这个文件吗？",
+                format!("将永久删除「{}」，此操作不可撤销。", target.label),
+            )
+        };
+
+        let content = v_flex()
+            .child(div().font_bold().text_color(fg).text_lg().child(title))
+            .child(div().text_sm().text_color(muted).child(body))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(Self::modal_button(
+                        "cancel-delete-file",
+                        "取消",
+                        neutral_bg,
+                        neutral_hover,
+                        fg,
+                        |this, _, _, cx| this.cancel_delete_file(cx),
+                        cx,
+                    ))
+                    .child(Self::modal_button(
+                        "confirm-delete-file",
+                        "确定删除",
+                        tint,
+                        hover,
+                        accent_text,
+                        |this, _, _, cx| this.confirm_delete_file(cx),
+                        cx,
+                    )),
+            );
+        Self::modal_shell(360., true, content, cx)
+    }
+
+    /// 真正删除磁盘上的文件或目录，并刷新文件树缓存。
+    fn perform_delete_file(&mut self, path: String, is_dir: bool, cx: &mut Context<Self>) {
+        let ok = if is_dir {
+            std::fs::remove_dir_all(&path).is_ok()
+        } else {
+            std::fs::remove_file(&path).is_ok()
+        };
+        if !ok {
+            return;
+        }
+
+        let under = |base: &str, candidate: &str| {
+            candidate == base || candidate.starts_with(&format!("{base}/"))
+        };
+
+        if self
+            .open_file
+            .as_ref()
+            .is_some_and(|of| under(&path, &of.path))
+        {
+            self.open_file = None;
+        }
+        if self
+            .pending_file_switch
+            .as_ref()
+            .is_some_and(|p| under(&path, p))
+        {
+            self.pending_file_switch = None;
+        }
+
+        if is_dir {
+            self.expanded.retain(|p| !under(&path, p));
+            self.dir_cache.retain(|p, _| !under(&path, p));
+        } else {
+            self.expanded.remove(&path);
+        }
+
+        if let Some(parent) = Path::new(&path).parent().and_then(|p| p.to_str()) {
+            self.dir_cache.remove(parent);
+        }
+        cx.notify();
     }
 
     /// 文件树右键「发送到终端」：把路径转成相对当前 cwd 的 @提及，写进当前激活终端
