@@ -661,7 +661,13 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        None
+        // 一直报 None → macOS 侧的 selectedRange 变成 {NSNotFound, 0}，等于告诉系统
+        // 「这里没有文字光标」。切换输入法时那个提示气泡靠 selectedRange 判断当前
+        // 焦点是否有效文字输入位置，一直是 NSNotFound 会导致它不出现（IME 候选窗本身
+        // 走 hasMarkedText/setMarkedText，不受这个影响，所以合成打字不受影响）。这里
+        // 汇报一个折叠的光标位置：合成中就在 marked_text 末尾，否则在 0。
+        let len = self.marked_text.as_ref().map(|s| s.encode_utf16().count()).unwrap_or(0);
+        Some(UTF16Selection { range: len..len, reversed: false })
     }
 
     fn marked_text_range(
