@@ -157,6 +157,26 @@ if [[ -d "/Volumes/$VOL" ]]; then
   hdiutil detach "/Volumes/$VOL" -force >/dev/null 2>&1 || true
 fi
 
+# CI 里没有 Finder/GUI session，下面那套 AppleScript 窗口定制本来就做不了（只会走到
+# 「⚠ Finder 定制失败」那条容错分支），产出的必然是朴素 dmg。既然定制不可能生效，就
+# 没必要为它走「建可写映像 → attach → 定制 → detach → convert」这条挂载链：runner 上
+# hdiutil 的挂载/卸载会偶发撞车——v0.4.5 两次发布分别挂在 `create failed - Resource
+# busy` 和 `convert failed - Resource temporarily unavailable`，失败在不同步骤，是典型
+# 的资源竞争而非固定 bug。CI 直接一步压出只读 dmg：不 attach、无中间可写映像，把竞争
+# 面砍掉。本地打包不受影响，仍走下面的定制流程。
+if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
+  echo "  … CI 环境：跳过 Finder 窗口定制（无 GUI session，本来也不生效），直接压制只读 dmg"
+  rm -f "$DIST/$APP_NAME.dmg"
+  hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDZO \
+    -imagekey zlib-level=9 -ov "$DIST/$APP_NAME.dmg" >/dev/null
+  rm -rf "$STAGE"
+  echo ""
+  echo "✅ 完成（CI 朴素 dmg）"
+  echo "   应用：   $APP"
+  echo "   分发件： $DIST/$APP_NAME.dmg"
+  exit 0
+fi
+
 rm -f "$RW"
 hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RW" >/dev/null
 
