@@ -605,14 +605,25 @@ impl TerminalView {
 /// 输入法（IME）支持：中文等需要合成的输入走这里，最终提交的文字通过
 /// replace_text_in_range 回调进来，写入 PTY。英文/可打印字符同样经此路径。
 impl EntityInputHandler for TerminalView {
+    /// 输入法拿这个接口取「文档里某一段文字」。我们的「文档」只有合成中的预编辑串
+    /// （终端已提交的内容不属于可编辑文档），所以按 UTF-16 下标切片返回；越界就夹回
+    /// 有效范围并通过 adjusted 告诉输入法。**不能不管问的是哪一段都把整串还回去**：
+    /// 长度对不上会让输入法认为文档状态错乱，进而放弃合成、把拼音原文直接上屏。
     fn text_for_range(
         &mut self,
-        _range: Range<usize>,
-        _adjusted: &mut Option<Range<usize>>,
+        range_utf16: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        self.marked_text.clone()
+        let text = self.marked_text.as_ref()?;
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let start = range_utf16.start.min(units.len());
+        let end = range_utf16.end.clamp(start, units.len());
+        if start != range_utf16.start || end != range_utf16.end {
+            *adjusted = Some(start..end);
+        }
+        String::from_utf16(&units[start..end]).ok()
     }
 
     fn selected_text_range(
@@ -744,16 +755,24 @@ impl Render for TerminalView {
         }
 
         let frame = self.terminal.snapshot();
-        // 画反色块用可见光标（应用 CSI ?25l 藏光标时为 None）；IME 候选窗定位、
-        // Option+点击移光标用**位置**（cursor_pos，含隐藏）——TUI 藏了光标输入法
-        // 照样要知道往哪落。
-        let cursor = frame.cursor;
+        // 画反色块用可见光标（应用 CSI ?25l 藏光标时为 None）；IME 候选窗/预编辑
+        // 定位、Option+点击移光标用**位置**（cursor_pos，含隐藏）——TUI 藏了光标
+        // 输入法照样要知道往哪落。
+        //
+        // IME 合成中不画网格里的光标块：预编辑串自带光标（画在拼音末尾，跟 iTerm2 一致）。
+        let cursor = if self.marked_text.is_some() { None } else { frame.cursor };
         self.cursor = frame.cursor_pos;
         let hover_url = self.hover_url;
         let has_hover = hover_url.is_some();
         let base_font = terminal_font();
         // 网格列宽：render_row 用它把每一批文本钉到 col * cell_w 上（见 render_row 头注）。
         let cell_w = self.cell_w;
+
+        // IME 合成中的拼音预编辑串（marked text）：macOS 的分工是候选词浮窗由系统画
+        // （bounds_for_range 只负责告诉它摆哪），**预编辑串由应用自己画**——不画的话
+        // 打拼音就是盲打，只有候选窗没有输入回显。交给 render_row 画在光标所在行的行内，
+        // 光标已上滚离开可视区（cursor_pos 为 None）时自然不画。
+        let ime = self.marked_text.clone().zip(frame.cursor_pos);
         let fh = self.focus_handle.clone();
         let entity = cx.entity();
         let origin_cell = self.grid_origin.clone();
@@ -808,6 +827,12 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
                 let ks = &ev.keystroke;
                 let m = &ks.modifiers;
+                // IME 合成中：这些键归输入法（backspace 删拼音、enter/space/数字选词），
+                // 不能再往 PTY 发一份，否则终端会当成真实按键吃掉。上屏的文字走
+                // replace_text_in_range 进来。
+                if this.marked_text.is_some() && !m.platform {
+                    return;
+                }
                 // Cmd+C 复制选区（alacritty 按缓冲区绝对行取文本，跨屏选区也完整）
                 if m.platform && ks.key == "c" {
                     if let Some(text) = this.terminal.selection_text() {
@@ -1025,7 +1050,11 @@ impl Render for TerminalView {
                             Some((hr, a, b)) if hr == r => Some((a, b)),
                             _ => None,
                         };
-                        render_row(row, cc, &base_font, hl, cell_w)
+                        let ime_here = match &ime {
+                            Some((text, (ir, ic))) if *ir == r => Some((text.clone(), *ic)),
+                            _ => None,
+                        };
+                        render_row(row, cc, &base_font, hl, cell_w, ime_here)
                     })),
             )
             // 透明覆盖层：paint 阶段注册 IME 输入处理器，并记录网格原点。
@@ -1071,12 +1100,17 @@ impl Render for TerminalView {
 /// 每批绝对定位在自己的起始列上。宽字符的第二格是 '\0' 占位，跳过它但列号照常前进，
 /// 于是宽字符后面的内容列号对不上、自动断成新的一批——每个全角字各自成批、各自钉在
 /// 自己的列上。字形窄于两格只是自己画窄一点，绝不会把后面的字符往左推。
+///
+/// `ime`（预编辑串, 起始列）不为空时，在行内叠一层：**必须画在行 div 里而不是另起一个
+/// 绝对定位的层**——行的 y 由 flex 逐行堆叠决定，带像素对齐舍入，跟 `PAD + row × line_px`
+/// 算出来的 y 差几个像素，几十行开外肉眼可见（预编辑串比同一行已上屏的中文高一截）。
 fn render_row(
     row: Vec<terminal::Cell>,
     cursor_col: Option<usize>,
     base_font: &Font,
     hover_link: Option<(usize, usize)>,
     cell_w: f32,
+    ime: Option<(String, usize)>,
 ) -> Div {
     let is_link = |i: usize| hover_link.map_or(false, |(a, b)| i >= a && i <= b);
     // 悬停链接：高亮色 + 下划线；再叠加光标反色 / 选区背景。
@@ -1161,6 +1195,32 @@ fn render_row(
                 .absolute()
                 .left(x_of(col))
                 .child(StyledText::new(text).with_runs(vec![run]))
+        }))
+        // IME 预编辑串（见函数头注）：垫终端底色遮住底下的内容、下划线标示「合成中」，
+        // 光标跟在拼音末尾（合成中网格里的光标块不画，见 render 里 cursor 的取值）。
+        .children(ime.map(|(text, col)| {
+            let run = TextRun {
+                len: text.len(),
+                font: base_font.clone(),
+                color: Hsla::from(rgb(terminal::default_fg())),
+                background_color: None,
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(Hsla::from(rgb(terminal::default_fg()))),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            };
+            div()
+                .absolute()
+                .left(x_of(col))
+                .h_full()
+                .flex()
+                .flex_row()
+                .items_start()
+                .bg(rgb(terminal::default_bg()))
+                .child(StyledText::new(text).with_runs(vec![run]))
+                .child(div().w(px(cell_w)).h_full().bg(rgb(terminal::default_fg())))
         }))
 }
 
