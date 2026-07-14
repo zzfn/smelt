@@ -724,6 +724,10 @@ struct Workspace {
     dir_cache: HashMap<String, (Instant, Rc<Vec<(String, bool)>>)>,
     /// 正在后台读取的目录（防重复并发 spawn）。
     dir_inflight: HashSet<String>,
+    /// 文件树键盘选中的条目绝对路径（↑↓ 导航用）。
+    file_tree_selected: Option<String>,
+    /// 打开文件后要 reveal 的路径：祖先目录缓存齐了再 scroll_to_item。
+    file_tree_pending_reveal: Option<String>,
     /// 当前在文件树里打开查看的文件（含预高亮的行数据）。
     open_file: Option<OpenFile>,
     /// 打开文件的自增序号：后台高亮完成时用它判断结果是否已过期（切了别的文件）。
@@ -992,6 +996,8 @@ impl Workspace {
             expanded: HashSet::new(),
             dir_cache: HashMap::new(),
             dir_inflight: HashSet::new(),
+            file_tree_selected: None,
+            file_tree_pending_reveal: None,
             open_file: None,
             file_gen: 0,
             pending_file_switch: None,
@@ -2421,7 +2427,7 @@ impl Workspace {
                         fg,
                         |this, _, window, cx| {
                             if let Some(target) = this.pending_file_switch.take() {
-                                this.open_file_now(target, window, cx);
+                                this.open_file_now(target, None, window, cx);
                             }
                         },
                         cx,
@@ -2686,9 +2692,8 @@ impl Render for Workspace {
                 .map(|s| s.read(cx).value().trim().to_string())
                 .unwrap_or_default();
             if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
-                // 改动文件标红点要用 git status；不强制用户先去过 Git 页才有数据，
-                // Files 页自己也确保一份缓存新鲜（ensure_git_status 内部已有 TTL，
-                // 两个页面都在看时不会重复刷两遍）。
+                // 改动文件 M/A/D 标要用 git status；不强制用户先去过 Git 页才有数据，
+                // Files 页自己也确保一份缓存新鲜（ensure_git_status 内部已有 TTL）。
                 self.ensure_git_status(root.clone(), cx);
                 if query.is_empty() {
                     // 无查询：正常树形浏览，清空上一次搜索结果。
@@ -3483,6 +3488,41 @@ impl Render for Workspace {
             // Cmd+1~9 跳到第 N 个会话（键位分工对齐 iTerm2）
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
+                // 文件树键盘导航：搜索框 / 编辑器聚焦时不抢键。
+                if this.view == MainView::Files && !ks.modifiers.platform && !ks.modifiers.control {
+                    use gpui::Focusable;
+                    let search_focused = this.file_filter.as_ref().is_some_and(|s| {
+                        s.read(cx).focus_handle(cx).is_focused(window)
+                    });
+                    let editor_focused = this.open_file.as_ref().is_some_and(|of| {
+                        of.editor.read(cx).focus_handle(cx).is_focused(window)
+                    });
+                    if !search_focused && !editor_focused {
+                        match ks.key.as_str() {
+                            "up" => {
+                                this.file_tree_move_selection(-1, cx);
+                                return;
+                            }
+                            "down" => {
+                                this.file_tree_move_selection(1, cx);
+                                return;
+                            }
+                            "left" => {
+                                this.file_tree_key_left(cx);
+                                return;
+                            }
+                            "right" => {
+                                this.file_tree_key_right(window, cx);
+                                return;
+                            }
+                            "enter" => {
+                                this.file_tree_key_enter(window, cx);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if !ks.modifiers.platform {
                     return;
                 }
@@ -3729,6 +3769,10 @@ impl Render for Workspace {
                                 .file_filter
                                 .as_ref()
                                 .is_some_and(|s| !s.read(cx).value().trim().is_empty());
+                            // 打开文件后的 reveal：祖先目录缓存齐了就滚到树里对应行。
+                            if !has_query {
+                                self.try_flush_file_tree_reveal(cx);
+                            }
                             let body = if has_query {
                                 match &self.search_results {
                                     Some(state) => {
@@ -3739,8 +3783,8 @@ impl Render for Workspace {
                                 }
                             } else {
                                 let open_path = self.open_file.as_ref().map(|of| of.path.as_str());
-                                // 借当前 git status 缓存给改动文件标红点；没有缓存（还没进过
-                                // Git 页 / 非 git 目录）就是 None，file_tree 会当作没有改动处理。
+                                let selected = self.file_tree_selected.as_deref();
+                                // 借当前 git status 缓存给改动文件标 M/A/D；没有缓存就是 None。
                                 let changed_files = cwd
                                     .as_ref()
                                     .and_then(|r| self.git_status.get(r))
@@ -3751,6 +3795,7 @@ impl Render for Workspace {
                                     &self.dir_cache,
                                     &self.file_tree_scroll,
                                     open_path,
+                                    selected,
                                     self.file_tree_w,
                                     changed_files,
                                     cx,

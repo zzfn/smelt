@@ -86,9 +86,8 @@ pub struct GitStatusData {
     ahead: u32,
     /// 落后上游的提交数（上游有、本地没有）。
     behind: u32,
-    /// 改动文件：(porcelain 两位状态码, 路径)。file_tree.rs 借它给改动文件标红点，
-    /// 所以是 pub（main.rs 转手把这份列表传过去，file_tree.rs 不需要认识
-    /// GitStatusData 本身，只拿这个字段）。
+    /// 改动文件：(porcelain 两位状态码, 路径)。file_tree.rs 借它给改动文件标 M/A/D，
+    /// 所以是 pub（main.rs 转手把这份列表传过去）。
     pub files: Vec<(String, String)>,
 }
 

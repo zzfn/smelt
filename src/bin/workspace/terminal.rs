@@ -11,13 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{
-    viewport_to_point, Config, Term, TermDamage, TermMode, SEMANTIC_ESCAPE_CHARS,
+    point_to_viewport, viewport_to_point, Config, Term, TermDamage, TermMode, SEMANTIC_ESCAPE_CHARS,
 };
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 
@@ -66,13 +67,40 @@ fn palette() -> &'static [u32; 16] {
     if is_dark() { &PALETTE_DARK } else { &PALETTE_LIGHT }
 }
 
-/// 一个渲染用的终端单元：字符 + 前景/背景 rgb + 粗体/下划线 + 是否在选区内。
+/// 一个渲染用的终端单元：字符 + 前景/背景 rgb + 字形修饰 + 是否在选区内。
 pub struct Cell {
     pub ch: char,
     pub fg: u32,
     pub bg: u32,
     pub bold: bool,
+    /// SGR 3。bat / delta 的注释、agent 输出的强调文本都在用。
+    pub italic: bool,
+    /// SGR 2（faint）。CLI 里做视觉层级的主力——git 的次要信息、`ls` 的元数据、
+    /// agent 的灰色提示行。渲染侧把前景色的 alpha 乘 0.7（跟 Zed / alacritty 一致）。
+    pub dim: bool,
+    /// 任意一种下划线（SGR 4 及其变体，alacritty 的 `ALL_UNDERLINES` 聚合位）。
     pub underline: bool,
+    /// 下划线是波浪线（SGR 4:3）。编译器诊断、`rg --hyperlink`、TUI 的错误标注在用。
+    pub undercurl: bool,
+    /// SGR 9 删除线。
+    pub strikeout: bool,
+    /// 挂在这一格上的**零宽字符**（alacritty 的 `cell.zerowidth()`）：变体选择器
+    /// （`⚠` + U+FE0F 才是彩色 emoji ⚠️）、组合变音符（`e` + U+0301 = é）、ZWJ 等。
+    ///
+    /// 它们必须跟着基字符一起交给排版器，但**不占格子**。丢掉的话：emoji 掉成黑白字形，
+    /// 带声调的文字直接掉音标——而 alacritty 复制时是带上它们的，于是「看到的 ≠ 复制到的」。
+    /// 绝大多数格子没有零宽字符，用 Option 免掉每格一次分配。
+    pub zw: Option<Box<[char]>>,
+    /// OSC 8 超链接（`ESC]8;;uri ST`）的目标 URI。`eza` / `gh` / `npm` / `cargo` 和各家
+    /// agent 都在用它——**可见文本是标题、URL 藏在协议里**，所以光靠正则扫可见文本
+    /// （见 find_urls）是找不到的。这是终端协议层的东西，不绑定任何一家 agent。
+    pub link: Option<Arc<str>>,
+    /// 这一格的底色是不是「终端默认底色」。**必须按颜色枚举判**（`Color::Named(Background)`，
+    /// 跟 Zed 的 `is_default_background_color` 一致），不能拿解析出来的 RGB 去比：应用完全
+    /// 可以显式设一个恰好等于默认底色的 RGB（`\e[48;2;…m`），那时它是「真的画了一块底色」，
+    /// 而我们开着背景图 / 透明度时，默认底色的格子是**留空让背景透出来**的——判错就会在
+    /// 本该是纯色块的地方漏出背景图。
+    pub bg_default: bool,
     pub selected: bool,
 }
 
@@ -85,14 +113,27 @@ pub enum SelectionKind {
     Line,
 }
 
+/// 光标形状（对 terminal_view 屏蔽 alacritty 的 CursorShape）。应用用 DECSCUSR
+/// （`CSI Ps SP q`）切换——zsh 的 vi-mode 用它在插入态显竖线、普通态显方块。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorKind {
+    /// 实心方块（默认）
+    Block,
+    /// 下划线
+    Underline,
+    /// 竖线
+    Bar,
+    /// 空心方块
+    Hollow,
+}
+
 /// 一帧终端快照：网格行 + 光标。
 pub struct Frame {
     pub rows: Vec<Vec<Cell>>,
-    /// **可见**光标 (行, 列)，渲染层画反色块用。None = 已上滚离开可视区，或应用
-    /// 用 `CSI ?25l` 隐藏了光标——全屏 TUI（Cursor CLI / Claude Code 等）常隐藏
-    /// 真实光标、在自己的输入框里画反色假光标，这时真实光标往往停在角落，照画
-    /// 会多出一个孤立色块。
-    pub cursor: Option<(usize, usize)>,
+    /// **可见**光标 (行, 列, 形状)。None = 已上滚离开可视区，或应用用 `CSI ?25l`
+    /// 隐藏了光标——全屏 TUI（Cursor CLI / Claude Code 等）常隐藏真实光标、在自己的
+    /// 输入框里画反色假光标，这时真实光标往往停在角落，照画会多出一个孤立色块。
+    pub cursor: Option<(usize, usize, CursorKind)>,
     /// 光标**位置** (行, 列)，含被隐藏的情况；None 仅表示不在可视区内。
     /// IME 候选窗 / 预编辑串定位用——光标藏没藏，输入法都得知道往哪落。
     pub cursor_pos: Option<(usize, usize)>,
@@ -184,8 +225,18 @@ impl Dimensions for TermSize {
 /// UI 侧轮询 take_notification 取走，用作「agent 需要注意」提示。
 type NotifySlot = Arc<Mutex<Option<String>>>;
 
+/// 网格行列 + 单元格像素尺寸，给 OSC/CSI 查询（TextAreaSizeRequest）和 PTY resize 用。
+#[derive(Clone, Copy)]
+struct TermMetrics {
+    rows: u16,
+    cols: u16,
+    /// 单格宽/高（像素）。0 = 未知（首帧量字宽之前）。
+    cell_w: u16,
+    cell_h: u16,
+}
+
 /// 事件代理：alacritty 的 EventListener。终端响铃 Event::Bell → 写入一条默认通知；
-/// PtyWrite / ColorRequest → 把 alacritty 算好的回应字节写回 PTY（见 write_pty）；
+/// PtyWrite / ColorRequest / Clipboard* / TextAreaSizeRequest → 写回 PTY 或系统剪贴板；
 /// 其余事件仍忽略（重绘走 UI 定时快照）。
 #[derive(Clone)]
 struct EventProxy {
@@ -195,6 +246,8 @@ struct EventProxy {
     /// 守护连接写端，跟 [`Terminal`] 自己发键盘输入共用同一把锁——两边都是往同一个
     /// socket 写帧，混着写会把帧头/帧长/payload 交叉打乱，必须靠这把锁串行。
     writer: Arc<Mutex<UnixStream>>,
+    /// 当前网格/单元格尺寸（TextAreaSizeRequest 应答用）。
+    metrics: Arc<Mutex<TermMetrics>>,
 }
 
 impl EventProxy {
@@ -246,9 +299,63 @@ impl EventListener for EventProxy {
             Event::ColorRequest(index, format) => {
                 self.write_pty(format(Self::resolve_color(index)).as_bytes())
             }
+            // OSC 52：应用把文本写到系统剪贴板 / 从剪贴板读回。远程会话、嵌套
+            // tmux、部分 CLI 复制都靠它。读写走系统工具（见 os_clipboard_*），不必
+            // 绕到 UI 线程——EventProxy 跑在 PTY 读线程上。
+            Event::ClipboardStore(_ty, data) => os_clipboard_write(&data),
+            Event::ClipboardLoad(_ty, format) => {
+                let text = os_clipboard_read();
+                self.write_pty(format(&text).as_bytes());
+            }
+            Event::TextAreaSizeRequest(format) => {
+                let m = self.metrics.lock().ok().map(|g| *g).unwrap_or(TermMetrics {
+                    rows: 24,
+                    cols: 80,
+                    cell_w: 0,
+                    cell_h: 0,
+                });
+                let ws = WindowSize {
+                    num_lines: m.rows,
+                    num_cols: m.cols,
+                    cell_width: m.cell_w,
+                    cell_height: m.cell_h,
+                };
+                self.write_pty(format(ws).as_bytes());
+            }
             _ => {}
         }
     }
+}
+
+/// OSC 52 写系统剪贴板。macOS 用 `pbcopy`（任意线程可调）；其它平台静默忽略。
+fn os_clipboard_write(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = text;
+    }
+}
+
+/// OSC 52 读系统剪贴板。macOS 用 `pbpaste`；失败 / 其它平台返回空串（format 仍会写出
+/// 空应答，对端不至于卡死等回包）。
+fn os_clipboard_read() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("pbpaste").output() {
+            return String::from_utf8_lossy(&out.stdout).into_owned();
+        }
+    }
+    String::new()
 }
 
 /// OSC 9 / 777 通知扫描：alacritty 不解析这两个序列，我们在 reader 线程自己扫字节流
@@ -530,6 +637,120 @@ fn write_frame(w: &mut UnixStream, ty: u8, payload: &[u8]) {
     let _ = w.write_all(&frame);
 }
 
+/// 编码一帧鼠标事件。`button`：0=左键、3=X10 松开、32=左键拖动等（xterm 约定）。
+/// `pressed` 只对 SGR 有意义（`M` vs `m`）；X10 松开时调用方应传 button=3。
+fn encode_mouse(mode: TermMode, button: u8, pressed: bool, row: usize, col: usize) -> Vec<u8> {
+    let cx = col.saturating_add(1);
+    let cy = row.saturating_add(1);
+    if mode.contains(TermMode::SGR_MOUSE) {
+        format!("\x1b[<{button};{cx};{cy}{}", if pressed { 'M' } else { 'm' }).into_bytes()
+    } else {
+        // X10：各值偏移 32，坐标裁到 223。
+        let cb = button.min(223);
+        let bx = 32u8.saturating_add(cx.min(223) as u8);
+        let by = 32u8.saturating_add(cy.min(223) as u8);
+        vec![0x1b, b'[', b'M', 32 + cb, bx, by]
+    }
+}
+
+/// 把用户输入当成字面量塞进 RegexSearch：转义正则元字符，避免 `foo.bar` 误匹配。
+pub(crate) fn escape_regex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 收集 buffer 内全部命中（上限 `SEARCH_MATCH_CAP`）。
+fn collect_search_matches<T>(term: &Term<T>, query: &str) -> Vec<(Point, Point)> {
+    let pattern = escape_regex_literal(query);
+    let Ok(mut regex) = RegexSearch::new(&pattern) else {
+        return Vec::new();
+    };
+    let start = Point::new(term.topmost_line(), Column(0));
+    let end = Point::new(term.bottommost_line(), term.last_column());
+    RegexIter::new(start, end, Direction::Right, term, &mut regex)
+        .take(SEARCH_MATCH_CAP)
+        .map(|m| (*m.start(), *m.end()))
+        .collect()
+}
+
+/// 绝对坐标命中 → 可视区 SearchHit；不在可视区则 None。
+pub(crate) fn match_to_viewport_hit(
+    start: Point,
+    end: Point,
+    display_offset: usize,
+    cols: usize,
+    active: bool,
+) -> Option<SearchHit> {
+    let vp = point_to_viewport(display_offset, start)?;
+    let col_start = vp.column.0;
+    let col_end = if end.line == start.line {
+        end.column.0
+    } else {
+        cols.saturating_sub(1)
+    };
+    Some(SearchHit {
+        row: vp.line,
+        col_start,
+        col_end,
+        active,
+    })
+}
+
+/// 把剪贴板文本编码成写入 PTY 的字节（见 [`Terminal::paste`]）。
+/// 抽成纯函数方便单测，不依赖真 PTY。
+pub(crate) fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        // 剥 ESC：bracketed 内容里若夹着转义序列，会被应用当控制命令执行。
+        let cleaned = text.replace('\x1b', "");
+        let mut out = Vec::with_capacity(cleaned.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(cleaned.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
+
+/// 终端内搜索的一条命中（可视区坐标，0 基；跨行时只标首行起止列）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub row: usize,
+    pub col_start: usize,
+    pub col_end: usize, // 含
+    /// 是否为「当前」命中（下/上一个跳到的那条，画得更醒目）。
+    pub active: bool,
+}
+
+/// 一次搜索操作的汇总：给搜索条显示「3/12」。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchStatus {
+    /// 当前命中序号（1 基）；0 表示没有命中。
+    pub current: usize,
+    pub total: usize,
+}
+
+/// 滚动条用：`display_offset` 越大越往历史上看；0 = 贴底。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScrollInfo {
+    pub offset: usize,
+    /// 最大可滚 offset（= history_size）。0 表示没有 scrollback，不必画条。
+    pub max_offset: usize,
+    pub viewport_rows: usize,
+}
+
+/// 单次搜索最多收集的命中数，避免超大缓冲卡顿。
+const SEARCH_MATCH_CAP: usize = 2000;
+
 /// 一个内嵌终端：alacritty 的 Term（后台线程写、UI 线程读）+ 守护连接写端。
 pub struct Terminal {
     term: Arc<Mutex<Term<EventProxy>>>,
@@ -537,10 +758,21 @@ pub struct Terminal {
     /// 发出，必须串行，不能各拿一个裸 fd 各写各的。
     writer: Arc<Mutex<UnixStream>>,
     size: TermSize,
+    /// 与 EventProxy 共享的行列/单元格像素（resize 与 TextAreaSizeRequest 共用）。
+    metrics: Arc<Mutex<TermMetrics>>,
     /// 通知消息槽（响铃 / OSC 9 写入，UI 轮询 take_notification 取走）。
     notify: NotifySlot,
     /// 终端标题（agent 实时状态；UI 读 current_title 用于通知 / 总览）。
     title: Arc<Mutex<Option<String>>>,
+    /// `take_damage` 用来识别「光标真的动了」——alacritty 每帧都会把当前光标格标脏，
+    /// 静止时要滤掉；但光标移动后若只标了新位置那一格，也得算变化（见 take_damage）。
+    last_damage_cursor: Mutex<Option<(i32, usize)>>,
+    /// 当前搜索查询串；变了就重建 `search_matches`。
+    search_query: Mutex<String>,
+    /// 全部命中（缓冲绝对坐标 start..=end），按阅读顺序。
+    search_matches: Mutex<Vec<(Point, Point)>>,
+    /// 当前命中在 `search_matches` 里的下标。
+    search_index: Mutex<usize>,
 }
 
 /// 新建/reattach 握手失败时的重试次数与间隔：守护无缝升级 exec 交接的一次性抖动是
@@ -595,10 +827,21 @@ impl Terminal {
         let notify: NotifySlot = Arc::new(Mutex::new(None));
         let title: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let writer = Arc::new(Mutex::new(writer));
+        let metrics = Arc::new(Mutex::new(TermMetrics {
+            rows: size.rows as u16,
+            cols: size.cols as u16,
+            cell_w: 0,
+            cell_h: 0,
+        }));
         let term = Term::new(
             term_config(),
             &size,
-            EventProxy { notify: notify.clone(), title: title.clone(), writer: writer.clone() },
+            EventProxy {
+                notify: notify.clone(),
+                title: title.clone(),
+                writer: writer.clone(),
+                metrics: metrics.clone(),
+            },
         );
         let term = Arc::new(Mutex::new(term));
 
@@ -646,8 +889,13 @@ impl Terminal {
             term,
             writer,
             size,
+            metrics,
             notify,
             title,
+            last_damage_cursor: Mutex::new(None),
+            search_query: Mutex::new(String::new()),
+            search_matches: Mutex::new(Vec::new()),
+            search_index: Mutex::new(0),
         })
     }
 
@@ -703,40 +951,95 @@ impl Terminal {
             // 拿不到锁（锁中毒）：保守起见当作有变化，避免画面从此卡死不再刷新。
             return true;
         };
-        // 光标当前 (行, 列)：alacritty 的 damage_cursor() 每次调用都会无条件把光标
-        // 所在这一格标脏（哪怕光标压根没动），这是它假设"渲染方每帧都要重画光标做
-        // 闪烁动画"的设计——实测验证过：完全空闲的终端 take_damage() 会一直返回
-        // true，就是这个原因（不是猜的，写了隔离测试复现过）。smelt 没有光标闪烁
-        // 动画，不能把这个无条件标记当成"内容变了"，得从判定里精确减掉：只有脏区
-        // 范围比"仅光标那一格"更宽，才算数（光标真的移动了、或该格所在行其它字符
-        // 也变了，都会让范围变宽；纯粹静止不动时范围恰好等于光标那一格）。
+        // alacritty 的 damage_cursor() 每次都会无条件把**当前**光标格标脏（为闪烁动画
+        // 设计）。smelt 没有闪烁，静止时必须滤掉「仅当前光标那一格」——否则空闲也 33fps。
+        //
+        // 但光标真的移动时，脏区可能**只有新位置那一格**（旧格不在 partial 里），若仍按
+        // 「等于当前光标就忽略」会吞掉移动 → 光标不重画。所以再记一帧光标位置：动了就
+        // 算有变化。
         let cursor = term.grid().cursor.point;
-        let (cursor_line, cursor_col) = (cursor.line.0 as usize, cursor.column.0);
+        let cur = (cursor.line.0, cursor.column.0);
+        let cursor_moved = match self.last_damage_cursor.lock() {
+            Ok(mut g) => {
+                let moved = g.map(|prev| prev != cur).unwrap_or(true);
+                *g = Some(cur);
+                moved
+            }
+            Err(_) => true,
+        };
+        let cursor_line = cur.0 as usize;
+        let cursor_col = cur.1;
         let damaged = match term.damage() {
             TermDamage::Full => true,
-            TermDamage::Partial(it) => it.into_iter().any(|l| {
-                l.line != cursor_line || l.left != cursor_col || l.right != cursor_col
-            }),
+            TermDamage::Partial(it) => {
+                let mut any = false;
+                let mut only_idle_cursor = true;
+                for l in it {
+                    any = true;
+                    if l.line != cursor_line || l.left != cursor_col || l.right != cursor_col {
+                        only_idle_cursor = false;
+                        break;
+                    }
+                }
+                if !any {
+                    false
+                } else if only_idle_cursor {
+                    // 脏区恰好是当前光标格：只有光标真的动了才算变化
+                    cursor_moved
+                } else {
+                    true
+                }
+            }
         };
         term.reset_damage();
         damaged
     }
 
-    /// 按新行列 resize：同步 alacritty 网格，并发帧让守护 resize 底层 PTY。无变化则跳过。
-    pub fn resize(&mut self, rows: usize, cols: usize) {
-        if rows == self.size.rows && cols == self.size.cols {
-            return;
-        }
+    /// 按新行列 + 单元格像素 resize：同步 alacritty 网格，并发帧让守护 ioctl
+    /// TIOCSWINSZ（含 ws_xpixel/ws_ypixel）。`cell_w_px` / `cell_h_px` 为 0 时只更新
+    /// 行列（兼容老路径）。无变化则跳过。
+    pub fn resize(&mut self, rows: usize, cols: usize, cell_w_px: u16, cell_h_px: u16) {
         if rows == 0 || cols == 0 {
             return;
         }
-        self.size = TermSize { rows, cols };
-        if let Ok(mut term) = self.term.lock() {
-            term.resize(self.size);
+        let same_grid = rows == self.size.rows && cols == self.size.cols;
+        let same_cell = self
+            .metrics
+            .lock()
+            .ok()
+            .is_some_and(|m| m.cell_w == cell_w_px && m.cell_h == cell_h_px);
+        if same_grid && same_cell {
+            return;
         }
-        let mut payload = [0u8; 8];
+        self.size = TermSize { rows, cols };
+        if let Ok(mut m) = self.metrics.lock() {
+            m.rows = rows as u16;
+            m.cols = cols as u16;
+            if cell_w_px > 0 {
+                m.cell_w = cell_w_px;
+            }
+            if cell_h_px > 0 {
+                m.cell_h = cell_h_px;
+            }
+        }
+        if !same_grid {
+            if let Ok(mut term) = self.term.lock() {
+                term.resize(self.size);
+            }
+        }
+        // type 1 帧：cols + rows + cell_w + cell_h（各 u32 BE）。老 smeltd 只认 8 字节，
+        // 新守护认 16 字节并把 cell 像素乘到 ws_xpixel/ws_ypixel。
+        let (cw, ch) = self
+            .metrics
+            .lock()
+            .ok()
+            .map(|m| (m.cell_w, m.cell_h))
+            .unwrap_or((cell_w_px, cell_h_px));
+        let mut payload = [0u8; 16];
         payload[0..4].copy_from_slice(&(cols as u32).to_be_bytes());
         payload[4..8].copy_from_slice(&(rows as u32).to_be_bytes());
+        payload[8..12].copy_from_slice(&(cw as u32).to_be_bytes());
+        payload[12..16].copy_from_slice(&(ch as u32).to_be_bytes());
         if let Ok(mut w) = self.writer.lock() {
             write_frame(&mut w, 1, &payload);
         }
@@ -747,6 +1050,21 @@ impl Terminal {
         if let Ok(mut w) = self.writer.lock() {
             write_frame(&mut w, 0, bytes);
         }
+    }
+
+    /// 粘贴文本到 PTY。对端开了 bracketed paste（`CSI ?2004h`）时包
+    /// `\x1b[200~…\x1b[201~`，并剥掉内容里的 ESC（防注入序列）；否则只把 `\r\n`/`\n`
+    /// 规范成 `\r`——shell 行编辑器认的是 CR，原样喂 LF 会在 zsh/bash 里被当成提交
+    /// 多次。跟 Zed `Terminal::paste` / iTerm 行为一致。
+    pub fn paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = match self.term.lock() {
+            Ok(term) => term.mode().contains(TermMode::BRACKETED_PASTE),
+            Err(_) => false,
+        };
+        self.send_input(&encode_paste(text, bracketed));
     }
 
     /// 是否处于「应用光标键」模式（DECCKM）。像 Claude Code 里那种上下选列表的全屏
@@ -767,6 +1085,50 @@ impl Terminal {
         match self.term.lock() {
             Ok(term) => term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES),
             Err(_) => false,
+        }
+    }
+
+    /// 可视区的纯文本行（总览页迷你预览用）。**不走 snapshot**：那会把整个网格连同颜色、
+    /// 属性、链接一起 clone 一遍，而这里只要字符——总览页每帧对每个终端都调一次，白白
+    /// clone 几千个 Cell 太亏。零宽字符（变体选择器 / 音标）要带上，否则预览里 emoji 掉成
+    /// 黑白、带声调的字掉音标。
+    pub fn text_lines(&self) -> Vec<String> {
+        let Ok(term) = self.term.lock() else {
+            return Vec::new();
+        };
+        let cols = self.size.cols;
+        let mut lines = Vec::with_capacity(self.size.rows);
+        let mut cur = String::new();
+        let mut count = 0usize;
+        for indexed in term.renderable_content().display_iter {
+            let cell = indexed.cell;
+            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                cur.push(cell.c);
+                if let Some(zw) = cell.zerowidth() {
+                    cur.extend(zw);
+                }
+            }
+            count += 1;
+            if count % cols == 0 {
+                lines.push(std::mem::take(&mut cur).trim_end().to_string());
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur.trim_end().to_string());
+        }
+        lines
+    }
+
+    /// 焦点变化上报（DEC 1004，`CSI ?1004h` 打开）：应用开了这个模式时，终端在获得 / 失去
+    /// 焦点时要发 `ESC[I` / `ESC[O`。vim、部分 TUI 靠它决定要不要暂停动画、要不要重绘成
+    /// 「未聚焦」的样子。没开这个模式的应用绝不能收到这两个序列——否则会被当成普通输入。
+    pub fn report_focus(&mut self, focused: bool) {
+        let enabled = match self.term.lock() {
+            Ok(term) => term.mode().contains(TermMode::FOCUS_IN_OUT),
+            Err(_) => false,
+        };
+        if enabled {
+            self.send_input(if focused { b"\x1b[I" } else { b"\x1b[O" });
         }
     }
 
@@ -798,9 +1160,13 @@ impl Terminal {
             let cell = indexed.cell;
             let selected = sel_range.as_ref().is_some_and(|r| r.contains(indexed.point));
             let flags = cell.flags;
+            let inverse = flags.contains(Flags::INVERSE);
             let mut fg = resolve(cell.fg, true);
             let mut bg = resolve(cell.bg, false);
-            if flags.contains(Flags::INVERSE) {
+            // 反色（SGR 7）后真正当底色用的是**前景那个颜色**，默认底色的判定也得跟着换。
+            let bg_color = if inverse { cell.fg } else { cell.bg };
+            let bg_default = matches!(bg_color, Color::Named(NamedColor::Background));
+            if inverse {
                 std::mem::swap(&mut fg, &mut bg);
             }
             // 宽字符占两格，第二格是 WIDE_CHAR_SPACER 占位：一律记成 '\0'。
@@ -814,7 +1180,19 @@ impl Terminal {
                 fg,
                 bg,
                 bold: flags.contains(Flags::BOLD),
-                underline: flags.contains(Flags::UNDERLINE),
+                italic: flags.contains(Flags::ITALIC),
+                dim: flags.contains(Flags::DIM),
+                // 下划线有 5 种（普通/双线/波浪/点/虚线），`ALL_UNDERLINES` 是它们的聚合位；
+                // 只认 UNDERLINE 那一位的话，编译器诊断的波浪线之类会整个不显示。
+                underline: flags.intersects(Flags::ALL_UNDERLINES),
+                undercurl: flags.contains(Flags::UNDERCURL),
+                strikeout: flags.contains(Flags::STRIKEOUT),
+                zw: cell
+                    .zerowidth()
+                    .filter(|z| !z.is_empty())
+                    .map(|z| z.to_vec().into_boxed_slice()),
+                link: cell.hyperlink().map(|h| Arc::from(h.uri())),
+                bg_default,
                 selected,
             });
             count += 1;
@@ -826,19 +1204,32 @@ impl Terminal {
             rows.push(row);
         }
 
-        // 光标位置：仅在未上滚（offset==0）且光标行在可视范围内时有值。
-        let cursor_pos = if display_offset == 0 {
-            let r = cursor_pt.line.0;
+        // 光标位置：alacritty 的 cursor.point 是**活动区**坐标（不含滚动偏移），加上
+        // display_offset 才是屏幕上的行——上滚 N 行看历史时，内容整体下移 N 行，光标也
+        // 跟着往下走（iTerm2 行为）。只有滚到光标离开可视区才没有位置。
+        // 之前是「一上滚就直接 None」：滚一行光标就消失，IME 候选窗也跟着跳回左上角。
+        let cursor_pos = {
+            let r = cursor_pt.line.0 + display_offset as i32;
             if r >= 0 && (r as usize) < rows.len() {
                 Some((r as usize, cursor_pt.column.0))
             } else {
                 None
             }
-        } else {
-            None
         };
-        // 可见光标：应用没用 CSI ?25l 隐藏时才交给渲染层画反色块（见 Frame 字段注释）。
-        let cursor = if content.cursor.shape == CursorShape::Hidden { None } else { cursor_pos };
+        // 可见光标：应用没用 CSI ?25l 隐藏时才交给渲染层画（见 Frame 字段注释）。
+        // 形状随 DECSCUSR 走（zsh vi-mode 会在插入/普通态之间切竖线和方块）。
+        let cursor = match content.cursor.shape {
+            CursorShape::Hidden => None,
+            shape => cursor_pos.map(|(r, c)| {
+                let kind = match shape {
+                    CursorShape::Underline => CursorKind::Underline,
+                    CursorShape::Beam => CursorKind::Bar,
+                    CursorShape::HollowBlock => CursorKind::Hollow,
+                    _ => CursorKind::Block,
+                };
+                (r, c, kind)
+            }),
+        };
 
         Frame { rows, cursor, cursor_pos }
     }
@@ -912,12 +1303,19 @@ impl Terminal {
         }
     }
 
-    /// 鼠标左键按下/松开上报：应用开了鼠标上报（MOUSE_MODE）时才编码转发，
-    /// 否则原样返回 false 交给调用方走本地框选。**Claude Code TUI 里可点击的条目
-    /// （比如 fork agent 那一行）就是靠收到这个鼠标事件来响应点击的**——iTerm2 等
-    /// 真终端本就会转发，我们之前只转发了滚轮，点击全被本地框选吃掉了。
-    /// `pressed` true=按下、false=松开；`(row,col)` 0 基单元格。
-    pub fn mouse_button(&mut self, pressed: bool, row: usize, col: usize) -> bool {
+    /// 应用是否开了任意鼠标上报（click / drag / motion 之一）。UI 用来在
+    /// 「本地框选」和「转发给 TUI」之间分流；按住 Shift 时调用方应强制走本地选区
+    /// （xterm 约定：Shift 旁路应用鼠标）。
+    pub fn mouse_mode(&self) -> bool {
+        match self.term.lock() {
+            Ok(term) => term.mode().intersects(TermMode::MOUSE_MODE),
+            Err(_) => false,
+        }
+    }
+
+    /// 鼠标按下/松开上报。`button`：0=左、1=中、2=右（xterm 约定）。
+    /// 应用开了 `MOUSE_MODE` 时才编码转发，否则返回 false。
+    pub fn mouse_button(&mut self, button: u8, pressed: bool, row: usize, col: usize) -> bool {
         let mode = match self.term.lock() {
             Ok(term) => *term.mode(),
             Err(_) => return false,
@@ -925,19 +1323,229 @@ impl Terminal {
         if !mode.intersects(TermMode::MOUSE_MODE) {
             return false;
         }
-        let cx = col.saturating_add(1);
-        let cy = row.saturating_add(1);
-        let buf = if mode.contains(TermMode::SGR_MOUSE) {
-            format!("\x1b[<0;{cx};{cy}{}", if pressed { 'M' } else { 'm' }).into_bytes()
+        // SGR：button + pressed 决定 M/m；X10：松开固定 button 3。
+        let code = if !pressed && !mode.contains(TermMode::SGR_MOUSE) {
+            3
         } else {
-            // X10 编码：按下按钮码 0，松开固定用 3（不区分具体按了哪个键）。
-            let cb: u8 = if pressed { 0 } else { 3 };
-            let bx = 32u8.saturating_add(cx.min(223) as u8);
-            let by = 32u8.saturating_add(cy.min(223) as u8);
-            vec![0x1b, b'[', b'M', 32 + cb, bx, by]
+            button.min(2)
         };
-        self.send_input(&buf);
+        self.send_input(&encode_mouse(mode, code, pressed, row, col));
         true
+    }
+
+    /// 按住某键拖动上报（button = 32+btn）。仅在 `MOUSE_DRAG` 或 `MOUSE_MOTION` 时转发。
+    pub fn mouse_drag(&mut self, button: u8, row: usize, col: usize) -> bool {
+        let mode = match self.term.lock() {
+            Ok(term) => *term.mode(),
+            Err(_) => return false,
+        };
+        if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+            return false;
+        }
+        // 32 = motion 标志；+0/1/2 = 左/中/右。
+        self.send_input(&encode_mouse(mode, 32 + button.min(2), true, row, col));
+        true
+    }
+
+    /// 无按键悬停 motion（button = 35）。仅 `MOUSE_MOTION` 全开时 TUI 才关心。
+    pub fn mouse_motion(&mut self, row: usize, col: usize) -> bool {
+        let mode = match self.term.lock() {
+            Ok(term) => *term.mode(),
+            Err(_) => return false,
+        };
+        if !mode.contains(TermMode::MOUSE_MOTION) {
+            return false;
+        }
+        self.send_input(&encode_mouse(mode, 35, true, row, col));
+        true
+    }
+
+    /// 重建搜索命中列表（查询变了或内容大变时）。不滚动、不改当前序号（夹到合法范围）。
+    pub fn set_search_query(&mut self, query: &str) -> SearchStatus {
+        let q = query.trim().to_string();
+        if q.is_empty() {
+            self.clear_search();
+            return SearchStatus::default();
+        }
+        let Ok(term) = self.term.lock() else {
+            return SearchStatus::default();
+        };
+        let matches = collect_search_matches(&term, &q);
+        let total = matches.len();
+        if let Ok(mut g) = self.search_query.lock() {
+            *g = q;
+        }
+        if let Ok(mut g) = self.search_matches.lock() {
+            *g = matches;
+        }
+        if let Ok(mut g) = self.search_index.lock() {
+            if total == 0 {
+                *g = 0;
+            } else {
+                *g = (*g).min(total - 1);
+            }
+        }
+        SearchStatus {
+            current: if total == 0 { 0 } else { self.search_index.lock().map(|g| *g + 1).unwrap_or(1) },
+            total,
+        }
+    }
+
+    /// 跳到下一处 / 上一处命中并滚动到可视区。查询串变了会先重建列表。
+    pub fn find_next(&mut self, query: &str, backward: bool) -> SearchStatus {
+        let q = query.trim().to_string();
+        if q.is_empty() {
+            self.clear_search();
+            return SearchStatus::default();
+        }
+        let query_changed = self
+            .search_query
+            .lock()
+            .ok()
+            .is_none_or(|g| *g != q);
+        if query_changed {
+            let _ = self.set_search_query(&q);
+            // 新查询：后退从末条起，前进从首条起
+            if let Ok(mut g) = self.search_index.lock() {
+                let total = self.search_matches.lock().map(|m| m.len()).unwrap_or(0);
+                *g = if total == 0 {
+                    0
+                } else if backward {
+                    total - 1
+                } else {
+                    0
+                };
+            }
+        } else {
+            // 查询没变，但缓冲可能已滚动、新输出里也可能有新命中：旧坐标
+            // 整体过期，步进前先按当前缓冲重建列表（重建会保住当前下标）。
+            let _ = self.set_search_query(&q);
+            let total = self.search_matches.lock().map(|m| m.len()).unwrap_or(0);
+            if total == 0 {
+                return SearchStatus::default();
+            }
+            if let Ok(mut g) = self.search_index.lock() {
+                *g = if backward {
+                    if *g == 0 { total - 1 } else { *g - 1 }
+                } else {
+                    (*g + 1) % total
+                };
+            }
+        }
+        self.scroll_to_active_match();
+        self.search_status()
+    }
+
+    /// 当前搜索序号汇总。
+    pub fn search_status(&self) -> SearchStatus {
+        let total = self.search_matches.lock().map(|m| m.len()).unwrap_or(0);
+        if total == 0 {
+            return SearchStatus::default();
+        }
+        let current = self
+            .search_index
+            .lock()
+            .map(|g| (*g + 1).min(total))
+            .unwrap_or(1);
+        SearchStatus { current, total }
+    }
+
+    /// 当前可视区内所有命中（含 active 标记），供 paint 高亮。
+    ///
+    /// 每次都按当前缓冲重新收集：缓存里的命中是收集那一刻的绝对坐标，终端
+    /// 每滚一行它们就整体过期（全部 Line -1），照旧坐标画高亮会落在无关文本
+    /// 上。本方法只在搜索条打开时被调用，命中数有 SEARCH_MATCH_CAP 兜底。
+    pub fn viewport_search_hits(&self) -> Vec<SearchHit> {
+        let Ok(term) = self.term.lock() else {
+            return Vec::new();
+        };
+        let query = match self.search_query.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return Vec::new(),
+        };
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let fresh = collect_search_matches(&term, &query);
+        let Ok(mut matches) = self.search_matches.lock() else {
+            return Vec::new();
+        };
+        *matches = fresh;
+        let total = matches.len();
+        let active_idx = self
+            .search_index
+            .lock()
+            .map(|mut g| {
+                *g = if total == 0 { 0 } else { (*g).min(total - 1) };
+                *g
+            })
+            .unwrap_or(0);
+        let offset = term.grid().display_offset();
+        let mut out = Vec::new();
+        for (i, (start, end)) in matches.iter().enumerate() {
+            if let Some(hit) = match_to_viewport_hit(*start, *end, offset, self.size.cols, i == active_idx)
+            {
+                out.push(hit);
+            }
+        }
+        out
+    }
+
+    fn scroll_to_active_match(&mut self) {
+        let Ok(mut term) = self.term.lock() else {
+            return;
+        };
+        let Ok(matches) = self.search_matches.lock() else {
+            return;
+        };
+        let idx = self.search_index.lock().map(|g| *g).unwrap_or(0);
+        if let Some((start, _)) = matches.get(idx) {
+            term.scroll_to_point(*start);
+        }
+    }
+
+    /// 清空搜索状态（关搜索条时）。
+    pub fn clear_search(&mut self) {
+        if let Ok(mut g) = self.search_query.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.search_matches.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.search_index.lock() {
+            *g = 0;
+        }
+    }
+
+    /// 滚动条用的 offset / 上限 / 可视行数。
+    pub fn scroll_info(&self) -> ScrollInfo {
+        let Ok(term) = self.term.lock() else {
+            return ScrollInfo {
+                offset: 0,
+                max_offset: 0,
+                viewport_rows: self.size.rows,
+            };
+        };
+        ScrollInfo {
+            offset: term.grid().display_offset(),
+            max_offset: term.history_size(),
+            viewport_rows: self.size.rows,
+        }
+    }
+
+    /// 把 display_offset 设到目标值（夹到 `[0, history_size]`）。
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        let Ok(mut term) = self.term.lock() else {
+            return;
+        };
+        let max = term.history_size();
+        let target = offset.min(max);
+        let cur = term.grid().display_offset();
+        let delta = target as i32 - cur as i32;
+        if delta != 0 {
+            // 正数 = 向上看历史（增大 offset）
+            term.scroll_display(Scroll::Delta(delta));
+        }
     }
 
     /// 可视区 (行, 列) → 缓冲区绝对坐标：行列先夹进可视范围，再按**当前**
@@ -996,6 +1604,9 @@ mod damage_gate_tests {
     /// P0 性能修复的验证：真空闲时 take_damage() 应稳定为 false（跳过重画），
     /// 写入字节后应变 true（真实变化不会被吞掉）。用全新一次性 session id +
     /// 空临时目录，不碰任何真实/持久化会话。
+    ///
+    /// 交互 shell 会间歇吐 PROMPT / OSC 标题，不能当「真空闲」基线。先跑 `cat`
+    /// 堵住前台（不再画 prompt），再测门控；有输入时 cat 回显触发真实 damage。
     #[test]
     fn idle_then_input_toggles_damage() {
         let dir = std::env::temp_dir().join(format!("smelt-damage-test-{}", std::process::id()));
@@ -1004,9 +1615,28 @@ mod damage_gate_tests {
 
         let mut term = Terminal::spawn(24, 80, dir.to_str(), &id, None).expect("spawn 失败");
 
-        // 让 shell 起步、打印 prompt 稳定下来（这部分输出算真实变化，先排掉）。
-        thread::sleep(Duration::from_millis(800));
-        let _ = term.take_damage(); // 清掉启动阶段的输出
+        // 等 shell 起来后进入 cat：前台进程阻塞读，不再周期性画 prompt。
+        thread::sleep(Duration::from_millis(500));
+        term.send_input(b"cat\n");
+        thread::sleep(Duration::from_millis(300));
+
+        // 排掉 cat 启动 + 命令回显带来的 damage，直到连续安静。
+        let mut quiet_streak = 0usize;
+        for _ in 0..80 {
+            thread::sleep(Duration::from_millis(50));
+            if term.take_damage() {
+                quiet_streak = 0;
+            } else {
+                quiet_streak += 1;
+                if quiet_streak >= 10 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            quiet_streak >= 10,
+            "cat 阻塞后未能进入真空闲（quiet_streak={quiet_streak}），无法测 damage 门控"
+        );
 
         // 真空闲：什么都不做，多次采样应稳定为 false。
         let mut idle_true_count = 0;
@@ -1018,8 +1648,8 @@ mod damage_gate_tests {
         }
         assert_eq!(idle_true_count, 0, "真空闲时 take_damage() 不该返回 true（次数={idle_true_count}）");
 
-        // 写入真实字节：应该被判定为变化。
-        term.send_input(b"echo hi\n");
+        // 写入真实字节：cat 回显，应被判定为变化。
+        term.send_input(b"hi\n");
         thread::sleep(Duration::from_millis(300));
         assert!(term.take_damage(), "写入字节后 take_damage() 应返回 true");
 
@@ -1067,8 +1697,9 @@ mod damage_gate_tests {
         thread::sleep(Duration::from_millis(800)); // 等 shell 启动输出沉淀，避免并发 advance 干扰
 
         let frame = term.snapshot();
-        assert!(frame.cursor.is_some(), "shell 正常状态光标应可见");
-        assert_eq!(frame.cursor, frame.cursor_pos, "光标可见时两个字段应一致");
+        let (row, col, kind) = frame.cursor.expect("shell 正常状态光标应可见");
+        assert_eq!(Some((row, col)), frame.cursor_pos, "光标可见时位置应与 cursor_pos 一致");
+        assert_eq!(kind, CursorKind::Block, "没发过 DECSCUSR 时是默认的实心块");
 
         let inject = |bytes: &[u8]| {
             let mut parser: Processor = Processor::new();
@@ -1083,6 +1714,16 @@ mod damage_gate_tests {
 
         inject(b"\x1b[?25h");
         assert!(term.snapshot().cursor.is_some(), "CSI ?25h 后光标应恢复可见");
+
+        // DECSCUSR：zsh vi-mode 靠它在插入态切竖线、普通态切回方块。形状必须带到渲染层，
+        // 不能一律画成块。
+        inject(b"\x1b[5 q"); // 5/6 = 竖线（闪烁/稳定）
+        let (.., kind) = term.snapshot().cursor.expect("竖线光标仍是可见光标");
+        assert_eq!(kind, CursorKind::Bar, "CSI 5 SP q 应切成竖线");
+
+        inject(b"\x1b[3 q"); // 3/4 = 下划线
+        let (.., kind) = term.snapshot().cursor.expect("下划线光标仍是可见光标");
+        assert_eq!(kind, CursorKind::Underline, "CSI 3 SP q 应切成下划线");
 
         kill_remote(&id);
     }
@@ -1149,6 +1790,12 @@ mod event_proxy_answers_tests {
             notify: Arc::new(Mutex::new(None)),
             title: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(sock)),
+            metrics: Arc::new(Mutex::new(TermMetrics {
+                rows: 24,
+                cols: 80,
+                cell_w: 8,
+                cell_h: 16,
+            })),
         };
         (proxy, probe)
     }
@@ -1201,6 +1848,20 @@ mod event_proxy_answers_tests {
         assert!(resp.contains("rgb:1a1a/1b1b/2626"), "应含 DEFAULT_BG 的 rgb 十六进制，实际: {resp:?}");
     }
 
+    /// TextAreaSizeRequest：应用查文本区尺寸时必须按当前 metrics 回应，不能吞掉。
+    #[test]
+    fn text_area_size_request_gets_answered() {
+        let (proxy, mut probe) = make_proxy();
+        // 直接发事件（不经 parser）：验证 EventProxy 分支真的写帧。
+        use alacritty_terminal::event::WindowSize;
+        proxy.send_event(Event::TextAreaSizeRequest(std::sync::Arc::new(|ws: WindowSize| {
+            format!("{}x{}@{}x{}", ws.num_cols, ws.num_lines, ws.cell_width, ws.cell_height)
+        })));
+        let (ty, resp) = read_frame(&mut probe);
+        assert_eq!(ty, 0);
+        assert_eq!(resp, "80x24@8x16", "应回 metrics 里的 80×24 格、8×16 像素");
+    }
+
     /// Shift+Enter 能不能换行，全押在这个位上：TUI 进入时发 `CSI > 1 u` 开 kitty keyboard
     /// protocol，alacritty 要把它解析成 TermMode::DISAMBIGUATE_ESC_CODES，keystroke_to_bytes
     /// 才会改发 CSI u 编码。退出时发 `CSI < u` 弹栈还原——还原不掉的话，TUI 退出后普通
@@ -1230,5 +1891,171 @@ mod event_proxy_answers_tests {
             !term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES),
             "TUI 退出后应还原，否则 shell 里 Shift+Enter 会吐出 `[13;2u` 乱码"
         );
+    }
+}
+
+#[cfg(test)]
+mod paste_encode_tests {
+    use super::encode_paste;
+
+    #[test]
+    fn plain_paste_normalizes_newlines_to_cr() {
+        assert_eq!(encode_paste("a\nb\r\nc", false), b"a\rb\rc");
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_and_strips_esc() {
+        let out = encode_paste("hi\x1b[31m", true);
+        assert_eq!(out, b"\x1b[200~hi[31m\x1b[201~");
+    }
+}
+
+#[cfg(test)]
+mod search_resync_tests {
+    use super::*;
+
+    /// 搭一个不连守护的 Terminal：假 UnixStream 写端 + 直接构造的 Term。
+    /// 专测搜索坐标——不 spawn shell，无时序依赖，不 flaky。
+    fn make_terminal(rows: usize, cols: usize) -> Terminal {
+        let (_probe, sock) = UnixStream::pair().expect("pair 失败");
+        let metrics = Arc::new(Mutex::new(TermMetrics {
+            rows: rows as u16,
+            cols: cols as u16,
+            cell_w: 8,
+            cell_h: 16,
+        }));
+        let proxy = EventProxy {
+            notify: Arc::new(Mutex::new(None)),
+            title: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(sock.try_clone().expect("clone 失败"))),
+            metrics: metrics.clone(),
+        };
+        let term = Term::new(term_config(), &TermSize { rows, cols }, proxy);
+        Terminal {
+            term: Arc::new(Mutex::new(term)),
+            writer: Arc::new(Mutex::new(sock)),
+            size: TermSize { rows, cols },
+            metrics,
+            notify: Arc::new(Mutex::new(None)),
+            title: Arc::new(Mutex::new(None)),
+            last_damage_cursor: Mutex::new(None),
+            search_query: Mutex::new(String::new()),
+            search_matches: Mutex::new(Vec::new()),
+            search_index: Mutex::new(0),
+        }
+    }
+
+    /// 直接往 Term 喂字节（等价于读线程收到 PTY 输出）。
+    fn feed(t: &Terminal, bytes: &[u8]) {
+        let mut parser: Processor = Processor::new();
+        if let Ok(mut term) = t.term.lock() {
+            parser.advance(&mut *term, bytes);
+        }
+    }
+
+    /// 取一条命中在当前视口网格上盖住的实际文本——高亮画在哪，就该是什么字。
+    fn hit_text(t: &Terminal, hit: &SearchHit) -> String {
+        let term = t.term.lock().unwrap();
+        let offset = term.grid().display_offset();
+        (hit.col_start..=hit.col_end)
+            .map(|c| term.grid()[viewport_to_point(offset, Point::new(hit.row, Column(c)))].c)
+            .collect()
+    }
+
+    /// 截图 bug 复现：搜索后日志继续滚，缓存的命中坐标整体过期（每滚一行
+    /// 全部 Line -1），高亮落在无关文本上（搜 schwab 却高亮 HTTP/1）。
+    /// 命中行滚出可视区后就不该再画任何高亮。
+    #[test]
+    fn stale_hits_vanish_after_scroll() {
+        let mut t = make_terminal(4, 20);
+        feed(&t, b"one needle here\r\nfill-a\r\nfill-b\r\nfill-c");
+        let st = t.set_search_query("needle");
+        assert_eq!((st.current, st.total), (1, 1));
+        let hits = t.viewport_search_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hit_text(&t, &hits[0]), "needle", "滚动前高亮就该在命中文本上");
+
+        // 新输出滚 2 行：needle 行进 scrollback，贴底视口里已没有命中
+        feed(&t, b"\r\nnew-1\r\nnew-2");
+        let hits = t.viewport_search_hits();
+        assert!(
+            hits.is_empty(),
+            "命中已滚出可视区，不该再画高亮（旧坐标落在 {:?}）",
+            hits.first().map(|h| hit_text(&t, h))
+        );
+    }
+
+    /// 回看历史时高亮必须跟着内容走：滚动后命中的视口位置变了，重算要对准。
+    #[test]
+    fn hits_track_content_into_scrollback() {
+        let mut t = make_terminal(4, 20);
+        feed(&t, b"one needle here\r\nfill-a\r\nfill-b\r\nfill-c");
+        t.set_search_query("needle");
+        feed(&t, b"\r\nnew-1\r\nnew-2");
+
+        t.set_scroll_offset(2); // 回看到最初 4 行，needle 应在视口第 0 行
+        let hits = t.viewport_search_hits();
+        assert_eq!(hits.len(), 1, "回看后 needle 回到可视区");
+        assert_eq!(hit_text(&t, &hits[0]), "needle", "高亮必须落在命中文本上");
+        assert_eq!(hits[0].row, 0);
+    }
+
+    /// 同一查询按「下一个」：搜索之后新输出里的命中也要被看见。
+    #[test]
+    fn find_next_picks_up_new_matches() {
+        let mut t = make_terminal(4, 20);
+        feed(&t, b"one needle here\r\nfill-a");
+        let st = t.find_next("needle", false);
+        assert_eq!((st.current, st.total), (1, 1));
+
+        feed(&t, b"\r\nsecond needle x");
+        let st = t.find_next("needle", false);
+        assert_eq!(st.total, 2, "新输出里的命中必须被看见");
+        assert_eq!(st.current, 2);
+    }
+}
+
+#[cfg(test)]
+mod mouse_encode_tests {
+    use super::encode_mouse;
+    use alacritty_terminal::term::TermMode;
+
+    #[test]
+    fn sgr_press_release_and_drag() {
+        let sgr = TermMode::SGR_MOUSE | TermMode::MOUSE_MODE;
+        assert_eq!(encode_mouse(sgr, 0, true, 2, 4), b"\x1b[<0;5;3M");
+        assert_eq!(encode_mouse(sgr, 0, false, 2, 4), b"\x1b[<0;5;3m");
+        assert_eq!(encode_mouse(sgr, 32, true, 2, 4), b"\x1b[<32;5;3M");
+    }
+}
+
+#[cfg(test)]
+mod search_literal_tests {
+    use super::{escape_regex_literal, match_to_viewport_hit, SearchHit};
+    use alacritty_terminal::index::{Column, Line, Point};
+
+    #[test]
+    fn escapes_regex_metachars_for_literal_search() {
+        assert_eq!(escape_regex_literal("a.b*c"), r"a\.b\*c");
+        assert_eq!(escape_regex_literal("plain"), "plain");
+    }
+
+    #[test]
+    fn match_maps_into_viewport_with_offset() {
+        // 缓冲 line=-5，offset=5 → 可视第 0 行
+        let start = Point::new(Line(-5), Column(3));
+        let end = Point::new(Line(-5), Column(7));
+        let hit = match_to_viewport_hit(start, end, 5, 80, true).unwrap();
+        assert_eq!(
+            hit,
+            SearchHit {
+                row: 0,
+                col_start: 3,
+                col_end: 7,
+                active: true,
+            }
+        );
+        // offset 不够 → 仍在历史上方，不可见
+        assert!(match_to_viewport_hit(start, end, 2, 80, false).is_none());
     }
 }

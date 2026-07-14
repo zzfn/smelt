@@ -36,7 +36,7 @@ pub struct DeleteFileTarget {
 /// tree-sitter 语法高亮 + 行号 + 搜索，直接可编辑，不再是只读预览）。
 pub struct OpenFile {
     pub path: String,
-    editor: Entity<gpui_component::input::InputState>,
+    pub(crate) editor: Entity<gpui_component::input::InputState>,
     /// 磁盘上（或最近一次保存后）的内容快照，跟编辑器当前内容一比就知道是否有未保存
     /// 改动——不用额外订阅 InputEvent::Change 维护一个脏标记，render 时比一下字符串就行。
     saved_content: Rc<String>,
@@ -205,6 +205,7 @@ pub fn search_results_view(
                 None => (String::new(), hit.rel.clone()),
             };
             let preview = hit.line.clone();
+            let goto_line = preview.as_ref().map(|(no, _)| *no);
             div()
                 .id(("search-hit", i))
                 .flex()
@@ -214,7 +215,9 @@ pub fn search_results_view(
                 .py(px(2.0))
                 .hover(move |s| s.bg(hover))
                 .on_click(move |_ev, window, cx| {
-                    this.update(cx, |ws, cx| ws.view_file(p.clone(), window, cx));
+                    this.update(cx, |ws, cx| {
+                        ws.view_file_at(p.clone(), goto_line, window, cx);
+                    });
                 })
                 // 第一行：目录（弱）+ 文件名（强）。
                 .child(
@@ -312,21 +315,41 @@ fn walk_dir_cached(
 /// uniform_list 的度量逻辑而非容器高度链的问题。文件树条目量级远小于 git diff，
 /// 虚拟滚动只是锦上添花而非必需，故改走普通可滚动列表（与 git-files 同款写法），
 /// 优先保证正确显示；虚拟滚动作为后续可选优化记在 docs/roadmap.md。
+/// porcelain 两位状态码 → 简标 + 颜色（M 改 / A 增 / D 删 / ? 未跟踪）。
+fn git_status_badge(code: &str) -> Option<(char, gpui::Hsla)> {
+    // 取 index + worktree 两位里「更严重」的那个：D > A/? > M > 其它
+    let chars: String = code.chars().take(2).collect();
+    if chars.contains('D') {
+        Some(('D', gpui::rgb(0x00f7_768e).into()))
+    } else if chars.contains('A') {
+        Some(('A', gpui::rgb(0x009e_ce6a).into()))
+    } else if chars.contains('?') {
+        Some(('U', gpui::rgb(0x007d_cfff).into())) // untracked
+    } else if chars.contains('M') || chars.contains('R') || chars.contains('C') {
+        Some(('M', gpui::rgb(0x00e0_af68).into()))
+    } else if chars.chars().any(|c| c != ' ' && c != '?') {
+        Some(('M', gpui::rgb(0x00e0_af68).into()))
+    } else {
+        None
+    }
+}
+
 pub fn file_tree(
     cwd: Option<String>,
     expanded: &HashSet<String>,
     dir_cache: &HashMap<String, (Instant, Rc<Vec<(String, bool)>>)>,
     scroll: &ScrollHandle,
     open_path: Option<&str>,
+    // 键盘选中的条目路径（高亮边框，区别于「当前打开文件」的底色）。
+    selected_path: Option<&str>,
     panel_w: f32,
-    // 当前 git status 的改动文件列表（(porcelain 状态码, 相对 root 的路径)）：不认识
-    // GitStatusData 本身，main.rs 转手把 `&d.files` 传进来即可，只在这一处标红点用。
+    // 当前 git status 的改动文件列表（(porcelain 状态码, 相对 root 的路径)）。
     changed_files: Option<&[(String, String)]>,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
-    let (muted, fg, hover, active_bg, warning) = {
+    let (muted, fg, hover, active_bg, accent) = {
         let t = cx.theme();
-        (t.muted_foreground, t.foreground, t.accent, t.border, t.warning)
+        (t.muted_foreground, t.foreground, t.accent, t.border, t.primary)
     };
     let Some(root) = cwd else {
         return placeholder_view("无项目目录", muted).into_any_element();
@@ -383,17 +406,24 @@ pub fn file_tree(
             let p_menu = p.clone();
             // 当前在右侧内容面板打开的文件：文件树里对应行常驻高亮，不用靠记忆去找。
             let is_open = !is_dir && open_path == Some(path.as_str());
-            // 有未提交改动的文件标个小红点：path 是 "{root}/..." 绝对路径，git status
-            // 记的是相对 root 的路径，去掉前缀比一下就知道。只标文件，不往目录上冒泡
-            // （冒泡要额外一趟遍历，且文件树本来就是按需展开，价值不大）。
-            let is_changed = !is_dir
-                && changed_files.is_some_and(|files| {
+            // git 状态：M/A/D/U 字母色标（只标文件，不往目录冒泡）。
+            let git_badge = if !is_dir {
+                changed_files.and_then(|files| {
                     Path::new(&path)
                         .strip_prefix(&root)
                         .ok()
                         .and_then(|rel| rel.to_str())
-                        .is_some_and(|rel| files.iter().any(|(_, p)| p == rel))
-                });
+                        .and_then(|rel| {
+                            files
+                                .iter()
+                                .find(|(_, p)| p == rel)
+                                .and_then(|(code, _)| git_status_badge(code))
+                        })
+                })
+            } else {
+                None
+            };
+            let is_selected = selected_path == Some(path.as_str());
             let name_tip: SharedString = name.clone().into();
             let show_name_tip = name_likely_truncated(&name, depth, panel_w);
             div()
@@ -407,9 +437,13 @@ pub fn file_tree(
                 .text_sm()
                 .text_color(if is_dir { fg } else { muted })
                 .when(is_open, |el| el.bg(active_bg))
+                .when(is_selected, |el| {
+                    el.border_l_2().border_color(accent).pl(indent - px(2.0))
+                })
                 .hover(move |s| s.bg(hover))
                 .on_click(move |_ev, window, cx| {
                     this.update(cx, |ws, cx| {
+                        ws.file_tree_selected = Some(p.clone());
                         if is_dir {
                             ws.toggle_expand(p.clone(), cx);
                         } else {
@@ -422,6 +456,8 @@ pub fn file_tree(
                     let p_term = p_menu.clone();
                     let this_copy = this_menu.clone();
                     let p_copy = p_menu.clone();
+                    let this_finder = this_menu.clone();
+                    let p_finder = p_menu.clone();
                     let this_del = this_menu.clone();
                     let p_del = p_menu.clone();
                     menu
@@ -433,6 +469,13 @@ pub fn file_tree(
                         .item(
                             PopupMenuItem::new("复制文件路径").on_click(move |_ev, _window, cx| {
                                 this_copy.update(cx, |ws, cx| ws.copy_file_path_to_clipboard(p_copy.clone(), cx));
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new("在 Finder 中显示").on_click(move |_ev, _window, cx| {
+                                this_finder.update(cx, |ws, cx| {
+                                    ws.reveal_path_in_finder(p_finder.clone(), cx);
+                                });
                             }),
                         )
                         .item(
@@ -462,9 +505,14 @@ pub fn file_tree(
                             })
                         }),
                 )
-                .when(is_changed, |el| {
-                    el.child(div().flex_none().size(px(6.)).rounded_full().bg(warning))
-                })
+                .children(git_badge.map(|(ch, color)| {
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_bold()
+                        .text_color(color)
+                        .child(ch.to_string())
+                }))
                 .into_any_element()
         })
         .collect();
@@ -633,28 +681,228 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 在文件树中定位 path：展开所有祖先目录、选中、并排队滚动到该行。
+    pub fn reveal_in_file_tree(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else {
+            return;
+        };
+        let path_buf = Path::new(path);
+        // 自下而上展开祖先（不含文件自身）。
+        let mut ancestors = Vec::new();
+        let mut p = path_buf.parent();
+        while let Some(parent) = p {
+            let ps = parent.to_string_lossy().to_string();
+            if ps.is_empty() || ps == root {
+                // 根目录本身也要有 listing
+                self.ensure_dir_listing(root.clone(), cx);
+                break;
+            }
+            if !ps.starts_with(&root) {
+                break;
+            }
+            ancestors.push(ps);
+            p = parent.parent();
+        }
+        // 先 ensure 近根的，再展开
+        for dir in ancestors.iter().rev() {
+            self.expanded.insert(dir.clone());
+            self.ensure_dir_listing(dir.clone(), cx);
+        }
+        self.ensure_dir_listing(root, cx);
+        self.file_tree_selected = Some(path.to_string());
+        self.file_tree_pending_reveal = Some(path.to_string());
+        cx.notify();
+    }
+
+    /// 祖先目录缓存齐了就把树滚到 pending reveal 那一行。
+    pub fn try_flush_file_tree_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.file_tree_pending_reveal.clone() else {
+            return;
+        };
+        let flat = self.file_tree_flat(cx);
+        if let Some(ix) = flat.iter().position(|(_, _, p)| p == &path) {
+            self.file_tree_scroll.scroll_to_item(ix);
+            self.file_tree_pending_reveal = None;
+            // 不 notify：本帧正在 render，scroll 在 prepaint 生效即可
+        }
+        let _ = cx;
+    }
+
+    /// 当前扁平可见树条目：(is_dir, name, path)。
+    fn file_tree_flat(&self, cx: &App) -> Vec<(bool, String, String)> {
+        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else {
+            return Vec::new();
+        };
+        let mut raw: Vec<(usize, String, bool, String, bool)> = Vec::new();
+        walk_dir_cached(&root, &self.dir_cache, &self.expanded, 0, &mut raw);
+        raw.into_iter()
+            .map(|(_, name, is_dir, path, _)| (is_dir, name, path))
+            .collect()
+    }
+
+    /// ↑↓ 移动键盘选中。
+    pub fn file_tree_move_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let flat = self.file_tree_flat(cx);
+        if flat.is_empty() {
+            return;
+        }
+        let cur = self
+            .file_tree_selected
+            .as_ref()
+            .and_then(|p| flat.iter().position(|(_, _, path)| path == p));
+        let next = match cur {
+            Some(i) => (i as i32 + delta).clamp(0, flat.len() as i32 - 1) as usize,
+            None => {
+                if delta >= 0 {
+                    0
+                } else {
+                    flat.len() - 1
+                }
+            }
+        };
+        self.file_tree_selected = Some(flat[next].2.clone());
+        self.file_tree_scroll.scroll_to_item(next);
+        cx.notify();
+    }
+
+    /// ←：目录已展开则收起；否则选中父目录。
+    pub fn file_tree_key_left(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.file_tree_selected.clone() else {
+            return;
+        };
+        if self.expanded.contains(&path) {
+            self.expanded.remove(&path);
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else {
+            return;
+        };
+        if let Some(parent) = Path::new(&path).parent() {
+            let ps = parent.to_string_lossy().to_string();
+            // 父目录在项目根之下（含根的直接子项的父 = root）
+            if ps == root || (ps.starts_with(&root) && ps.len() > root.len()) {
+                // 根本身不在 flat 列表里时，选中第一项的兄弟无意义；只选非根父路径
+                if ps != root {
+                    self.file_tree_selected = Some(ps);
+                    self.try_flush_file_tree_reveal_path(cx);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// →：目录未展开则展开；已展开则进第一个子项；文件则打开。
+    pub fn file_tree_key_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.file_tree_selected.clone() else {
+            return;
+        };
+        let flat = self.file_tree_flat(cx);
+        let Some((is_dir, _, _)) = flat.iter().find(|(_, _, p)| p == &path) else {
+            return;
+        };
+        if *is_dir {
+            if !self.expanded.contains(&path) {
+                self.expanded.insert(path.clone());
+                self.ensure_dir_listing(path, cx);
+                cx.notify();
+            } else if let Some(ix) = flat.iter().position(|(_, _, p)| p == &path) {
+                if let Some((_, _, child)) = flat.get(ix + 1) {
+                    // 下一行若是更深的子项才进去
+                    self.file_tree_selected = Some(child.clone());
+                    self.file_tree_scroll.scroll_to_item(ix + 1);
+                    cx.notify();
+                }
+            }
+        } else {
+            self.view_file(path, window, cx);
+        }
+    }
+
+    /// Enter：目录切换展开；文件打开。
+    pub fn file_tree_key_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.file_tree_selected.clone() else {
+            return;
+        };
+        let flat = self.file_tree_flat(cx);
+        let Some((is_dir, _, _)) = flat.iter().find(|(_, _, p)| p == &path) else {
+            return;
+        };
+        if *is_dir {
+            self.toggle_expand(path, cx);
+        } else {
+            self.view_file(path, window, cx);
+        }
+    }
+
+    fn try_flush_file_tree_reveal_path(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.file_tree_selected.clone() {
+            let flat = self.file_tree_flat(cx);
+            if let Some(ix) = flat.iter().position(|(_, _, p)| p == &path) {
+                self.file_tree_scroll.scroll_to_item(ix);
+            }
+        }
+    }
+
+    /// 右键：在系统文件管理器中显示。
+    pub fn reveal_path_in_finder(&mut self, path: String, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Linux：尽量打开所在目录
+            if let Some(parent) = Path::new(&path).parent() {
+                let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+            }
+        }
+    }
+
     /// 文件树：打开一个文件查看/编辑内容。当前文件有未保存改动时不直接切换——先弹
     /// 确认弹窗（见 pending_file_switch / render_unsaved_file_confirm），用户选了
     /// "不保存"或"保存并切换"才真正调用 open_file_now。
     pub fn view_file(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.view_file_at(path, None, window, cx);
+    }
+
+    /// 打开文件并可跳到指定行（1 基，搜索命中用）。
+    pub fn view_file_at(
+        &mut self,
+        path: String,
+        line: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let dirty = self
             .open_file
             .as_ref()
             .is_some_and(|of| of.editor.read(cx).value().to_string() != *of.saved_content);
         if dirty {
+            // 脏切换暂不带行号（确认后再 open 整文件即可）
             self.pending_file_switch = Some(path);
             cx.notify();
             return;
         }
-        self.open_file_now(path, window, cx);
+        self.open_file_now(path, line, window, cx);
     }
 
     /// 实际打开文件：用 gpui-component 的 Editor（InputState 的 code_editor 模式）：
     /// tree-sitter 语法高亮 + 行号 + 搜索，直接可编辑，Cmd+S（见 save_open_file）能
     /// 存回磁盘。读文件本身放到后台线程跑（大文件不卡 UI），读完回主线程灌进编辑器；
     /// 用自增 file_gen 丢弃过期结果（期间又切了别的文件）。
-    pub fn open_file_now(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        use gpui_component::input::InputState;
+    /// `goto_line`：1 基行号，读完后定位光标。
+    pub fn open_file_now(
+        &mut self,
+        path: String,
+        goto_line: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::{InputState, Position};
+
+        self.reveal_in_file_tree(&path, cx);
+        self.view = crate::MainView::Files;
 
         self.file_gen = self.file_gen.wrapping_add(1);
         let gen = self.file_gen;
@@ -693,6 +941,11 @@ impl Workspace {
                     Ok(content) => {
                         editor.update(cx, |state, cx| {
                             state.set_value(content.clone(), window, cx);
+                            if let Some(line) = goto_line {
+                                // 搜索命中是 1 基；Position 是 0 基。
+                                let line0 = line.saturating_sub(1) as u32;
+                                state.set_cursor_position(Position::new(line0, 0), window, cx);
+                            }
                         });
                         of.saved_content = Rc::new(content);
                         of.readable = true;
@@ -769,7 +1022,7 @@ impl Workspace {
                         of.save_error = None;
                         of.conflict_pending = false;
                         if let Some(target) = switch_target {
-                            this.open_file_now(target, window, cx);
+                            this.open_file_now(target, None, window, cx);
                         }
                     }
                     SaveOutcome::Conflict => {

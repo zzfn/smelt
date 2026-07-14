@@ -33,47 +33,20 @@
 
 ## 会话持久化增强（smeltd）
 
-### 🔲 根治 Ctrl+C 重连错位：daemon 侧常驻 Term，attach 时吐快照而非回放字节
+### ✅ 根治 Ctrl+C 重连错位：daemon 侧常驻 Term，attach 时吐网格快照
 
-**已发现的 bug**：长时间 detach（Claude Code/Ink 这类反复重绘 spinner 的 TUI 攒了很多输出）
-后 reattach，画面能正常显示（已修过的"不显示"问题），但按 Ctrl+C 触发 Claude Code 退出时
-的大范围重绘（擦旧框、画新提示）会显示错位——边框角字符丢失、文字行接错行。
+**已落地（完整快照）**（`src/bin/smeltd.rs`）：
+1. 每会话常驻 `alacritty_terminal::Term`（history 1 万行），PTY 泵 `parser.advance`（`catch_unwind`）。
+2. attach 时 `snapshot_ansi`：**scrollback（上限 1 万行）+ 可视区**自洽 ANSI；备用屏、SGR、
+   软换行、OSC 8、光标形状/显隐、bracketed paste / app cursor / 鼠标 / focus 等模式恢复。
+3. resize 同步常驻 Term；GUI 协议不变（`replay_len` + 字节流）。
+4. 原始缓冲 256KB 仅供 upgrade 交接 best-effort 重建 + jolt。
 
-**根因**：`smeltd.rs` 的 `out.buf` 是原始字节环形缓冲（`BUF_CAP = 2MB`），超限从头截断，
-截断点不管有没有切在某个转义序列 / 相对光标移动的半截上。GUI 重连时拿这段可能被腰斩的
-字节流去喂一个全新建的 alacritty `Term`（`terminal.rs::Terminal::spawn`），长时间 detached
-后重建出来的光标 / 换行状态可能跟 Ink 自己心里记的账对不上，Ctrl+C 那次大范围重绘就把
-误差暴露出来。
+**仍可增强**：
+- 实机验证：长 detach + Claude Code Ctrl+C。
+- 守护进程崩溃后的落盘恢复（与 reattach 正确性无关）。
 
-**修法：抄 tmux**。tmux server 自己（不管有没有客户端 attach）用 VT100 状态机持续解析
-PTY 输出维护一份 `grid`（服务端常驻终端状态机，不是攒原始字节）；client attach 时不回放
-历史字节，而是从 grid 现状直接"重画"一份全新输出——这份"重画"本身就是普通 ANSI 转义序列
-（定位光标 + SGR + 字符逐行走一遍），复用同一套"生成终端输出"的机制，不是什么专门协议。
-
-落地大致分三块（`alacritty_terminal` 已是整个 crate 共享依赖，smeltd 里直接 `use` 不用
-改 Cargo.toml）：
-1. `smeltd::Session` 加一份常驻 `Term`（`Mutex` 包着），PTY 输出泵线程里除了转发字节，
-   同时跑 `parser.advance()` 喂给它，和 `ctl.master.resize()` 同步 resize。
-2. attach 时不再 `write_all(&out.buf)`，改成把常驻 `Term` 的当前网格序列化成一段 ANSI
-   字节发给新客户端——这段"网格转 ANSI"的序列化函数目前没有现成实现（alacritty_terminal
-   不带这个，得照着 `terminal.rs::snapshot()` 遍历 cell 的思路自己写）。
-3. GUI 侧 `terminal.rs::Terminal::spawn` 基本不用改：wire 上还是纯字节，一样喂给客户端
-   自己的 vte parser。
-
-**需要拍板的取舍**：
-- **scrollback**：回放字节的副作用是把历史顺带灌进了客户端 scrollback；换成"吐当前网格
-  快照"默认只有可见区域，除非也在 daemon 的 `Term` 上留一段有限 history 一起吐（tmux 的
-  `history-limit` 思路）。不做的话等于用"翻旧历史的能力"换"reattach 画面永远对"。
-- **daemon 崩溃半径变大**：现在 smeltd 是哑管道，几乎不会崩；挪进真解析后，理论上某个
-  畸形转义序列触发 alacritty 解析器 panic，炸的就是整个 smeltd 进程（所有项目所有 tab
-  的持久化会话一起没），而不是像现在这样顶多炸一个 GUI 窗口。得用 `catch_unwind` 包住
-  解析调用兜底，但没法完全消除这条新增的失败面。
-- **老 smeltd 不会自动获得修复**：得手动重启守护——正好接上刚做的"守护版本落后提示 +
-  重启确认"功能。
-- 这个环境起不来真实 GUI 窗口，没法自己重连验证画面对不对；改完之后实机验证
-  （尤其长时间 detach + Ctrl+C 这个原始触发场景）得靠人工跑一遍。
-
-现状：smeltd 用**内存 2MB 环形缓冲**存输出，守护重启即失忆。可借鉴 codex 的做法落盘：
+可借鉴 codex 的做法落盘会话：
 - 会话历史写 JSONL（`~/.smelt/sessions/<date>/<uuid>.jsonl`，每行带时间戳的 typed 事件）
 - SQLite 做索引，支持会话列表分页 / 全文搜索（`rusqlite` 依赖已随 instincts 蒸馏链路一起
   移除，真要做这条得重新加回来）

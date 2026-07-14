@@ -1,7 +1,15 @@
 //! smeltd —— 终端持久化守护进程（tmux 的最小替身）。
 //!
 //! 所有 shell / PTY 活在这里而非 GUI 进程里：GUI 退出、崩溃，会话照常运行；
-//! 重开 GUI 按会话 id 重连（attach），守护重放输出缓冲恢复画面。
+//! 重开 GUI 按会话 id 重连（attach）。
+//!
+//! ## 画面恢复（类 tmux，不是「字节磁带重放」）
+//!
+//! 每个会话在守护内常驻一份 `alacritty_terminal::Term`：PTY 输出一边转发给 client，
+//! 一边 `parser.advance` 进这份网格。attach 时**不**依赖可能被环形缓冲腰斩的原始
+//! 字节重放，而是把当前网格序列化成一段自洽的 ANSI「整屏快照」发给客户端——空 Term
+//! 解析后即当前画面，避免长 detach 后 Ctrl+C 大重绘错位（见 docs/roadmap.md）。
+//! 仍保留一小段原始字节缓冲，仅供无缝 upgrade 交接后尽量重建 Term 状态。
 //!
 //! 协议（Unix socket ~/.smelt/smeltd.sock）——连接后客户端先发一行 JSON：
 //!   {"op":"open","id":"..","cwd":"..","cols":120,"rows":30}  → 进入流模式
@@ -13,9 +21,13 @@
 //!                                                              PTY fd 原地交接，**所有会话不中断**（见下）
 //!
 //! 流模式：
-//!   守护 → 客户端：原始 PTY 输出字节（attach 先重放缓冲，再实时转发）
+//!   守护 → 客户端：先发 JSON 尺寸行（含 replay_len=快照字节数）→ ANSI 网格快照
+//!                   → 再实时转发 PTY 输出
 //!   客户端 → 守护：帧 [type:u8][len:u32 BE][payload]
-//!     type 0 = 键盘输入字节；type 1 = resize（payload 8 字节：cols u32 BE + rows u32 BE）
+//!     type 0 = 键盘输入字节；type 1 = resize
+//!       payload 8 字节：cols u32 BE + rows u32 BE（兼容旧客户端，像素 = 0）
+//!       payload 16 字节：cols + rows + cell_w + cell_h（各 u32 BE）→
+//!         ws_xpixel = cols*cell_w，ws_ypixel = rows*cell_h
 //! shell 退出 → 守护关闭该连接（客户端读到 EOF）。
 //!
 //! ## 无缝升级（"upgrade" op，nginx 风格 exec 交接）
@@ -44,14 +56,26 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-/// 每会话输出回放缓冲上限。从中部截断可能留半截转义序列，alacritty 解析器可容错跳过。
-const BUF_CAP: usize = 2 * 1024 * 1024;
+/// 每会话原始字节缓冲上限（**仅**供 upgrade 交接后尽量重建 Term，不再作为 attach 主路径）。
+/// 主路径是常驻 Term 的网格快照。容量小于旧 2MB，降低交接文件体积。
+const BUF_CAP: usize = 256 * 1024;
+
+/// 常驻 Term 的 scrollback 行数（状态机 history-limit）。
+const TERM_HISTORY: usize = 10_000;
+/// attach 快照最多带上的历史行数（含可视区）；避免超大会话一次吐爆客户端。
+const SNAPSHOT_MAX_LINES: usize = 10_000;
 
 /// attach 客户端 socket 的写超时：泵线程/attach 初始重放都会往客户端 write，客户端
 /// 冻结（GUI 被挂起/调试暂停）时不能让这一个 write 无限期占着 Out 锁——handle_upgrade
@@ -101,9 +125,15 @@ struct Ctl {
     rows: u16,
 }
 
-/// 按行列 resize PTY（TIOCSWINSZ 直接打在 master fd 上）。
-fn resize_fd(fd: RawFd, rows: u16, cols: u16) {
-    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+/// 按行列 + 可选像素尺寸 resize PTY（TIOCSWINSZ）。
+/// `xpixel`/`ypixel` 是**整窗**像素（cols×cell_w / rows×cell_h），不是单格。
+fn resize_fd(fd: RawFd, rows: u16, cols: u16, xpixel: u16, ypixel: u16) {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: xpixel,
+        ws_ypixel: ypixel,
+    };
     unsafe {
         libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
     }
@@ -130,16 +160,53 @@ fn dup_file(fd: RawFd) -> anyhow::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(d) })
 }
 
-/// 会话输出端：回放缓冲 + 当前 attach 的客户端。「重放→接管」与实时转发共用这把锁，
-/// 严格串行，重连时不会出现新输出插到重放内容前面的乱序。
+/// 会话输出端：原始字节旁路缓冲 + 当前 attach 的客户端。
+/// 「快照→接管」与实时转发共用这把锁，严格串行。
 struct Out {
+    /// upgrade 交接用；attach 主路径已改走网格快照。
     buf: Vec<u8>,
     client: Option<UnixStream>,
+}
+
+/// 守护侧常驻终端状态机尺寸（实现 alacritty Dimensions）。
+#[derive(Clone, Copy)]
+struct DaemonTermSize {
+    rows: usize,
+    cols: usize,
+}
+
+impl Dimensions for DaemonTermSize {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+fn daemon_term_config() -> TermConfig {
+    TermConfig {
+        scrolling_history: TERM_HISTORY,
+        ..TermConfig::default()
+    }
+}
+
+fn new_daemon_term(rows: u16, cols: u16) -> Term<VoidListener> {
+    let size = DaemonTermSize {
+        rows: rows.max(1) as usize,
+        cols: cols.max(1) as usize,
+    };
+    Term::new(daemon_term_config(), &size, VoidListener)
 }
 
 struct Session {
     ctl: Mutex<Ctl>,
     out: Mutex<Out>,
+    /// 常驻网格：PTY 输出持续 advance；attach 时序列化成 ANSI 快照。
+    term: Mutex<Term<VoidListener>>,
 }
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
@@ -240,17 +307,28 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
             continue;
         };
         let buf = item["buf"].as_str().and_then(hex_decode).unwrap_or_default();
+        let cols = item["cols"].as_u64().unwrap_or(80) as u16;
+        let rows = item["rows"].as_u64().unwrap_or(24) as u16;
+        // 尽量用交接带来的字节重建 Term（可能腰斩，仅 best-effort）；jolt 会让 TUI 再刷。
+        let mut term = new_daemon_term(rows, cols);
+        if !buf.is_empty() {
+            feed_term(&mut term, &buf);
+        }
         let sess = Arc::new(Session {
             ctl: Mutex::new(Ctl {
                 master,
                 pid,
                 // 交接后 GUI 会重连，首个 resize 抖动出 SIGWINCH 让 TUI 全屏重绘，
-                // 顺带盖掉交接窗口内可能没进重放缓冲的零星输出。
+                // 顺带盖掉交接窗口内可能没进缓冲/Term 的零星输出。
                 jolt: true,
-                cols: item["cols"].as_u64().unwrap_or(80) as u16,
-                rows: item["rows"].as_u64().unwrap_or(24) as u16,
+                cols,
+                rows,
             }),
-            out: Mutex::new(Out { buf, client: None }),
+            out: Mutex::new(Out {
+                buf,
+                client: None,
+            }),
+            term: Mutex::new(term),
         });
         sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&sess));
         start_pty_pump(sess, Box::new(reader), id.to_string(), Arc::clone(&sessions));
@@ -258,7 +336,15 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
     Some((listener, sessions))
 }
 
-/// 重放缓冲的交接编码：hex 简单无依赖，2MB 上限的缓冲编成 4MB 文本，一次性开销可接受。
+/// 把字节喂进常驻 Term；panic 时吞掉，避免畸形序列拖死整个守护。
+fn feed_term(term: &mut Term<VoidListener>, bytes: &[u8]) {
+    let mut parser: Processor = Processor::new();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        parser.advance(term, bytes);
+    }));
+}
+
+/// 重放缓冲的交接编码：hex 简单无依赖，BUF_CAP 上限的缓冲编成 2× 文本，一次性开销可接受。
 fn hex_encode(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for byte in b {
@@ -400,8 +486,13 @@ fn handle_open(
         }
     };
 
-    // attach：回报 PTY 当前尺寸 → 重放缓冲 → 接管转发（尺寸行 + 重放在同一锁内先于
-    // 实时转发，客户端先按正确宽度建终端再解析重放字节，行宽才对得上）。
+    // attach：回报 PTY 当前尺寸 → 网格 ANSI 快照 → 接管转发。
+    //
+    // 锁序必须与泵一致（term → out），且 snapshot 与装上 client 之间不能放掉 out：
+    // 若先 snapshot 再另抢 out，间隙里泵可能 advance(D) 后发现还没 client 而丢弃 D，
+    // 新客户端拿到的网格就永久缺字节（正是「吐快照」要避免的 reattach 错位）。
+    // 正确做法：持 term 时抢到 out → 再出快照 → 放 term → 写 socket 期间只持 out
+    // （泵 advance 后堵在 out，client 装上后再把缺口字节转发给新客户端）。
     let (cur_cols, cur_rows) = {
         let ctl = sess.ctl.lock().unwrap();
         (ctl.cols, ctl.rows)
@@ -409,18 +500,23 @@ fn handle_open(
     let attached_fd = {
         let Ok(mut c) = conn.try_clone() else { return };
         let fd = c.as_raw_fd();
-        // 写超时：客户端冻结（GUI 被挂起/调试暂停）时，泵线程/这里的初始重放不能
-        // 无限期占着下面这把 out 锁——handle_upgrade 快照时也要挨个拿它，泵线程
-        // 一旦永久攥着，会把整个 upgrade 拖成全局死锁（见 CLIENT_WRITE_TIMEOUT）。
+        // 写超时：客户端冻结时不能无限期占着 out 锁（见 CLIENT_WRITE_TIMEOUT）。
         let _ = c.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
-        let mut out = sess.out.lock().unwrap();
+
+        let (snapshot, mut out) = {
+            let term = sess.term.lock().unwrap();
+            let out = sess.out.lock().unwrap();
+            let snapshot = snapshot_ansi(&term);
+            drop(term);
+            (snapshot, out)
+        };
+
         if let Some(old) = out.client.take() {
             let _ = old.shutdown(Shutdown::Both); // 顶掉旧连接（同 id 只允许一个 GUI）
         }
-        // replay_len 告诉客户端接下来这段字节是重放的历史，不是刚发生的：客户端拿它
-        // 划一条边界，重放范围内扫到的 OSC 9/777 通知（可能是几天前就已经处理过的
-        // 权限确认之类）不会被当成新事件重新弹出来，见 terminal.rs::spawn 里的用法。
-        let replay_len = out.buf.len();
+        // replay_len = 快照字节数：客户端仍用它划「历史/实时」边界，跳过快照里的
+        // 历史 OSC 9（网格快照本身不含旧通知序列，但边界语义保留兼容）。
+        let replay_len = snapshot.len();
         if writeln!(
             c,
             "{}",
@@ -430,7 +526,7 @@ fn handle_open(
         {
             return;
         }
-        if replay_len > 0 && c.write_all(&out.buf).is_err() {
+        if replay_len > 0 && c.write_all(&snapshot).is_err() {
             return;
         }
         out.client = Some(c);
@@ -456,18 +552,36 @@ fn handle_open(
                 let ctl = sess.ctl.lock().unwrap();
                 let _ = (&ctl.master).write_all(&payload);
             }
-            1 if len == 8 => {
+            1 if len == 8 || len == 16 => {
                 let cols = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as u16;
                 let rows = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as u16;
+                // 可选：单元格像素（新客户端 16 字节帧）；整窗像素 = 行列 × 格像素。
+                let (cell_w, cell_h) = if len == 16 {
+                    let cw = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as u16;
+                    let ch = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as u16;
+                    (cw, ch)
+                } else {
+                    (0, 0)
+                };
+                let xpixel = cols.saturating_mul(cell_w);
+                let ypixel = rows.saturating_mul(cell_h);
                 let mut ctl = sess.ctl.lock().unwrap();
                 let fd = ctl.master.as_raw_fd();
                 if ctl.jolt {
                     ctl.jolt = false;
-                    resize_fd(fd, rows.saturating_add(1), cols);
+                    resize_fd(fd, rows.saturating_add(1), cols, xpixel, ypixel);
                 }
-                resize_fd(fd, rows, cols);
+                resize_fd(fd, rows, cols, xpixel, ypixel);
                 ctl.cols = cols;
                 ctl.rows = rows;
+                drop(ctl);
+                // 常驻 Term 与 PTY 同步行列，否则快照宽高和真实壳不一致。
+                if let Ok(mut term) = sess.term.lock() {
+                    term.resize(DaemonTermSize {
+                        rows: rows.max(1) as usize,
+                        cols: cols.max(1) as usize,
+                    });
+                }
             }
             _ => break,
         }
@@ -584,6 +698,8 @@ fn spawn_session(
         cmd.cwd(dir);
     }
     cmd.env("TERM", "xterm-256color");
+    // 少数 CLI 只认 COLORTERM 才开 24-bit 真彩（Zed 也会设）。
+    cmd.env("COLORTERM", "truecolor");
     // 伪装 iTerm2：让 Claude Code 自动发 OSC 9 通知（GUI 侧捕获），见 terminal.rs 注释。
     cmd.env("TERM_PROGRAM", "iTerm.app");
     cmd.env("TERM_PROGRAM_VERSION", "3.5.0");
@@ -613,13 +729,23 @@ fn spawn_session(
     let master = dup_file(raw)?;
     let pty_reader = master.try_clone()?;
     let sess = Session {
-        ctl: Mutex::new(Ctl { master, pid, jolt: false, cols, rows }),
-        out: Mutex::new(Out { buf: Vec::new(), client: None }),
+        ctl: Mutex::new(Ctl {
+            master,
+            pid,
+            jolt: false,
+            cols,
+            rows,
+        }),
+        out: Mutex::new(Out {
+            buf: Vec::new(),
+            client: None,
+        }),
+        term: Mutex::new(new_daemon_term(rows, cols)),
     };
     Ok((sess, Box::new(pty_reader)))
 }
 
-/// PTY 输出泵线程：读 PTY → 追加回放缓冲（截断到上限）→ 转发当前客户端。
+/// PTY 输出泵：读 PTY → advance 常驻 Term → 旁路缓冲 → 转发当前客户端。
 /// shell 退出（EOF）：移除会话、断开客户端、收割子进程。
 fn start_pty_pump(
     sess: Arc<Session>,
@@ -629,18 +755,26 @@ fn start_pty_pump(
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut parser: Processor = Processor::new();
         loop {
             match pty_reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    let chunk = &buf[..n];
+                    // 先更新网格（锁序 term → out，与 attach 一致）。
+                    if let Ok(mut term) = sess.term.lock() {
+                        let _ = catch_unwind(AssertUnwindSafe(|| {
+                            parser.advance(&mut *term, chunk);
+                        }));
+                    }
                     let mut out = sess.out.lock().unwrap();
-                    out.buf.extend_from_slice(&buf[..n]);
+                    out.buf.extend_from_slice(chunk);
                     if out.buf.len() > BUF_CAP {
                         let cut = out.buf.len() - BUF_CAP;
                         out.buf.drain(..cut);
                     }
                     if let Some(c) = out.client.as_mut() {
-                        if c.write_all(&buf[..n]).is_err() {
+                        if c.write_all(chunk).is_err() {
                             out.client = None; // 客户端已断，会话继续养着
                         }
                     }
@@ -660,4 +794,548 @@ fn start_pty_pump(
             libc::waitpid(pid, std::ptr::null_mut(), 0);
         }
     });
+}
+
+// ===================== 网格 → ANSI 快照（完整：history + 可视区 + 模式）=====================
+
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Cell;
+
+/// 当前 SGR 状态（只发变化，压缩快照体积）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SgrState {
+    fg: Color,
+    bg: Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    /// 0=无，1=单线，2=双线，3=波浪，4=点，5=虚线
+    underline: u8,
+    strike: bool,
+    inverse: bool,
+    /// OSC 8 当前挂着的 URI（None = 未开链接）。
+    link: Option<u64>, // 用指针地址当身份，避免克隆字符串比相等
+}
+
+impl Default for SgrState {
+    fn default() -> Self {
+        Self {
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: 0,
+            strike: false,
+            inverse: false,
+            link: None,
+        }
+    }
+}
+
+/// 把常驻 Term 编成自洽 ANSI 快照：
+/// - **主缓冲**：有限 scrollback（`SNAPSHOT_MAX_LINES`）+ 可视区，客户端可上滚看历史
+/// - **备用屏**：整屏重画（TUI 场景）
+/// - 恢复光标形状/可见性、常用私有模式（bracketed paste / app cursor / 鼠标）
+///
+/// 不依赖可能被环形缓冲腰斩的原始字节流。
+fn snapshot_ansi(term: &Term<VoidListener>) -> Vec<u8> {
+    let grid = term.grid();
+    let cols = term.columns().max(1);
+    let screen_lines = term.screen_lines().max(1);
+    let mode = *term.mode();
+
+    let top = term.topmost_line();
+    let bottom = term.bottommost_line();
+    // 从 bottom 往上最多 SNAPSHOT_MAX_LINES 行
+    let span = (bottom.0 - top.0 + 1).max(0) as usize;
+    let start = if span > SNAPSHOT_MAX_LINES {
+        Line(bottom.0 - SNAPSHOT_MAX_LINES as i32 + 1)
+    } else {
+        top
+    };
+
+    let lines_to_emit = (bottom.0 - start.0 + 1).max(0) as usize;
+    let mut out = Vec::with_capacity(lines_to_emit.saturating_mul(cols).saturating_mul(4));
+
+    // —— 缓冲 / 私有模式前缀 ——
+    if mode.contains(TermMode::ALT_SCREEN) {
+        out.extend_from_slice(b"\x1b[?1049h");
+    }
+    // 清屏 + 清客户端旧 scrollback，再由我们的 history 重新灌入
+    out.extend_from_slice(b"\x1b[H\x1b[2J\x1b[3J\x1b[0m");
+
+    // 自动换行：默认开着，显式对齐
+    if mode.contains(TermMode::LINE_WRAP) {
+        out.extend_from_slice(b"\x1b[?7h");
+    } else {
+        out.extend_from_slice(b"\x1b[?7l");
+    }
+
+    let mut sgr = SgrState::default();
+    let mut line = start;
+    while line <= bottom {
+        let row = &grid[line];
+        let wrap = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+
+        for col in 0..cols {
+            let cell = &row[Column(col)];
+            let flags = cell.flags;
+
+            if flags.contains(Flags::WIDE_CHAR_SPACER)
+                || flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+
+            // OSC 8 超链接开/关（按 URI 变）
+            let link_id = cell.hyperlink().map(|h| {
+                // 用 uri 指针稳定比较：同一 hyperlink Arc 地址相同
+                h.uri().as_ptr() as u64 ^ (h.uri().len() as u64)
+            });
+            if link_id != sgr.link {
+                // 先关旧
+                if sgr.link.is_some() {
+                    out.extend_from_slice(b"\x1b]8;;\x1b\\");
+                }
+                if let Some(h) = cell.hyperlink() {
+                    out.extend_from_slice(b"\x1b]8;;");
+                    out.extend_from_slice(h.uri().as_bytes());
+                    out.extend_from_slice(b"\x1b\\");
+                }
+                sgr.link = link_id;
+            }
+
+            append_sgr(&mut out, &mut sgr, cell);
+
+            if !flags.contains(Flags::HIDDEN) {
+                let ch = cell.c;
+                if ch != '\0' {
+                    push_char(&mut out, ch);
+                }
+                if let Some(zw) = cell.zerowidth() {
+                    for &z in zw {
+                        push_char(&mut out, z);
+                    }
+                }
+            }
+        }
+
+        // 行尾：软换行不插 \r\n（下一行是续行）；硬换行才换行。
+        // 最后一行后也不要多余 \r\n，靠后面的 CUP 定位光标。
+        if line < bottom && !wrap {
+            // 换行前关 OSC 8，避免链接跨行粘连
+            if sgr.link.is_some() {
+                out.extend_from_slice(b"\x1b]8;;\x1b\\");
+                sgr.link = None;
+            }
+            out.extend_from_slice(b"\r\n");
+        }
+        line += 1;
+    }
+
+    // 关闭可能仍开着的 OSC 8
+    if sgr.link.is_some() {
+        out.extend_from_slice(b"\x1b]8;;\x1b\\");
+    }
+    out.extend_from_slice(b"\x1b[0m");
+
+    // —— 光标：吐完 history 后客户端应在底部；CUP 用可视区 1 基坐标 ——
+    // alacritty：display_offset=0 时 cursor.line 为 0..screen_lines-1。
+    let cursor = grid.cursor.point;
+    let viewport_row = if cursor.line.0 >= 0 {
+        cursor.line.0 as usize
+    } else {
+        0
+    };
+    let viewport_row = viewport_row.min(screen_lines.saturating_sub(1));
+    let viewport_col = cursor.column.0.min(cols.saturating_sub(1));
+    let _ = write!(
+        out,
+        "\x1b[{};{}H",
+        viewport_row + 1,
+        viewport_col + 1
+    );
+
+    // 光标形状（DECSCUSR）+ 显隐
+    let content = term.renderable_content();
+    match content.cursor.shape {
+        CursorShape::Hidden => out.extend_from_slice(b"\x1b[?25l"),
+        CursorShape::Underline => out.extend_from_slice(b"\x1b[4 q\x1b[?25h"),
+        CursorShape::Beam => out.extend_from_slice(b"\x1b[6 q\x1b[?25h"),
+        CursorShape::HollowBlock => out.extend_from_slice(b"\x1b[0 q\x1b[?25h"),
+        CursorShape::Block => out.extend_from_slice(b"\x1b[2 q\x1b[?25h"),
+    }
+
+    // —— 常用模式：TUI 在 jolt 重绘前也能收到正确的输入约定 ——
+    append_mode_restores(&mut out, mode);
+
+    out
+}
+
+fn push_char(out: &mut Vec<u8>, ch: char) {
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+}
+
+fn append_mode_restores(out: &mut Vec<u8>, mode: TermMode) {
+    if mode.contains(TermMode::APP_CURSOR) {
+        out.extend_from_slice(b"\x1b[?1h");
+    }
+    if mode.contains(TermMode::BRACKETED_PASTE) {
+        out.extend_from_slice(b"\x1b[?2004h");
+    }
+    // 鼠标：按实际打开的子模式恢复（SGR 优先）
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        if mode.contains(TermMode::SGR_MOUSE) {
+            out.extend_from_slice(b"\x1b[?1006h");
+        }
+        if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            out.extend_from_slice(b"\x1b[?1000h");
+        }
+        if mode.contains(TermMode::MOUSE_DRAG) {
+            out.extend_from_slice(b"\x1b[?1002h");
+        }
+        if mode.contains(TermMode::MOUSE_MOTION) {
+            out.extend_from_slice(b"\x1b[?1003h");
+        }
+    }
+    if mode.contains(TermMode::FOCUS_IN_OUT) {
+        out.extend_from_slice(b"\x1b[?1004h");
+    }
+}
+
+fn underline_kind(flags: Flags) -> u8 {
+    if flags.contains(Flags::UNDERCURL) {
+        3
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        2
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        4
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        5
+    } else if flags.contains(Flags::UNDERLINE) {
+        1
+    } else {
+        0
+    }
+}
+
+fn append_sgr(out: &mut Vec<u8>, state: &mut SgrState, cell: &Cell) {
+    let flags = cell.flags;
+    let bold = flags.contains(Flags::BOLD) || flags.contains(Flags::BOLD_ITALIC);
+    let dim = flags.contains(Flags::DIM) || flags.contains(Flags::DIM_BOLD);
+    let italic = flags.contains(Flags::ITALIC) || flags.contains(Flags::BOLD_ITALIC);
+    let underline = underline_kind(flags);
+    let strike = flags.contains(Flags::STRIKEOUT);
+    let inverse = flags.contains(Flags::INVERSE);
+
+    let next_attrs = (bold, dim, italic, underline, strike, inverse, cell.fg, cell.bg);
+    let cur_attrs = (
+        state.bold,
+        state.dim,
+        state.italic,
+        state.underline,
+        state.strike,
+        state.inverse,
+        state.fg,
+        state.bg,
+    );
+    if next_attrs == cur_attrs {
+        return;
+    }
+
+    let need_reset = state.bold && !bold
+        || state.dim && !dim
+        || state.italic && !italic
+        || state.underline != 0 && underline == 0
+        || state.underline != 0 && underline != 0 && state.underline != underline
+        || state.strike && !strike
+        || state.inverse && !inverse
+        || (state.fg != cell.fg && is_default_fg(cell.fg))
+        || (state.bg != cell.bg && is_default_bg(cell.bg));
+
+    let mut params = Vec::new();
+    let push_code = |params: &mut Vec<u8>, code: u8| {
+        if !params.is_empty() {
+            params.push(b';');
+        }
+        push_u8(params, code);
+    };
+
+    if need_reset {
+        params.push(b'0');
+        state.bold = false;
+        state.dim = false;
+        state.italic = false;
+        state.underline = 0;
+        state.strike = false;
+        state.inverse = false;
+        state.fg = Color::Named(NamedColor::Foreground);
+        state.bg = Color::Named(NamedColor::Background);
+    }
+
+    if bold && !state.bold {
+        push_code(&mut params, 1);
+    }
+    if dim && !state.dim {
+        push_code(&mut params, 2);
+    }
+    if italic && !state.italic {
+        push_code(&mut params, 3);
+    }
+    if underline != 0 && underline != state.underline {
+        // SGR 4 / 4:2 / 4:3 / 4:4 / 4:5
+        if !params.is_empty() {
+            params.push(b';');
+        }
+        match underline {
+            1 => params.extend_from_slice(b"4"),
+            2 => params.extend_from_slice(b"4:2"),
+            3 => params.extend_from_slice(b"4:3"),
+            4 => params.extend_from_slice(b"4:4"),
+            5 => params.extend_from_slice(b"4:5"),
+            _ => params.extend_from_slice(b"4"),
+        }
+    }
+    if inverse && !state.inverse {
+        push_code(&mut params, 7);
+    }
+    if strike && !state.strike {
+        push_code(&mut params, 9);
+    }
+    if cell.fg != state.fg {
+        append_color_params(&mut params, true, cell.fg);
+    }
+    if cell.bg != state.bg {
+        append_color_params(&mut params, false, cell.bg);
+    }
+
+    if !params.is_empty() {
+        out.extend_from_slice(b"\x1b[");
+        out.extend_from_slice(&params);
+        out.push(b'm');
+    }
+
+    state.bold = bold;
+    state.dim = dim;
+    state.italic = italic;
+    state.underline = underline;
+    state.strike = strike;
+    state.inverse = inverse;
+    state.fg = cell.fg;
+    state.bg = cell.bg;
+}
+
+fn push_u8(params: &mut Vec<u8>, n: u8) {
+    if n >= 100 {
+        params.push(b'0' + n / 100);
+        params.push(b'0' + (n / 10) % 10);
+        params.push(b'0' + n % 10);
+    } else if n >= 10 {
+        params.push(b'0' + n / 10);
+        params.push(b'0' + n % 10);
+    } else {
+        params.push(b'0' + n);
+    }
+}
+
+fn is_default_fg(c: Color) -> bool {
+    matches!(c, Color::Named(NamedColor::Foreground))
+}
+fn is_default_bg(c: Color) -> bool {
+    matches!(c, Color::Named(NamedColor::Background))
+}
+
+fn append_color_params(params: &mut Vec<u8>, is_fg: bool, color: Color) {
+    let sep = |params: &mut Vec<u8>| {
+        if !params.is_empty() {
+            params.push(b';');
+        }
+    };
+    match color {
+        Color::Named(n) => {
+            sep(params);
+            push_u8(params, named_sgr_code(n, is_fg));
+        }
+        Color::Indexed(i) => {
+            sep(params);
+            push_u8(params, if is_fg { 38 } else { 48 });
+            params.push(b';');
+            params.push(b'5');
+            params.push(b';');
+            push_u8(params, i);
+        }
+        Color::Spec(rgb) => {
+            sep(params);
+            push_u8(params, if is_fg { 38 } else { 48 });
+            params.push(b';');
+            params.push(b'2');
+            params.push(b';');
+            push_u8(params, rgb.r);
+            params.push(b';');
+            push_u8(params, rgb.g);
+            params.push(b';');
+            push_u8(params, rgb.b);
+        }
+    }
+}
+
+fn named_sgr_code(n: NamedColor, is_fg: bool) -> u8 {
+    use NamedColor::*;
+    match (n, is_fg) {
+        (Black, true) => 30,
+        (Red, true) => 31,
+        (Green, true) => 32,
+        (Yellow, true) => 33,
+        (Blue, true) => 34,
+        (Magenta, true) => 35,
+        (Cyan, true) => 36,
+        (White, true) => 37,
+        (Foreground, true) => 39,
+        (BrightBlack, true) => 90,
+        (BrightRed, true) => 91,
+        (BrightGreen, true) => 92,
+        (BrightYellow, true) => 93,
+        (BrightBlue, true) => 94,
+        (BrightMagenta, true) => 95,
+        (BrightCyan, true) => 96,
+        (BrightWhite, true) => 97,
+        (Black, false) => 40,
+        (Red, false) => 41,
+        (Green, false) => 42,
+        (Yellow, false) => 43,
+        (Blue, false) => 44,
+        (Magenta, false) => 45,
+        (Cyan, false) => 46,
+        (White, false) => 47,
+        (Background, false) => 49,
+        (BrightBlack, false) => 100,
+        (BrightRed, false) => 101,
+        (BrightGreen, false) => 102,
+        (BrightYellow, false) => 103,
+        (BrightBlue, false) => 104,
+        (BrightMagenta, false) => 105,
+        (BrightCyan, false) => 106,
+        (BrightWhite, false) => 107,
+        (_, true) => 39,
+        (_, false) => 49,
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    fn visible_text(term: &Term<VoidListener>) -> String {
+        term.renderable_content()
+            .display_iter
+            .map(|i| i.cell.c)
+            .filter(|c| *c != '\0')
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_visible_text() {
+        let size = DaemonTermSize { rows: 5, cols: 20 };
+        let mut term = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"\x1b[31mhello\x1b[0m\r\nworld");
+
+        let snap = snapshot_ansi(&term);
+        assert!(snap.windows(5).any(|w| w == b"hello"));
+        assert!(snap.windows(5).any(|w| w == b"world"));
+
+        let mut term2 = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser2: Processor = Processor::new();
+        parser2.advance(&mut term2, &snap);
+        let text = visible_text(&term2);
+        assert!(text.contains("hello"), "got {text:?}");
+        assert!(text.contains("world"), "got {text:?}");
+    }
+
+    #[test]
+    fn snapshot_enters_alt_screen_when_active() {
+        let size = DaemonTermSize { rows: 4, cols: 10 };
+        let mut term = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"\x1b[?1049hTUI");
+        let snap = snapshot_ansi(&term);
+        assert!(snap.windows(8).any(|w| w == b"\x1b[?1049h"));
+        assert!(snap.windows(3).any(|w| w == b"TUI"));
+    }
+
+    #[test]
+    fn snapshot_includes_scrollback_history() {
+        // 3 行屏高，灌 10 行 → 前几行进 history
+        let size = DaemonTermSize { rows: 3, cols: 40 };
+        let mut term = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        for i in 0..10 {
+            parser.advance(&mut term, format!("line-{i:02}\r\n").as_bytes());
+        }
+        // 可视区只有最后几行；快照必须仍带上更早的 line-00
+        let snap = snapshot_ansi(&term);
+        assert!(
+            snap.windows(7).any(|w| w == b"line-00"),
+            "完整快照应含 scrollback 里的 line-00，实际: {}",
+            String::from_utf8_lossy(&snap)
+        );
+        assert!(snap.windows(7).any(|w| w == b"line-09"));
+
+        // 重放到更大屏，history 内容应可在网格里找到
+        let size2 = DaemonTermSize { rows: 20, cols: 40 };
+        let mut term2 = Term::new(daemon_term_config(), &size2, VoidListener);
+        let mut parser2: Processor = Processor::new();
+        parser2.advance(&mut term2, &snap);
+        // 扫整个 grid（含 history）
+        let mut all = String::new();
+        let top = term2.topmost_line();
+        let bottom = term2.bottommost_line();
+        let mut line = top;
+        while line <= bottom {
+            for col in 0..term2.columns() {
+                all.push(term2.grid()[line][Column(col)].c);
+            }
+            all.push('\n');
+            line += 1;
+        }
+        assert!(all.contains("line-00"), "重放后 grid 应含 line-00，got {all:?}");
+        assert!(all.contains("line-09"), "重放后 grid 应含 line-09");
+    }
+
+    #[test]
+    fn snapshot_restores_bracketed_paste_mode() {
+        let size = DaemonTermSize { rows: 3, cols: 10 };
+        let mut term = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"\x1b[?2004hhi");
+        let snap = snapshot_ansi(&term);
+        assert!(
+            snap.windows(8).any(|w| w == b"\x1b[?2004h"),
+            "开了 bracketed paste 的会话快照应恢复该模式"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_osc8_hyperlink() {
+        let size = DaemonTermSize { rows: 3, cols: 40 };
+        let mut term = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\",
+        );
+        let snap = snapshot_ansi(&term);
+        let s = String::from_utf8_lossy(&snap);
+        assert!(
+            s.contains("https://example.com"),
+            "快照应含 OSC 8 URI，got {s}"
+        );
+        assert!(snap.windows(4).any(|w| w == b"link"));
+    }
 }
