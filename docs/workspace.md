@@ -106,11 +106,26 @@ UI 线程每 30ms 对网格做快照并重绘。
 | `Cmd+V` | 粘贴剪贴板 |
 | `Shift+PageUp` / `Shift+PageDown` | 翻滚历史缓冲 |
 | `Cmd+点击` | 打开光标处识别到的链接 |
+| `Shift+Enter` | 在开了 kitty keyboard protocol 的 TUI 里换行而非提交（见下） |
 
 ---
 
 ## 关键技术决策
 
+- **Shift+Enter 与 kitty keyboard protocol**：遗留终端编码里 Enter 只有 `\r` 一种字节，
+  Shift/Alt/Ctrl+Enter 全塌缩成同一个 `\r`，修饰键信息在协议层就丢了——所以「Shift+Enter
+  换行、Enter 提交」不是 UI 能自己决定的事。kitty keyboard protocol 用 CSI u 编码补回修饰键
+  （Shift+Enter → `ESC[13;2u`），TUI 进入时发 `CSI > 1 u` 开启，alacritty_terminal 会解析并置
+  `TermMode::DISAMBIGUATE_ESC_CODES`。`keystroke_to_bytes` 据此分流：**开了才发 CSI u，没开
+  一律发 `\r`**。这个 gate 不能省——bash/zsh 不认 CSI u，硬发会被 readline 当文本吐出 `[13;2u`。
+  Claude Code 从 v2.1 起会主动开；老版本或不开协议的 TUI 还有 Alt+Enter（回退到 meta 前缀
+  `ESC`+`CR`）这条传统通道。
+  两个坑：① alacritty 的 `Config::kitty_keyboard` **默认 false**，关着时它会把 `CSI > 1 u`
+  在 `push_keyboard_mode` 里静默 return 掉，mode 位永远置不上——建 `Term` 时必须显式开。
+  ② 发送侧目前只给 Enter 编了 CSI u，其余键（Escape、Ctrl+字母、带修饰的方向键）在协议开着时
+  仍发遗留编码，不是完整的 level-1 实现。够用是因为 Claude Code 本来就得兼容 iTerm2 那种
+  「只把 Shift+Enter 映射成 CSI u、其余照旧」的手工配置；真要补全得照搬 alacritty 的
+  `build_key_sequence`。
 - **runtime_shaders**：绕开完整 Xcode 依赖，是能在只装 CLT 的机器上构建的关键。
 - **portable-pty + alacritty（仅状态机）**：与 GUI 集成比 alacritty 自带 event_loop 更干净，
   与 codux 的做法一致。

@@ -886,7 +886,11 @@ impl Render for TerminalView {
                     cx.notify();
                     return;
                 }
-                if let Some(bytes) = keystroke_to_bytes(ks, this.terminal.app_cursor_mode()) {
+                if let Some(bytes) = keystroke_to_bytes(
+                    ks,
+                    this.terminal.app_cursor_mode(),
+                    this.terminal.kitty_keyboard_mode(),
+                ) {
                     this.terminal.send_input(&bytes);
                     this.terminal.scroll_to_bottom(); // 敲键盘即回到最新输出，跟真实终端一致
                     this.notification = None; // 用户按键回应 → 清「需要注意」
@@ -1351,15 +1355,33 @@ fn is_url_char(c: char) -> bool {
 /// `app_cursor`：终端是否处于 DECCKM「应用光标键」模式（见 Terminal::app_cursor_mode）。
 /// 方向键固定发 CSI（`ESC [ A`）之前，Claude Code 这类开了 DECCKM 的全屏 TUI 收不到
 /// 它期待的 SS3（`ESC O A`）序列，方向键在这类界面里就跟没按一样。
-fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
+///
+/// `kitty_keys`：对端是否开了 kitty keyboard protocol（见 Terminal::kitty_keyboard_mode），
+/// 决定带修饰键的 Enter 走 CSI u 还是遗留编码。
+fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool, kitty_keys: bool) -> Option<Vec<u8>> {
     let m = &ks.modifiers;
 
     if m.platform {
         return None;
     }
 
+    // Enter 单独拎出来：遗留编码里 Shift/Alt/Ctrl+Enter 全都塌缩成 `\r`，跟裸 Enter 无从
+    // 区分，所以 Claude Code 那种「Shift+Enter 换行、Enter 提交」在传统终端里天然做不到。
+    // 对端开了 kitty keyboard protocol 时才按 CSI u 上报修饰键（Shift+Enter → `ESC[13;2u`）；
+    // 没开就必须继续发 `\r`，否则 bash/zsh 里按 Shift+Enter 会把 `[13;2u` 当文本吐出来。
+    if ks.key == "enter" {
+        let mods = csi_u_modifiers(m);
+        if kitty_keys && mods > 1 {
+            return Some(format!("\x1b[13;{mods}u").into_bytes());
+        }
+        // 协议没开时的兜底：Alt+Enter 按传统 meta 前缀发 `ESC` + `CR`，Claude Code 认这条。
+        if m.alt {
+            return Some(b"\x1b\r".to_vec());
+        }
+        return Some(b"\r".to_vec());
+    }
+
     let named: Option<&[u8]> = match ks.key.as_str() {
-        "enter" => Some(b"\r"),
         "backspace" => Some(b"\x7f"),
         "tab" => Some(b"\t"),
         "escape" => Some(b"\x1b"),
@@ -1386,4 +1408,74 @@ fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+/// CSI u 序列里的修饰键参数：基数 1，再按位叠加 shift(1) / alt(2) / ctrl(4)。
+/// 例：Shift+Enter → 2，于是 `ESC[13;2u`。
+fn csi_u_modifiers(m: &Modifiers) -> u8 {
+    1 + u8::from(m.shift) + (u8::from(m.alt) << 1) + (u8::from(m.control) << 2)
+}
+
+#[cfg(test)]
+mod tests {
+    // 不能 `use super::*`：那会把 gpui 的 `test` 属性宏一起带进来，盖掉标准 #[test]。
+    use super::keystroke_to_bytes;
+    use gpui::{Keystroke, Modifiers};
+
+    fn enter(shift: bool, alt: bool, control: bool) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                shift,
+                alt,
+                control,
+                ..Default::default()
+            },
+            key: "enter".into(),
+            key_char: None,
+        }
+    }
+
+    /// 开了 kitty keyboard protocol 的 TUI（Claude Code v2.1+）必须能把 Shift+Enter
+    /// 跟裸 Enter 区分开，否则「换行」会被当成「提交」。
+    #[test]
+    fn shift_enter_reports_csi_u_when_kitty_enabled() {
+        let bytes = keystroke_to_bytes(&enter(true, false, false), false, true).unwrap();
+        assert_eq!(bytes, b"\x1b[13;2u");
+    }
+
+    /// 修饰键位的叠加：alt=2、ctrl=4，都在基数 1 上加。
+    #[test]
+    fn other_enter_modifiers_report_csi_u_when_kitty_enabled() {
+        let alt = keystroke_to_bytes(&enter(false, true, false), false, true).unwrap();
+        assert_eq!(alt, b"\x1b[13;3u");
+        let ctrl = keystroke_to_bytes(&enter(false, false, true), false, true).unwrap();
+        assert_eq!(ctrl, b"\x1b[13;5u");
+        let all = keystroke_to_bytes(&enter(true, true, true), false, true).unwrap();
+        assert_eq!(all, b"\x1b[13;8u");
+    }
+
+    /// 裸 Enter 即便在 kitty 模式下也发遗留的 `\r`——协议如此规定，也让协议没被复位时
+    /// 用户还能在 shell 里敲 `reset` 把终端救回来。
+    #[test]
+    fn plain_enter_stays_carriage_return() {
+        let with_kitty = keystroke_to_bytes(&enter(false, false, false), false, true).unwrap();
+        assert_eq!(with_kitty, b"\r");
+        let without = keystroke_to_bytes(&enter(false, false, false), false, false).unwrap();
+        assert_eq!(without, b"\r");
+    }
+
+    /// 没开协议的程序（bash/zsh）不认 CSI u：这时 Shift+Enter 必须老老实实发 `\r`，
+    /// 不然 `[13;2u` 会被 readline 当普通文本吐在命令行里。
+    #[test]
+    fn shift_enter_falls_back_to_carriage_return_without_kitty() {
+        let bytes = keystroke_to_bytes(&enter(true, false, false), false, false).unwrap();
+        assert_eq!(bytes, b"\r");
+    }
+
+    /// 协议没开时 Alt+Enter 还有条传统通道：meta 前缀 `ESC` + `CR`，Claude Code 认这个。
+    #[test]
+    fn alt_enter_falls_back_to_meta_prefix_without_kitty() {
+        let bytes = keystroke_to_bytes(&enter(false, true, false), false, false).unwrap();
+        assert_eq!(bytes, b"\x1b\r");
+    }
 }

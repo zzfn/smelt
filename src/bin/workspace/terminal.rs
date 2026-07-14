@@ -578,8 +578,12 @@ impl Terminal {
         let notify: NotifySlot = Arc::new(Mutex::new(None));
         let title: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let writer = Arc::new(Mutex::new(writer));
+        // kitty_keyboard 默认是 false，而且关着的时候 alacritty 会把 `CSI > 1 u` 静默丢掉
+        // （push_keyboard_mode 里直接 return），DISAMBIGUATE_ESC_CODES 永远置不上，
+        // Shift+Enter 也就永远退化成裸 Enter。见 kitty_keyboard_mode / keystroke_to_bytes。
+        let config = Config { kitty_keyboard: true, ..Config::default() };
         let term = Term::new(
-            Config::default(),
+            config,
             &size,
             EventProxy { notify: notify.clone(), title: title.clone(), writer: writer.clone() },
         );
@@ -738,6 +742,17 @@ impl Terminal {
     pub fn app_cursor_mode(&self) -> bool {
         match self.term.lock() {
             Ok(term) => term.mode().contains(TermMode::APP_CURSOR),
+            Err(_) => false,
+        }
+    }
+
+    /// 对端有没有开 kitty keyboard protocol 的「消歧」层（进入时发 `CSI > 1 u`）。
+    /// 传统终端编码里 Shift+Enter 跟裸 Enter 撞车（都是 `\r`），修饰键信息丢了；开了这个
+    /// 模式后带修饰键的按键改用 CSI u 编码上报，两者才能分开。Claude Code 从 v2.1 起
+    /// 启动时会主动开——不开的程序（bash/zsh）就得继续收遗留编码，见 keystroke_to_bytes。
+    pub fn kitty_keyboard_mode(&self) -> bool {
+        match self.term.lock() {
+            Ok(term) => term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES),
             Err(_) => false,
         }
     }
@@ -952,6 +967,32 @@ mod damage_gate_tests {
         kill_remote(&id);
     }
 
+    /// 走完整生产路径（Terminal::spawn 的真 PTY + 真 shell + alacritty 解析）验证
+    /// kitty keyboard protocol 能被识别——上面 event_proxy 那个测试是手搭 Config 的，
+    /// 万一 spawn 里忘了开 kitty_keyboard 它照样绿，这里才防得住。
+    #[test]
+    fn spawned_terminal_honors_kitty_keyboard_protocol() {
+        let dir = std::env::temp_dir().join(format!("smelt-kitty-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let id = format!("kitty-test-{}", uuid_like());
+
+        let term = Terminal::spawn(24, 80, dir.to_str(), &id, None).expect("spawn 失败");
+        thread::sleep(Duration::from_millis(800)); // 等 shell 起来
+
+        assert!(!term.kitty_keyboard_mode(), "shell 刚起来时不该开着");
+
+        // 让 shell 真的把 `CSI > 1 u` 吐到 PTY 上（Claude Code v2.1+ 启动时干的事）。
+        let mut term = term;
+        term.send_input(b"printf '\\033[>1u'\n");
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            term.kitty_keyboard_mode(),
+            "真实 PTY 上收到 CSI > 1 u 后应置位——没置位说明 spawn 的 Config 没开 kitty_keyboard"
+        );
+
+        kill_remote(&id);
+    }
+
     /// 不依赖 uuid crate（terminal.rs 本身不需要它），用 pid+时间戳拼一个够唯一的 id。
     fn uuid_like() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1024,5 +1065,37 @@ mod event_proxy_answers_tests {
         let (ty, resp) = read_frame(&mut probe);
         assert_eq!(ty, 0);
         assert!(resp.contains("rgb:1a1a/1b1b/2626"), "应含 DEFAULT_BG 的 rgb 十六进制，实际: {resp:?}");
+    }
+
+    /// Shift+Enter 能不能换行，全押在这个位上：TUI 进入时发 `CSI > 1 u` 开 kitty keyboard
+    /// protocol，alacritty 要把它解析成 TermMode::DISAMBIGUATE_ESC_CODES，keystroke_to_bytes
+    /// 才会改发 CSI u 编码。退出时发 `CSI < u` 弹栈还原——还原不掉的话，TUI 退出后普通
+    /// shell 里按 Shift+Enter 就会被吐出 `[13;2u` 乱码。
+    #[test]
+    fn kitty_keyboard_protocol_toggles_disambiguate_mode() {
+        let (proxy, _probe) = make_proxy();
+        let size = TermSize { rows: 24, cols: 80 };
+        // 跟 Terminal::spawn 用同一份 config：kitty_keyboard 关着的话 alacritty 会把
+        // CSI u 全静默丢掉，这个测试就成了摆设。
+        let config = Config { kitty_keyboard: true, ..Config::default() };
+        let mut term = Term::new(config, &size, proxy);
+        let mut parser: Processor = Processor::new();
+
+        assert!(
+            !term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            "默认不该开着——普通 shell 不认 CSI u"
+        );
+
+        parser.advance(&mut term, b"\x1b[>1u"); // Claude Code v2.1+ 启动时发这个
+        assert!(
+            term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            "收到 CSI > 1 u 后应置位，否则 Shift+Enter 永远退化成裸 Enter"
+        );
+
+        parser.advance(&mut term, b"\x1b[<u"); // 退出时弹栈
+        assert!(
+            !term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            "TUI 退出后应还原，否则 shell 里 Shift+Enter 会吐出 `[13;2u` 乱码"
+        );
     }
 }
