@@ -20,6 +20,9 @@ pub enum StatusItemEvent {
 /// `update_menu`，本文件负责把它翻译成 AppKit 菜单项。
 #[derive(Clone, PartialEq)]
 pub struct SessionEntry {
+    /// 真实会话下标（`self.sessions` 里的位置）。菜单是按状态优先级排过序的，条目在菜单里
+    /// 的位置≠会话下标，所以点击要跳到的目标必须显式带上这个原始下标，不能用菜单位置当 tag。
+    pub session_ix: usize,
     pub title: String,
     pub status_text: &'static str,
     pub color: (u8, u8, u8),
@@ -199,14 +202,15 @@ mod imp {
             let target = target_ptr as *mut Object;
             let _: () = msg_send![menu, removeAllItems];
 
-            for (ix, entry) in entries.iter().enumerate() {
+            for entry in entries.iter() {
                 let title = format!("{} — {}", entry.title, entry.status_text);
                 let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
                 let item: *mut Object = msg_send![item,
                     initWithTitle: nsstring(&title)
                     action: sel!(smeltStatusItemJump:)
                     keyEquivalent: nsstring("")];
-                let _: () = msg_send![item, setTag: ix as i64];
+                // tag 记真实会话下标（不是菜单位置——菜单排过序），点击经 on_jump 原样带回。
+                let _: () = msg_send![item, setTag: entry.session_ix as i64];
                 let _: () = msg_send![item, setTarget: target];
                 let dot = dot_image(entry.color);
                 let _: () = msg_send![item, setImage: dot];

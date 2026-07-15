@@ -1195,19 +1195,18 @@ impl Workspace {
                             })
                         })
                     });
-                    // 兜底：硬重启（旧守护不支持无缝升级时的唯一出路，会断会话）。
-                    let restart_daemon_btn = (outdated == Some(true)).then(|| {
-                        btn("restart-daemon", "重启守护进程".into())
-                            .text_color(rgb(0xff8f8f))
-                            .bg(Hsla::from(rgba(0xef444424)))
-                            .hover(|s| s.bg(Hsla::from(rgba(0xef444440))))
-                            .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
-                                restart_entity.update(cx, |this, cx| {
-                                    this.show_daemon_restart_confirm = true;
-                                    cx.notify();
-                                });
-                            })
-                    });
+                    // 硬重启：常驻入口（守护卡死 / 想强制换二进制时用），会断会话。
+                    // 不受版本是否落后限制；点击走二次确认弹窗兜底。
+                    let restart_daemon_btn = btn("restart-daemon", "重启守护进程".into())
+                        .text_color(rgb(0xff8f8f))
+                        .bg(Hsla::from(rgba(0xef444424)))
+                        .hover(|s| s.bg(Hsla::from(rgba(0xef444440))))
+                        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
+                            restart_entity.update(cx, |this, cx| {
+                                this.show_daemon_restart_confirm = true;
+                                cx.notify();
+                            });
+                        });
                     let status_text = match outdated {
                         Some(true) => "版本落后于当前安装包，升级守护后新功能/修复才生效。".to_string(),
                         Some(false) => "已是最新。".to_string(),
@@ -1228,17 +1227,17 @@ impl Workspace {
                                         .gap_2()
                                         .items_center()
                                         .children(upgrade_daemon_btn)
-                                        .children(restart_daemon_btn),
+                                        .child(restart_daemon_btn),
                                 ),
                         )
                         .child(div().text_xs().text_color(muted).child(status_text))
                         .children(upgrade_msg.map(|m| div().text_xs().text_color(muted).child(m)))
-                        .children((outdated == Some(true)).then(|| {
+                        .child(
                             div()
                                 .text_xs()
                                 .text_color(muted)
-                                .child("「无缝升级」保留所有会话不中断；「重启守护进程」会断开并终止当前所有终端会话（含正在跑的 agent），仅当无缝升级不可用时使用。")
-                        }))
+                                .child("「重启守护进程」会断开并终止当前所有终端会话（含正在跑的 agent）；若只是版本落后，优先用会话不中断的「无缝升级」。"),
+                        )
                 })),
         );
 

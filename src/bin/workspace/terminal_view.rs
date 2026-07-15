@@ -9,9 +9,12 @@ use std::time::{Duration, Instant};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::Input;
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use smol::Timer;
 
 use crate::terminal::{self, Terminal};
+use crate::tasks::NewTaskPrefill;
+use crate::NewTask;
 
 /// 选区高亮背景色：跟终端主题一起切换（深色用暗蓝，浅色换成不刺眼的浅蓝，
 /// 否则深色定死的暗蓝铺在浅底上，选中文字会糊在一起看不清）。
@@ -189,6 +192,9 @@ pub struct TerminalView {
     /// Workspace::render 每帧来取，取走即清空。跟 last_notified 共用同一条
     /// 60s 同文本去重（见轮询循环），系统通知 / toast 二选一，不会重复弹。
     pending_toast: Option<String>,
+    /// 绑定任务刚被标 Done 时写入「完成项目 cwd」；Workspace::render 取走后
+    /// 触发同项目自动续跑下一条待办。None = 本帧无需续跑。
+    pending_task_continue_cwd: Option<String>,
     /// 最近一次比较过的外观设置：定时刷新时用于判断"背景色/图/透明度/模糊"是否被
     /// 改过（这些跟 PTY 内容无关，Terminal::take_damage 感知不到）。
     /// None = 还没比较过，首次一律当作"变了"以确保能显示当前外观。
@@ -275,8 +281,38 @@ impl TerminalView {
         launch: Option<&str>,
         launch_label: Option<&str>,
     ) -> Self {
-        let terminal = Terminal::spawn(24, 80, cwd.as_deref(), &session_id, launch)
-            .expect("启动内嵌终端失败");
+        Self::try_new(cx, cwd, session_id, launch, launch_label)
+            .expect("启动内嵌终端失败")
+    }
+
+    /// 可失败版本：无头 job 提升为可见终端时 reattach 可能已 EOF。
+    pub fn try_new(
+        cx: &mut Context<Self>,
+        cwd: Option<String>,
+        session_id: String,
+        launch: Option<&str>,
+        launch_label: Option<&str>,
+    ) -> Option<Self> {
+        let terminal = Terminal::spawn(24, 80, cwd.as_deref(), &session_id, launch).ok()?;
+        Some(Self::from_terminal(
+            cx,
+            terminal,
+            cwd,
+            session_id,
+            launch,
+            launch_label,
+        ))
+    }
+
+    /// 用已 spawn 的 `Terminal` 包一层视图（无头 job 提升时先 spawn 再决定是否建 Entity）。
+    pub fn from_terminal(
+        cx: &mut Context<Self>,
+        terminal: Terminal,
+        cwd: Option<String>,
+        session_id: String,
+        launch: Option<&str>,
+        launch_label: Option<&str>,
+    ) -> Self {
         // Zed 式事件驱动重绘：读线程一有新内容就唤醒这里 cx.notify()（见 drive_redraws）。
         Self::drive_redraws(terminal.redraw_channel(), cx);
         let launch_kind = classify_launch(launch);
@@ -327,6 +363,12 @@ impl TerminalView {
                 if this.was_running && !running {
                     // Running → Idle：该会话的 agent 干完了 → 标「完成未读」（总览绿标）。
                     this.completed_unread = true;
+                    // 绑了本 session 的任务 → Done；若确实收尾了任务，挂旗让 Workspace
+                    // 同项目自动 claim 下一条待办（见 `on_session_task_idle`）。
+                    let sid = this.session_id.clone();
+                    if let Some(cwd) = crate::tasks::TaskStore::mark_session_done(&sid) {
+                        this.pending_task_continue_cwd = Some(cwd);
+                    }
                     crate::pet::push_pet_message(cx, format!("「{name}」任务完成啦，来看看结果吧"));
                 }
                 if running {
@@ -418,6 +460,7 @@ impl TerminalView {
             completed_unread: false,
             last_notified: None,
             pending_toast: None,
+            pending_task_continue_cwd: None,
             last_appearance: None,
             scroll_accum: 0.0,
             launch_kind,
@@ -519,6 +562,11 @@ impl TerminalView {
         self.pending_toast.take()
     }
 
+    /// 取走「任务完成 → 自动续跑」挂旗（完成项目 cwd）；Workspace::render 每帧调用。
+    pub fn take_pending_task_continue(&mut self) -> Option<String> {
+        self.pending_task_continue_cwd.take()
+    }
+
     /// agent 报告的终端标题（含任务名 + 状态符号）；供侧栏 / 总览显示。
     pub fn agent_title(&self) -> Option<String> {
         self.terminal.current_title()
@@ -545,11 +593,39 @@ impl TerminalView {
 
     /// 从外部写一段文本到 PTY（等价于粘贴），供 diff 视图「发到终端」等场景复用。
     /// 走 [`Terminal::paste`]：bracketed paste + 换行规范化，跟 Cmd+V 同一条路。
+    ///
+    /// **不会提交**：Claude 等开了 bracketed paste 时，粘贴内容里的 `\n` 只是多行文本。
+    /// 需要回车执行时用 [`Self::send_text_and_submit`]。
     pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.terminal.paste(text);
         self.notification = None;
         self.completed_unread = false;
         cx.notify();
+    }
+
+    /// 把正文当作**键盘输入**写入 PTY（不走 bracketed paste）。
+    pub fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let body = text.trim_end_matches(['\n', '\r']);
+        if !body.is_empty() {
+            self.terminal.send_input(body.as_bytes());
+        }
+        self.notification = None;
+        self.completed_unread = false;
+        cx.notify();
+    }
+
+    /// 发送一次 Enter（裸 `\r`）。
+    pub fn send_enter(&mut self, cx: &mut Context<Self>) {
+        self.terminal.send_input(b"\r");
+        self.notification = None;
+        self.completed_unread = false;
+        cx.notify();
+    }
+
+    /// 键入正文并回车（已有终端上执行任务用）。
+    pub fn send_text_and_submit(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.type_text(text, cx);
+        self.send_enter(cx);
     }
 
     /// 打开终端内搜索条（Cmd+F）。输入框获焦；Enter 下一个，Shift+Enter 上一个，Esc 关闭。
@@ -939,6 +1015,8 @@ impl Render for TerminalView {
         }
         let bg_layer = bg_layer.opacity(ap.opacity);
 
+        let menu_sid = self.session_id.clone();
+        let menu_cwd = self.cwd.clone();
         div()
             .relative()
             .track_focus(&self.focus_handle)
@@ -1220,7 +1298,8 @@ impl Render for TerminalView {
                     }
                 }),
             )
-            // 右键：仅在应用开了鼠标上报时转发（Shift 旁路）
+            // 右键：TUI 开了鼠标上报时转发给应用（Shift 旁路 → 系统菜单）；
+            // 否则不转发，交给 context_menu（新建任务等）。
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
@@ -1228,8 +1307,10 @@ impl Render for TerminalView {
                     if ev.modifiers.shift {
                         return;
                     }
-                    let cell = this.pos_to_cell(ev.position, window);
-                    this.terminal.mouse_button(2, true, cell.0, cell.1);
+                    if this.terminal.mouse_mode() {
+                        let cell = this.pos_to_cell(ev.position, window);
+                        this.terminal.mouse_button(2, true, cell.0, cell.1);
+                    }
                 }),
             )
             .on_mouse_up(
@@ -1238,8 +1319,10 @@ impl Render for TerminalView {
                     if ev.modifiers.shift {
                         return;
                     }
-                    let cell = this.pos_to_cell(ev.position, window);
-                    this.terminal.mouse_button(2, false, cell.0, cell.1);
+                    if this.terminal.mouse_mode() {
+                        let cell = this.pos_to_cell(ev.position, window);
+                        this.terminal.mouse_button(2, false, cell.0, cell.1);
+                    }
                 }),
             )
             .on_mouse_up(
@@ -1412,6 +1495,18 @@ impl Render for TerminalView {
             // 滚动条：有 scrollback 时画在右侧；拖 thumb / 点轨道跳转。
             .when(scroll_info.max_offset > 0, |root| {
                 root.child(self.render_scrollbar(scroll_info, cx))
+            })
+            // TUI 未开鼠标模式时右键出菜单；开了则右键转给应用（见 on_mouse_down）。
+            .context_menu(move |menu, _window, _cx| {
+                let sid = menu_sid.clone();
+                let cwd = menu_cwd.clone();
+                menu.item(PopupMenuItem::new("新建任务").on_click(move |_ev, window, cx| {
+                    *cx.default_global::<NewTaskPrefill>() = NewTaskPrefill {
+                        session_id: Some(sid.clone()),
+                        cwd: cwd.clone(),
+                    };
+                    window.dispatch_action(Box::new(NewTask), cx);
+                }))
             })
     }
 }

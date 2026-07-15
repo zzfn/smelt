@@ -211,6 +211,137 @@ struct Session {
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 
+/// macOS 顶部状态栏常驻图标（accessory 模式：**没有 Dock 图标、不进 ⌘Tab**，只在菜单栏
+/// 留一枚图标）。smeltd 本是无 UI 的守护，但被 GUI 拉起时继承了登录会话、连得上
+/// WindowServer，于是在这里挂个图标当常驻入口——即便 workspace 主窗口关了、图标仍在。
+/// 跟 `workspace/status_item.rs` 同一路数（绕开框架直接摸 AppKit），但更简单：菜单是
+/// 静态两项，不随会话状态重建。仅在 `SMELT_MENUBAR` 存在（即由 GUI 拉起）时才被调用。
+#[cfg(target_os = "macos")]
+mod menubar {
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Object, Sel};
+    use objc::{class, msg_send, sel, sel_impl};
+    use std::sync::OnceLock;
+
+    /// 应用图标母图，编进二进制当菜单栏图标（跟 workspace 用的是同一张）。
+    const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/icon-1024.png");
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSSize {
+        width: f64,
+        height: f64,
+    }
+
+    /// 点「打开 smelt」：拉起同目录的 workspace GUI。已在跑的话，由 workspace 自己的
+    /// 单实例逻辑负责前置窗口，这里只管发起。
+    extern "C" fn on_open(_this: &Object, _cmd: Sel, _sender: *mut Object) {
+        if let Ok(exe) = std::env::current_exe() {
+            use std::process::Stdio;
+            let gui = exe.with_file_name("workspace");
+            let _ = std::process::Command::new(gui)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+    }
+
+    /// 点「退出 smelt」：整个守护进程退出。注意这会关掉所有 PTY——所有会话（含正在
+    /// 跑的 agent）随之结束。后果已写进菜单项文案里。
+    extern "C" fn on_quit(_this: &Object, _cmd: Sel, _sender: *mut Object) {
+        std::process::exit(0);
+    }
+
+    /// 注册（仅一次）点击靶子类：AppKit 菜单项只认 target-action，不认 Rust 闭包，
+    /// 得声明一个最小的 `NSObject` 子类当靶子（同 status_item.rs 的做法）。
+    fn target_class() -> &'static Class {
+        static CLASS: OnceLock<&'static Class> = OnceLock::new();
+        *CLASS.get_or_init(|| {
+            let mut decl = ClassDecl::new("SmeltdMenubarTarget", class!(NSObject))
+                .expect("SmeltdMenubarTarget 类重复注册");
+            unsafe {
+                decl.add_method(
+                    sel!(smeltdOpen:),
+                    on_open as extern "C" fn(&Object, Sel, *mut Object),
+                );
+                decl.add_method(
+                    sel!(smeltdQuit:),
+                    on_quit as extern "C" fn(&Object, Sel, *mut Object),
+                );
+            }
+            decl.register()
+        })
+    }
+
+    /// `&str` → 临时 `NSString*`（autorelease，仅供本次调用当参数用）。
+    unsafe fn nsstring(s: &str) -> *mut Object {
+        let c = std::ffi::CString::new(s).unwrap_or_default();
+        msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()]
+    }
+
+    /// 建菜单栏图标 + 静态菜单，然后跑 AppKit runloop（阻塞到进程退出）。
+    /// **必须在主线程调用。** 图标、菜单、靶子实例都常驻到进程退出，故意不释放。
+    pub fn run_event_loop() {
+        unsafe {
+            let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+            // accessory：不占 Dock、不进 ⌘Tab，只在菜单栏留一枚图标。
+            // NSApplicationActivationPolicyAccessory == 1。
+            let _: bool = msg_send![app, setActivationPolicy: 1i64];
+
+            let bar: *mut Object = msg_send![class!(NSStatusBar), systemStatusBar];
+            // NSVariableStatusItemLength == -1.0，按内容自适应宽度。
+            let item: *mut Object = msg_send![bar, statusItemWithLength: -1.0f64];
+            let _: () = msg_send![item, retain]; // 常驻单例，自己按住
+
+            let button: *mut Object = msg_send![item, button];
+            let data: *mut Object = msg_send![
+                class!(NSData),
+                dataWithBytes: APP_ICON_PNG.as_ptr() as *const std::ffi::c_void
+                length: APP_ICON_PNG.len()
+            ];
+            let image: *mut Object = msg_send![class!(NSImage), alloc];
+            let image: *mut Object = msg_send![image, initWithData: data];
+            if !image.is_null() {
+                // 母图 1024×1024，菜单栏按 18pt 显示（跟系统自带图标观感对齐）。
+                let _: () = msg_send![image, setSize: NSSize { width: 18.0, height: 18.0 }];
+                let _: () = msg_send![button, setImage: image];
+            } else {
+                let _: () = msg_send![button, setTitle: nsstring("smelt")];
+            }
+
+            let target: *mut Object = msg_send![target_class(), new]; // +1，永不 release
+            let menu: *mut Object = msg_send![class!(NSMenu), new]; // +1，永不 release
+
+            let open_item: *mut Object = msg_send![class!(NSMenuItem), alloc];
+            let open_item: *mut Object = msg_send![open_item,
+                initWithTitle: nsstring("打开 smelt")
+                action: sel!(smeltdOpen:)
+                keyEquivalent: nsstring("")];
+            let _: () = msg_send![open_item, setTarget: target];
+            let _: () = msg_send![menu, addItem: open_item];
+            let _: () = msg_send![open_item, release];
+
+            let sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+            let _: () = msg_send![menu, addItem: sep];
+
+            let quit_item: *mut Object = msg_send![class!(NSMenuItem), alloc];
+            let quit_item: *mut Object = msg_send![quit_item,
+                initWithTitle: nsstring("退出 smelt（结束所有会话）")
+                action: sel!(smeltdQuit:)
+                keyEquivalent: nsstring("")];
+            let _: () = msg_send![quit_item, setTarget: target];
+            let _: () = msg_send![menu, addItem: quit_item];
+            let _: () = msg_send![quit_item, release];
+
+            let _: () = msg_send![item, setMenu: menu];
+
+            // 阻塞跑 runloop：菜单点击的 target-action 全靠它派发。
+            let _: () = msg_send![app, run];
+        }
+    }
+}
+
 fn main() {
     // 无缝升级交接：上一代进程 exec 本二进制前写好交接文件并把路径放在环境变量里。
     // 立即摘掉环境变量：它只对"本次 exec 交接"有意义，不能传染给之后 spawn 的 shell。
@@ -251,11 +382,29 @@ fn main() {
 
     let listen_fd = listener.as_raw_fd();
     let exe_mtime = exe_mtime_secs();
-    for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
-        let sessions = Arc::clone(&sessions);
-        thread::spawn(move || handle_conn(conn, sessions, exe_mtime, listen_fd));
+
+    // thread-per-connection 的 accept 主循环。抽成闭包，好让主线程在 macOS 上腾出来
+    // 跑菜单栏 runloop——AppKit 铁律：NSApplication/NSStatusItem 只能在主线程摸。
+    let accept_loop = move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            let sessions = Arc::clone(&sessions);
+            thread::spawn(move || handle_conn(conn, sessions, exe_mtime, listen_fd));
+        }
+    };
+
+    // 只有被 GUI 拉起时（SMELT_MENUBAR=1，说明继承了登录会话、连得上 WindowServer）
+    // 才在顶部状态栏挂图标；命令行 / 无 GUI 会话下老老实实 headless 跑，绝不让「图标」
+    // 这个锦上添花的东西把守护本身拖垮。
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("SMELT_MENUBAR").is_some() {
+        let daemon = thread::spawn(accept_loop);
+        menubar::run_event_loop(); // 阻塞：跑到用户从菜单选「退出」为止
+        let _ = daemon.join(); // 兜底：runloop 万一提前返回，也别让守护跟着没
+        return;
     }
+
+    accept_loop();
 }
 
 /// 交接文件路径（跟 socket 同目录）。
@@ -874,6 +1023,11 @@ fn snapshot_ansi(term: &Term<VoidListener>) -> Vec<u8> {
         out.extend_from_slice(b"\x1b[?7l");
     }
 
+    // 私有模式尽早恢复（尤其是鼠标上报）：大快照灌完前用户就可能滚轮，
+    // 若等末尾才恢复，scroll_wheel 会误判成「无 MOUSE_MODE」而滚本地 history
+    // （「整个滚」）。末尾再写一次，防止中间序列（若有）冲掉。
+    append_mode_restores(&mut out, mode);
+
     let mut sgr = SgrState::default();
     let mut line = start;
     while line <= bottom {
@@ -980,6 +1134,11 @@ fn push_char(out: &mut Vec<u8>, ch: char) {
     out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
 }
 
+/// 把守护 Term 当前的私有模式编码成 CSI，供 reattach 快照灌进客户端空 Term。
+///
+/// 关键：**鼠标 tracking（1000/1002/1003 之一）+ 编码（1006 SGR / 1005 UTF-8）**。
+/// 客户端 `scroll_wheel` 靠这两位分流；缺了就会滚本地 history，TUI 表现为「整个滚」。
+/// alacritty 里 tracking 三位互斥，只恢复实际置位的那一位。
 fn append_mode_restores(out: &mut Vec<u8>, mode: TermMode) {
     if mode.contains(TermMode::APP_CURSOR) {
         out.extend_from_slice(b"\x1b[?1h");
@@ -987,21 +1146,29 @@ fn append_mode_restores(out: &mut Vec<u8>, mode: TermMode) {
     if mode.contains(TermMode::BRACKETED_PASTE) {
         out.extend_from_slice(b"\x1b[?2004h");
     }
-    // 鼠标：按实际打开的子模式恢复（SGR 优先）
-    if mode.intersects(TermMode::MOUSE_MODE) {
-        if mode.contains(TermMode::SGR_MOUSE) {
-            out.extend_from_slice(b"\x1b[?1006h");
-        }
-        if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
-            out.extend_from_slice(b"\x1b[?1000h");
-        }
-        if mode.contains(TermMode::MOUSE_DRAG) {
-            out.extend_from_slice(b"\x1b[?1002h");
-        }
-        if mode.contains(TermMode::MOUSE_MOTION) {
-            out.extend_from_slice(b"\x1b[?1003h");
-        }
+
+    // 备用滚动（默认常开；若 TUI 显式关过，客户端默认仍是开，这里按守护实际对齐）
+    if mode.contains(TermMode::ALTERNATE_SCROLL) {
+        out.extend_from_slice(b"\x1b[?1007h");
+    } else {
+        out.extend_from_slice(b"\x1b[?1007l");
     }
+
+    // 鼠标：编码位 + tracking 位（「两位」）。顺序：先编码再 tracking（xterm 惯例）。
+    if mode.contains(TermMode::SGR_MOUSE) {
+        out.extend_from_slice(b"\x1b[?1006h");
+    } else if mode.contains(TermMode::UTF8_MOUSE) {
+        out.extend_from_slice(b"\x1b[?1005h");
+    }
+    // tracking 互斥：motion > drag > click，只发一位，避免后写的冲掉前写的
+    if mode.contains(TermMode::MOUSE_MOTION) {
+        out.extend_from_slice(b"\x1b[?1003h");
+    } else if mode.contains(TermMode::MOUSE_DRAG) {
+        out.extend_from_slice(b"\x1b[?1002h");
+    } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+        out.extend_from_slice(b"\x1b[?1000h");
+    }
+
     if mode.contains(TermMode::FOCUS_IN_OUT) {
         out.extend_from_slice(b"\x1b[?1004h");
     }
@@ -1469,6 +1636,122 @@ mod snapshot_tests {
         assert!(
             snap.windows(8).any(|w| w == b"\x1b[?2004h"),
             "开了 bracketed paste 的会话快照应恢复该模式"
+        );
+    }
+
+    /// reattach 后 TUI 滚轮靠客户端 Term 的 MOUSE_MODE + SGR：快照必须恢复这两位，
+    /// 否则 scroll_wheel 会误走本地 history / 方向键，表现为「整个滚」。
+    #[test]
+    fn snapshot_restores_mouse_report_modes_roundtrip() {
+        let size = DaemonTermSize { rows: 5, cols: 20 };
+        let mut term = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        // Claude Code 典型：备用屏 + SGR + cell motion（1002）或 all motion（1003）
+        parser.advance(
+            &mut term,
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006hhello",
+        );
+        assert!(
+            term.mode().intersects(TermMode::MOUSE_MODE),
+            "源 Term 应有鼠标上报: {:?}",
+            term.mode()
+        );
+        assert!(
+            term.mode().contains(TermMode::SGR_MOUSE),
+            "源 Term 应有 SGR 鼠标"
+        );
+
+        let snap = snapshot_ansi(&term);
+        let s = String::from_utf8_lossy(&snap);
+        assert!(
+            s.contains("\x1b[?1006h"),
+            "快照应含 SGR 鼠标恢复，got {s:?}"
+        );
+        // 互斥后只剩 DRAG(1002)；至少要有一种 tracking
+        let has_track = s.contains("\x1b[?1000h")
+            || s.contains("\x1b[?1002h")
+            || s.contains("\x1b[?1003h");
+        assert!(has_track, "快照应含鼠标 tracking 恢复，got {s:?}");
+
+        let mut client = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut p2: Processor = Processor::new();
+        p2.advance(&mut client, &snap);
+        assert!(
+            client.mode().intersects(TermMode::MOUSE_MODE),
+            "客户端重放后应恢复 MOUSE_MODE，mode={:?}",
+            client.mode()
+        );
+        assert!(
+            client.mode().contains(TermMode::SGR_MOUSE),
+            "客户端重放后应恢复 SGR_MOUSE，mode={:?}",
+            client.mode()
+        );
+        assert!(
+            client.mode().contains(TermMode::ALT_SCREEN),
+            "客户端应仍在备用屏"
+        );
+    }
+
+    #[test]
+    fn snapshot_restores_mouse_motion_only() {
+        // 只开 1003+1006（Claude / 部分 TUI 只开 motion）
+        let size = DaemonTermSize { rows: 4, cols: 16 };
+        let mut term = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"\x1b[?1049h\x1b[?1003h\x1b[?1006hx");
+        let snap = snapshot_ansi(&term);
+        // 鼠标 CSI 必须出现在快照**前部**（清屏之后、大段内容之前），
+        // 否则大快照灌完前滚轮会误判。
+        let s = String::from_utf8_lossy(&snap);
+        let i_sgr = s.find("\x1b[?1006h").expect("缺 SGR");
+        let i_motion = s.find("\x1b[?1003h").expect("缺 MOTION");
+        // 至少有一次出现在前 256 字节内（前缀区）
+        assert!(
+            i_sgr < 256 && i_motion < 256,
+            "鼠标模式应在快照前缀恢复，sgr@{i_sgr} motion@{i_motion}"
+        );
+
+        let mut client = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut p2: Processor = Processor::new();
+        p2.advance(&mut client, &snap);
+        assert!(
+            client.mode().contains(TermMode::MOUSE_MOTION),
+            "应恢复 MOTION，mode={:?}",
+            client.mode()
+        );
+        assert!(client.mode().contains(TermMode::SGR_MOUSE));
+    }
+
+    /// 前缀灌入一半就应已有鼠标模式（模拟「大快照还没传完用户就滚轮」）。
+    #[test]
+    fn snapshot_prefix_enables_mouse_before_full_feed() {
+        let size = DaemonTermSize { rows: 8, cols: 40 };
+        let mut term = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            b"\x1b[?1049h\x1b[?1002h\x1b[?1006h",
+        );
+        // 填一些行，让快照变长
+        for i in 0..20 {
+            parser.advance(&mut term, format!("line-{i:02}\r\n").as_bytes());
+        }
+        let snap = snapshot_ansi(&term);
+        assert!(snap.len() > 300, "快照应足够长以区分前缀/全文");
+
+        let mut client = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut p2: Processor = Processor::new();
+        // 只喂前 200 字节（前缀 + 部分内容）
+        let n = 200.min(snap.len());
+        p2.advance(&mut client, &snap[..n]);
+        assert!(
+            client.mode().intersects(TermMode::MOUSE_MODE),
+            "仅喂前缀就应有 MOUSE_MODE，mode={:?} n={n}",
+            client.mode()
+        );
+        assert!(
+            client.mode().contains(TermMode::SGR_MOUSE),
+            "仅喂前缀就应有 SGR_MOUSE"
         );
     }
 

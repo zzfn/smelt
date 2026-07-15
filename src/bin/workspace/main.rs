@@ -17,6 +17,7 @@ mod pet;
 mod session_history;
 mod settings;
 mod status_item;
+mod tasks;
 mod terminal;
 mod terminal_view;
 mod updater;
@@ -67,8 +68,12 @@ use settings::{
 };
 use usage_stats::format_count;
 
+
 // Cmd+Q 退出的应用级 action（gpui 无默认菜单栏，需自建菜单栏 + 键位绑定）。
-gpui::actions!(smelt, [Quit, OpenSettings, CheckForUpdate, SendSelectionToTerminal]);
+gpui::actions!(
+    smelt,
+    [Quit, OpenSettings, CheckForUpdate, SendSelectionToTerminal, NewTask]
+);
 
 /// 命令面板里的一个可执行动作。
 #[derive(Clone)]
@@ -185,10 +190,13 @@ impl ListDelegate for CmdDelegate {
     }
 }
 
-/// 主区视图：总览 / 终端 / 文件树 / Git / 热力图。
+/// 主区视图：会话总览 / 任务总览 / 终端 / 文件树 / Git / 热力图 / 历史。
+/// 任务总览与会话总览并列独立页，互不混内容；入口在侧栏「任务」。
 #[derive(Clone, Copy, PartialEq)]
 enum MainView {
     Overview,
+    /// 任务总览（卡片网格，对齐会话总览交互，内容只含任务）。
+    Tasks,
     Terminal,
     Files,
     Git,
@@ -776,6 +784,32 @@ struct Workspace {
     file_filter: Option<Entity<gpui_component::input::InputState>>,
     /// 过滤框的变更订阅（键入即重渲染）；随视图存活。
     _file_filter_sub: Option<Subscription>,
+    /// 总览任务区：标题 / prompt 输入（懒创建）。
+    task_title_input: Option<Entity<gpui_component::input::InputState>>,
+    task_body_input: Option<Entity<gpui_component::input::InputState>>,
+    /// 定时任务：执行时间输入（`YYYY-MM-DD HH:MM`，懒创建）。
+    task_run_at_input: Option<Entity<gpui_component::input::InputState>>,
+    /// 新建任务类型（普通 / 单次定时）。
+    task_kind: tasks::TaskKind,
+    /// 新建任务是否允许系统自动执行（任务级 `auto_run`；定时强制 true）。
+    task_auto_run: bool,
+    /// 任务列表选中项 id。
+    task_selected: Option<String>,
+    /// 新建任务绑定的项目 cwd。
+    task_bind_project: Option<String>,
+    /// 新建任务选用的 launch 命令（与设置页启动项 command 对齐）。
+    task_bind_launch: Option<String>,
+    /// 在已有终端执行：Some(smeltd session id)；None = 新开终端。
+    /// 由「终端/会话右键 → 新建任务」写入。
+    task_bind_session: Option<String>,
+    /// 任务总览状态筛选：None = 全部。
+    task_column_filter: Option<tasks::TaskColumn>,
+    /// 标题输入的 Enter 订阅（回车 = 创建并开跑）。
+    _task_title_sub: Option<Subscription>,
+    /// 新建任务弹窗（Cmd+Shift+N / 侧栏「新建任务」）。
+    show_new_task_modal: bool,
+    /// 定时任务扫描循环是否已启动（避免 render 重复 spawn）。
+    task_schedule_started: bool,
     /// 文件树搜索结果（文件名 + 文件内容）：后台遍历项目填充，render 只读。
     /// query 非空时左栏由树形切换为扁平命中列表。
     search_results: Option<SearchState>,
@@ -1020,6 +1054,19 @@ impl Workspace {
             file_tree_resize,
             file_filter: None,
             _file_filter_sub: None,
+            task_title_input: None,
+            task_body_input: None,
+            task_run_at_input: None,
+            task_kind: tasks::TaskKind::Once,
+            task_auto_run: true,
+            task_selected: None,
+            task_bind_project: None,
+            task_bind_launch: None,
+            task_bind_session: None,
+            task_column_filter: None,
+            _task_title_sub: None,
+            show_new_task_modal: false,
+            task_schedule_started: false,
             search_results: None,
             search_gen: 0,
             root_resize,
@@ -1500,8 +1547,8 @@ impl Workspace {
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.sessions.len() {
             self.active_session = ix;
-            // 从总览点会话 → 进入该会话的终端视图。
-            if self.view == MainView::Overview {
+            // 从会话总览 / 任务总览点会话 → 进入终端视图（否则主区仍停在总览页）。
+            if matches!(self.view, MainView::Overview | MainView::Tasks) {
                 self.view = MainView::Terminal;
             }
             // 切过去只是查看，不清「需要注意」——等用户实际输入回应了才清。
@@ -1906,13 +1953,76 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// 总览页：所有会话的卡片网格（状态徽章 + 任务名 + cwd + 窗格数），点击跳转。
-    fn render_overview(&mut self, cx: &mut Context<Self>) -> Div {
+    /// 总览页：会话态势监控（任务在左侧栏，不在此页）。
+    fn render_overview(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let (fg, muted, border) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground, t.border)
+        };
+
+        let need_attn = self
+            .sessions
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.status(cx),
+                    AgentStatus::WaitingApproval | AgentStatus::NeedsAttention
+                )
+            })
+            .count();
+
+        let header = div()
+            .px_5()
+            .pt_4()
+            .pb_2()
+            .border_b_1()
+            .border_color(border)
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_xl()
+                    .font_bold()
+                    .text_color(fg)
+                    .child("总览"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(if need_attn > 0 {
+                        format!("会话监控 · {need_attn} 需关注 · 点卡片进入终端")
+                    } else {
+                        format!("会话监控 · {} · 点卡片进入终端", self.sessions.len())
+                    }),
+            );
+
+        let body = self.render_overview_sessions(cx);
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id("overview-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_5()
+                    .child(body),
+            )
+    }
+
+    /// 会话监控网格。
+    fn render_overview_sessions(&mut self, cx: &mut Context<Self>) -> Div {
         let (fg, muted) = {
             let t = cx.theme();
             (t.foreground, t.muted_foreground)
         };
-        // 果冻感配色：柔和卡片底、细白边、状态色 + 半透明底做胶囊（统一 Hsla）。
         let card_bg = rgb(0x17181d);
         let card_border = rgba(0xffffff12);
         let soft_bg: Hsla = rgba(0xffffff0d).into();
@@ -1924,10 +2034,8 @@ impl Workspace {
         let blue_tint: Hsla = rgba(0x4a9eff22).into();
         let green_tint: Hsla = rgba(0x22c55e22).into();
         let amber_tint: Hsla = rgba(0xf59e0b22).into();
-        // 空闲态圆点：低调灰，不与「已完成」的绿抢注意力。
         let c_muted_dot: Hsla = rgba(0x8b93a7aa).into();
 
-        // 顶部汇总：标题 + 胶囊统计。「需要处理」= 等审批 + 一般注意。
         let statuses: Vec<AgentStatus> = self.sessions.iter().map(|s| s.status(cx)).collect();
         let need = statuses
             .iter()
@@ -1936,19 +2044,44 @@ impl Workspace {
         let running = statuses.iter().filter(|s| matches!(s, AgentStatus::Running)).count();
         let done = statuses.iter().filter(|s| matches!(s, AgentStatus::Done)).count();
         let pill = |text: String, color: Hsla, bg: Hsla| {
-            div().px(px(11.)).py(px(4.)).rounded_full().bg(bg).text_sm().text_color(color).child(text)
+            div()
+                .px(px(11.))
+                .py(px(4.))
+                .rounded_full()
+                .bg(bg)
+                .text_sm()
+                .text_color(color)
+                .child(text)
         };
+
         let summary = div()
             .flex()
             .items_center()
             .gap_2()
-            .child(div().text_xl().font_bold().text_color(fg).mr_2().child("总览"))
+            .flex_wrap()
+            .mb_4()
             .child(pill(format!("{} 会话", self.sessions.len()), fg, soft_bg))
             .child(pill(format!("{need} 需要处理"), c_red, red_tint))
             .child(pill(format!("{running} 运行中"), c_blue, blue_tint))
             .children((done > 0).then(|| pill(format!("{done} 已完成"), c_green, green_tint)));
 
-        // 按状态排序：等审批 > 需要处理 > 运行中 > 刚完成 > 空闲（同级保持原顺序）。
+        if self.sessions.is_empty() {
+            return div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .py_16()
+                .child(div().text_sm().text_color(muted).child("还没有会话"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("侧栏打开项目或「新建终端」后，状态会出现在这里"),
+                );
+        }
+
         let mut order: Vec<usize> = (0..self.sessions.len()).collect();
         order.sort_by_key(|&ix| match statuses[ix] {
             AgentStatus::WaitingApproval => 0,
@@ -1958,14 +2091,9 @@ impl Workspace {
             AgentStatus::Idle => 4,
         });
 
-        // 会话卡片。
         let cards: Vec<_> = order
             .into_iter()
             .map(|ix| {
-                // 会话卡片「运行了多久 / 当前 token 用量 / 最近工具调用」直接前移复用
-                // 历史会话页已有的扫描结果（ensure_session_list 有 10s 缓存，这里
-                // 只是触发+读缓存，不会每帧重新扫盘）——取该项目目录下最近活跃的
-                // 那份 transcript 当作"当前会话"的口径。
                 let cwd_opt = self.sessions[ix].cwd(cx);
                 if let Some(c) = cwd_opt.clone() {
                     self.ensure_session_list(c, cx);
@@ -2022,7 +2150,6 @@ impl Workspace {
                     .bg(card_bg)
                     .shadow_sm()
                     .cursor_pointer()
-                    // hover：边框亮起 + 抬起阴影 + 底色微亮，做出「果冻浮起」感。
                     .hover(|d| d.border_color(dot).shadow_lg().bg(rgb(0x1c1e24)))
                     .flex()
                     .flex_col()
@@ -2031,7 +2158,6 @@ impl Workspace {
                         MouseButton::Left,
                         cx.listener(move |this, _ev, window, cx| this.activate(ix, window, cx)),
                     )
-                    // 状态点 + 会话名（任务） + 最近时间
                     .child(
                         div()
                             .flex()
@@ -2052,7 +2178,6 @@ impl Workspace {
                                 div().text_xs().text_color(muted).flex_shrink_0().child(w)
                             })),
                     )
-                    // cwd + 状态 + 窗格数
                     .child(
                         div()
                             .flex()
@@ -2071,7 +2196,6 @@ impl Workspace {
                             .child(div().text_color(muted).child(cwd))
                             .child(div().text_color(muted).child(format!("· {panes} 窗格"))),
                     )
-                    // git 分支 + 改动数
                     .children(git.map(|(branch, changed)| {
                         div()
                             .flex()
@@ -2084,11 +2208,9 @@ impl Workspace {
                                 div().text_color(c_amber).child(format!("● {changed} 改动"))
                             }))
                     }))
-                    // 当前会话：跑了多久 / token 用量 / 最近工具调用
                     .children(live_line.map(|line| {
                         div().text_xs().text_color(muted).truncate().child(line)
                     }))
-                    // 需要处理时显示通知消息（红底胶囊，更醒目）
                     .children(notif.map(|m| {
                         div()
                             .px(px(8.))
@@ -2100,7 +2222,6 @@ impl Workspace {
                             .truncate()
                             .child(m)
                     }))
-                    // 迷你终端预览（末尾几行）
                     .children((!preview.is_empty()).then(|| {
                         div()
                             .p_2()
@@ -2122,18 +2243,11 @@ impl Workspace {
             })
             .collect();
 
-        div().flex_1().min_h_0().child(
-            div()
-                .id("overview-scroll")
-                .size_full()
-                .overflow_y_scroll()
-                .p_5()
-                .flex()
-                .flex_col()
-                .gap_5()
-                .child(summary)
-                .child(div().flex().flex_wrap().gap_4().children(cards)),
-        )
+        div()
+            .flex()
+            .flex_col()
+            .child(summary)
+            .child(div().flex().flex_wrap().gap_4().children(cards))
     }
 
     /// 弹窗遮罩 + 居中卡片壳：宽度 `width`，颜色取当前主题。`content` 是调用方已经
@@ -2600,7 +2714,7 @@ impl Render for Workspace {
                     AgentStatus::Done => ((0x22, 0xc5, 0x5e), "已完成"),
                     AgentStatus::Idle => ((0x8b, 0x93, 0xa7), "空闲"),
                 };
-                status_item::SessionEntry { title: self.sessions[ix].title(cx), status_text, color }
+                status_item::SessionEntry { session_ix: ix, title: self.sessions[ix].title(cx), status_text, color }
             })
             .collect();
         if self.status_menu_snapshot.as_ref() != Some(&menu_snapshot) {
@@ -2608,24 +2722,55 @@ impl Render for Workspace {
             self.status_menu_snapshot = Some(menu_snapshot);
         }
 
+        // 定时任务扫描：启动后约 2s 首扫，之后 30s 一轮；到期 → run_task。
+        if !self.task_schedule_started {
+            self.task_schedule_started = true;
+            cx.spawn_in(window, async move |this, cx| {
+                smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                loop {
+                    let alive = this
+                        .update_in(cx, |this, window, cx| {
+                            this.tick_scheduled_tasks(window, cx);
+                        })
+                        .is_ok();
+                    if !alive {
+                        break;
+                    }
+                    smol::Timer::after(std::time::Duration::from_secs(30)).await;
+                }
+            })
+            .detach();
+        }
+
         // 组件 toast：app 前台但没在看的 pane 有新通知时弹一条（右上角浮层，5s
         // 自动消失）。完全切到别的 app 时不弹 toast，走 terminal_view.rs 里的系统
         // 通知；正在看的那个 pane 直接吃掉待发消息，不弹——你自己看得见。
         // 每帧都要来取（不管是否前台），否则待发消息会一直攒着，等哪天恰好前台又
         // 不是当前 pane 时全冒出来。
+        // 同时捞「任务完成 → 自动续跑」挂旗（先收集再处理，避免 run 时改 sessions）。
         let window_active = window.is_window_active();
+        let mut task_continues: Vec<(String, String)> = Vec::new();
         for (ix, sess) in self.sessions.iter().enumerate() {
             let mut leaves = Vec::new();
             collect_leaves(&sess.layout, &mut leaves);
             let active_pane_id = sess.active.entity_id();
             for leaf in &leaves {
-                let toast = leaf.update(cx, |t, _cx| t.take_pending_toast());
+                let (toast, cont_cwd) = leaf.update(cx, |t, _cx| {
+                    (t.take_pending_toast(), t.take_pending_task_continue())
+                });
+                if let Some(cwd) = cont_cwd {
+                    let sid = leaf.read(cx).session_id().to_string();
+                    task_continues.push((sid, cwd));
+                }
                 let Some(msg) = toast else { continue };
                 let is_current_view = ix == active && leaf.entity_id() == active_pane_id;
                 if window_active && !is_current_view {
                     window.push_notification(Notification::info(msg), cx);
                 }
             }
+        }
+        for (sid, cwd) in task_continues {
+            self.on_session_task_idle(&sid, &cwd, window, cx);
         }
 
         // 侧栏项目分组：后台刷新每个会话 cwd 的仓库身份（是不是 worktree + 分支名），
@@ -2844,7 +2989,19 @@ impl Render for Workspace {
                                         .context_menu(move |menu, _window, _cx| {
                                             let e_pane_rename = e_pane_rename.clone();
                                             let rename_pane = rename_pane.clone();
-                                            menu.item(PopupMenuItem::new("重命名").on_click(
+                                            let e_task = e_pane_rename.clone();
+                                            let task_pane = rename_pane.clone();
+                                            menu.item(PopupMenuItem::new("新建任务").on_click(
+                                                move |_ev, window, cx| {
+                                                    let pane = task_pane.clone();
+                                                    e_task.update(cx, |ws, cx| {
+                                                        ws.open_new_task_for_terminal(
+                                                            &pane, window, cx,
+                                                        );
+                                                    });
+                                                },
+                                            ))
+                                            .item(PopupMenuItem::new("重命名").on_click(
                                                 move |_ev, window, cx| {
                                                     let target =
                                                         RenameTarget::Pane(rename_pane.clone());
@@ -2878,7 +3035,19 @@ impl Render for Workspace {
                             })
                             .context_menu(move |menu, _window, _cx| {
                                 let e_rename = e_rename.clone();
-                                menu.item(PopupMenuItem::new("重命名").on_click(
+                                let e_task = e_rename.clone();
+                                let sess_ix = ix;
+                                menu.item(PopupMenuItem::new("新建任务").on_click(
+                                    move |_ev, window, cx| {
+                                        e_task.update(cx, |ws, cx| {
+                                            if let Some(sess) = ws.sessions.get(sess_ix) {
+                                                let pane = sess.active.clone();
+                                                ws.open_new_task_for_terminal(&pane, window, cx);
+                                            }
+                                        });
+                                    },
+                                ))
+                                .item(PopupMenuItem::new("重命名").on_click(
                                     move |_ev, window, cx| {
                                         e_rename.update(cx, |ws, cx| {
                                             ws.start_rename(RenameTarget::Session(ix), window, cx)
@@ -3302,6 +3471,62 @@ impl Render for Workspace {
                     .render("sidebar-overview", window, cx),
                 ),
             )
+            .child({
+                // 侧栏「任务」：任务总览入口 + 执行中快捷项（新建在总览页顶栏 / 终端右键）
+                let e_task = this.clone();
+                let tasks_active = self.view == MainView::Tasks;
+                let mut task_items: Vec<SidebarMenuItem> = Vec::new();
+                {
+                    let e = e_task.clone();
+                    let e2 = e_task.clone();
+                    task_items.push(
+                        SidebarMenuItem::new("任务总览")
+                            .icon(IconName::Bot)
+                            .active(tasks_active)
+                            .on_click(move |_ev, window, cx| {
+                                e.update(cx, |ws, cx| {
+                                    ws.view = MainView::Tasks;
+                                    cx.notify();
+                                });
+                                let h = e2.read(cx).focus_handle.clone();
+                                window.focus(&h, cx);
+                            }),
+                    );
+                }
+                let mut listed = tasks::TaskStore::load().tasks;
+                listed.retain(|t| t.column.is_active());
+                listed.sort_by_key(|t| t.column.sidebar_rank());
+                for t in listed.into_iter().take(12) {
+                    let tid = t.id.clone();
+                    let e = e_task.clone();
+                    let e2 = e_task.clone();
+                    let title = t.title.clone();
+                    let st_color = rgb(t.column.color());
+                    let selected = self.task_selected.as_deref() == Some(tid.as_str())
+                        && self.view == MainView::Terminal;
+                    task_items.push(
+                        SidebarMenuItem::new(title)
+                            .icon(IconName::Bot)
+                            .active(selected)
+                            .on_click(move |_ev, window, cx| {
+                                let tid = tid.clone();
+                                e.update(cx, |ws, cx| {
+                                    ws.focus_or_run_task(&tid, window, cx);
+                                });
+                                let h = e2.read(cx).focus_handle.clone();
+                                window.focus(&h, cx);
+                            })
+                            .suffix(move |_w, _cx: &mut App| {
+                                div()
+                                    .size_2()
+                                    .rounded_full()
+                                    .bg(st_color)
+                                    .into_any_element()
+                            }),
+                    );
+                }
+                SidebarGroup::new("任务").child(SidebarMenu::new().children(task_items))
+            })
             .child(SidebarGroup::new("会话").child(SidebarMenu::new().children(menu_items)))
             // 不用 SidebarFooter：它会给整块 footer 挂 hover 背景（sidebar_accent），
             // 盖住按钮自己的 hover。直接放普通容器，让每个按钮各自 hover 可见。
@@ -3458,6 +3683,10 @@ impl Render for Workspace {
                 // 但下次新开窗口得回到外观页，不能停在「检查更新…」跳过去的那页。
                 this.settings_page_ix = SETTINGS_PAGE_APPEARANCE;
                 this.open_settings_window(cx);
+            }))
+            // Cmd+Shift+N：全局新建任务（侧栏任务列表 + 弹窗）。
+            .on_action(cx.listener(|this, _: &NewTask, window, cx| {
+                this.open_new_task_modal(window, cx);
             }))
             // 应用菜单「检查更新…」：顺手发起一次检查，再把设置窗口开到「更新」页看进度。
             .on_action(cx.listener(|this, _: &CheckForUpdate, window, cx| {
@@ -3718,7 +3947,7 @@ impl Render for Workspace {
                     .flex_col()
                     // 会话视图 tab（终端/文件树/Git）——总览是全局视图，走侧栏入口，不在这排里；
                     // 用量页已拆成独立窗口，不再是 self.view 的一种取值。
-                    .children((self.view != MainView::Overview)
+                    .children((!matches!(self.view, MainView::Overview | MainView::Tasks))
                         .then(|| {
                         TabBar::new("main-view-tabs")
                             .underline()
@@ -3760,7 +3989,8 @@ impl Render for Workspace {
                             .child(Tab::new().label("历史会话"))
                     }))
                     .child(match self.view {
-                        MainView::Overview => self.render_overview(cx),
+                        MainView::Overview => self.render_overview(window, cx),
+                        MainView::Tasks => self.render_tasks_page(window, cx),
                         MainView::Terminal => content,
                         MainView::Files => {
                             let cwd = self.cur().and_then(|s| s.cwd(cx));
@@ -3924,6 +4154,8 @@ impl Render for Workspace {
             .children(self.show_quit_confirm.then(|| self.render_quit_confirm(cx)))
             // 会话重命名拦截弹层
             .children(self.rename_target.is_some().then(|| self.render_rename_session(cx)))
+            // 新建任务弹窗
+            .children(self.show_new_task_modal.then(|| self.render_new_task_modal(cx)))
             // 新建 Worktree 拦截弹层
             .children(self.new_worktree_target.is_some().then(|| self.render_new_worktree_dialog(cx)))
             // 删除 Worktree 确认拦截弹层
@@ -4182,12 +4414,14 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("cmd-shift-n", NewTask, None),
             // 把 Tab/Shift-Tab 从 gpui-component Root 的全局焦点跳转手里要回来，
             // 终端聚焦时改发给 shell（见 terminal_view.rs 里 TerminalTab 的注释）。
             KeyBinding::new("tab", terminal_view::TerminalTab, Some("Terminal")),
             KeyBinding::new("shift-tab", terminal_view::TerminalBackTab, Some("Terminal")),
         ]);
         cx.set_menus(vec![Menu::new("Smelt").items([
+            MenuItem::action("新建任务…", NewTask),
             MenuItem::action("检查更新…", CheckForUpdate),
             MenuItem::Separator,
             MenuItem::action("设置…", OpenSettings),

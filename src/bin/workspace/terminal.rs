@@ -436,6 +436,9 @@ fn connect_daemon() -> std::io::Result<UnixStream> {
         use std::process::Stdio;
         let _ = std::process::Command::new(&daemon)
             .process_group(0)
+            // 由 GUI 拉起 → smeltd 继承登录会话、连得上 WindowServer，才允许它挂菜单栏
+            // 图标（见 smeltd.rs::menubar）。命令行直接跑 smeltd 时没这个 env，纯 headless。
+            .env("SMELT_MENUBAR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -780,6 +783,8 @@ pub struct Terminal {
     /// 那个「底部画不出来、一敲键盘/框选才好」的 bug。`bounded(1)` 天然合并突发：
     /// 空闲无输出＝无唤醒（保住 P0 那条空闲不重绘的优化），有输出才唤醒。
     redraw_rx: smol::channel::Receiver<()>,
+    /// 读线程 EOF/出错后置 true：无头任务 job 用来判定 oneshot 结束。
+    finished: Arc<AtomicBool>,
 }
 
 /// 新建/reattach 握手失败时的重试次数与间隔：守护无缝升级 exec 交接的一次性抖动是
@@ -862,6 +867,8 @@ impl Terminal {
         let mut reader = buffered;
         let term_reader = Arc::clone(&term);
         let notify_reader = notify.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_w = finished.clone();
         thread::spawn(move || {
             // Processor<T = StdSyncHandler>：默认类型参数不参与 ::new() 推断，需显式标注。
             let mut parser: Processor = Processor::new();
@@ -899,6 +906,7 @@ impl Terminal {
                     Err(_) => break,
                 }
             }
+            finished_w.store(true, Ordering::SeqCst);
             // 读线程退出（EOF/守护离线）：主动关掉发送端，让 UI 侧的 recv 任务收到
             // Err 而退出，不空转。
             drop(redraw_tx);
@@ -916,7 +924,14 @@ impl Terminal {
             search_matches: Mutex::new(Vec::new()),
             search_index: Mutex::new(0),
             redraw_rx,
+            finished,
         })
+    }
+
+    /// 读线程是否已结束（shell 退出或守护断连）。
+    #[allow(dead_code)]
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
     }
 
     /// 重绘唤醒的接收端（clone 一份给 UI 侧的 `cx.spawn` 任务 await）。见 `redraw_rx` 字段。
@@ -1975,6 +1990,7 @@ mod search_resync_tests {
                 let (_, rx) = smol::channel::bounded::<()>(1);
                 rx
             },
+            finished: Arc::new(AtomicBool::new(false)),
         }
     }
 

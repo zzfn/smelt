@@ -130,4 +130,6 @@ smelt 有意多做的、Zed 没有或不同的部分：
 ### smeltd reattach（会话持久化）
 
 - **✅ 完整**：常驻 `Term` + attach 吐 **history+可视区** ANSI 快照（软换行 / OSC 8 / 模式恢复）。
+- **✅ 鼠标上报两位**（tracking `1000/1002/1003` + 编码 `1006`/`1005`）：快照**前缀**即恢复，
+  末尾再写一次。缺了客户端 `scroll_wheel` 会误滚本地 history（「整个滚」）。
 - 可选：实机验收长 detach + TUI Ctrl+C；守护崩溃落盘。
