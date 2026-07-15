@@ -675,6 +675,76 @@ pub fn tunnel_status() -> TunnelStatus {
     TunnelStatus { running: v["running"].as_bool().unwrap_or(false), url: v["url"].as_str().map(String::from) }
 }
 
+// ===================== 状态通道（见 docs/state-channel-plan.md） =====================
+//
+// 这个模块本身不碰 GPUI（没有 gpui 依赖）；global/Entity 这些跟 UI 相关的东西留给
+// main.rs 处理，这里只管纯数据结构和阻塞的 socket 通信，跟文件里其它daemon 通信
+// 函数保持同一种分工。
+
+/// GUI 侧的 SessionState 镜像。字段名/含义必须跟 smeltd.rs 的 `SessionState`
+/// 一一对应（走 serde 反序列化，不是共享类型——两个 bin 没有共同的 lib crate）。
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct DaemonSessionState {
+    pub id: String,
+    pub cwd: Option<String>,
+    pub launch: Option<String>,
+    pub title: Option<String>,
+    pub phase: DaemonPhase,
+    pub phase_since: u64,
+    pub pending_question: Option<String>,
+    pub tokens_used: Option<u64>,
+    pub branch: Option<String>,
+    pub dirty_files: Vec<String>,
+    pub updated_at: u64,
+}
+
+/// 跟 smeltd.rs 的 `Phase` 对应，同样 `rename_all = "snake_case"`。
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonPhase {
+    Thinking,
+    ExecutingTool,
+    AwaitingApproval,
+    WaitingForUser,
+    #[default]
+    Idle,
+    Dead,
+}
+
+/// `subscribe` 连接推来的一行，两种形状（见 smeltd.rs 的 handle_subscribe/state op）。
+pub enum DaemonStateEvent {
+    /// 首帧：全量快照。
+    Snapshot(Vec<DaemonSessionState>),
+    /// 之后每次：单个会话的变化。
+    Update(DaemonSessionState),
+}
+
+/// 阻塞：连守护的 `subscribe`，逐行解析转发，直到连接断开（守护重启/没起来）才
+/// 返回。调用方负责重连（这个函数本身不重试，一次连接的生命周期而已）。
+pub fn subscribe_daemon_states_blocking(tx: &smol::channel::Sender<DaemonStateEvent>) {
+    let Ok(mut s) = UnixStream::connect(sock_path()) else { return };
+    if writeln!(s, "{}", serde_json::json!({ "op": "subscribe" })).is_err() {
+        return;
+    }
+    let reader = BufReader::new(s);
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if let Some(sessions) = v.get("sessions") {
+            if let Ok(list) = serde_json::from_value::<Vec<DaemonSessionState>>(sessions.clone()) {
+                if tx.try_send(DaemonStateEvent::Snapshot(list)).is_err() {
+                    return; // 接收端（GUI 那边的转发任务）没了，没必要继续读
+                }
+            }
+        } else if let Some(session) = v.get("session") {
+            if let Ok(state) = serde_json::from_value::<DaemonSessionState>(session.clone()) {
+                if tx.try_send(DaemonStateEvent::Update(state)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// alacritty Term 的统一配置（生产 spawn 与测试共用，防两边漂移）：
 /// - kitty_keyboard：默认 false 时 alacritty 会把 `CSI > 1 u` 静默丢掉
 ///   （push_keyboard_mode 里直接 return），DISAMBIGUATE_ESC_CODES 永远置不上，

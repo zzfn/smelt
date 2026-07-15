@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::*;
@@ -215,6 +216,22 @@ enum AgentStatus {
     Idle,
 }
 
+/// 守护上报的会话状态镜像（全局单例，跨窗口共享）。key = smeltd session id
+/// （每个 pane 一个，见 TerminalView.session_id——不是每个 GUI Session 一个）。
+/// 由 main.rs 启动时那条常驻 subscribe 转发任务维护，`Session::status`/`pane_status`
+/// 读它；daemon 没有对应 id 的数据（老版本守护/还没收到第一条上报）就退化到 OSC 猜测。
+#[derive(Clone, Default)]
+struct DaemonStates(Arc<Mutex<HashMap<String, terminal::DaemonSessionState>>>);
+
+impl Global for DaemonStates {}
+
+/// 取某个 pane 对应的守护状态；没有全局单例（比如极早期尚未走到注册那一步）或
+/// 那个 session id 还没有数据都返回 None。
+fn daemon_state_for(view: &Entity<TerminalView>, cx: &App) -> Option<terminal::DaemonSessionState> {
+    let id = view.read(cx).session_id().to_string();
+    cx.try_global::<DaemonStates>()?.0.lock().unwrap().get(&id).cloned()
+}
+
 /// 主区终端分屏布局树：叶子是一个终端，内部 Split 把区域按某轴切成多块。
 /// 每个 Split 各持一个 ResizableState 记住拖动比例；递归即可任意嵌套分屏。
 enum Pane {
@@ -344,9 +361,15 @@ impl Session {
     fn status(&self, cx: &App) -> AgentStatus {
         let mut v = Vec::new();
         collect_leaves(&self.layout, &mut v);
-        // 等审批（红）压过一般注意（橙）。
+        // 等审批（红）压过一般注意（橙）。daemon 说等审批是协议事实，优先于
+        // OSC 猜出来的 attention_kind。
         let mut attention = None;
         for t in &v {
+            if let Some(state) = daemon_state_for(t, cx) {
+                if state.phase == terminal::DaemonPhase::AwaitingApproval {
+                    return AgentStatus::WaitingApproval;
+                }
+            }
             match t.read(cx).attention_kind() {
                 Some(terminal_view::AttentionKind::Approval) => {
                     return AgentStatus::WaitingApproval
@@ -360,8 +383,16 @@ impl Session {
         if let Some(s) = attention {
             return s;
         }
-        // 活动终端标题以 Braille spinner（非空盲文块）开头 → 运行中。
-        if let Some(raw) = self.active.read(cx).agent_title() {
+        // 活动终端：daemon 说在跑（Thinking/ExecutingTool）比标题 spinner 猜测更可信；
+        // 没有 daemon 数据（老版本守护/还没收到第一条上报）才退化到猜。
+        if let Some(state) = daemon_state_for(&self.active, cx) {
+            if matches!(
+                state.phase,
+                terminal::DaemonPhase::Thinking | terminal::DaemonPhase::ExecutingTool
+            ) {
+                return AgentStatus::Running;
+            }
+        } else if let Some(raw) = self.active.read(cx).agent_title() {
             if crate::osc::title_starts_with_spinner(raw.trim_start()) {
                 return AgentStatus::Running;
             }
@@ -438,13 +469,26 @@ fn pane_title(view: &Entity<TerminalView>, cx: &App) -> String {
 /// 单个终端 pane 的状态：逻辑同 Session::status，但只看这一个 pane 自己
 /// （Session::status 是取会话内所有 pane 的最高态）。
 fn pane_status(view: &Entity<TerminalView>, cx: &App) -> AgentStatus {
+    let daemon_state = daemon_state_for(view, cx);
+    if let Some(state) = &daemon_state {
+        if state.phase == terminal::DaemonPhase::AwaitingApproval {
+            return AgentStatus::WaitingApproval;
+        }
+    }
     let t = view.read(cx);
     match t.attention_kind() {
         Some(terminal_view::AttentionKind::Approval) => return AgentStatus::WaitingApproval,
         Some(terminal_view::AttentionKind::Attention) => return AgentStatus::NeedsAttention,
         None => {}
     }
-    if let Some(raw) = t.agent_title() {
+    if let Some(state) = &daemon_state {
+        if matches!(
+            state.phase,
+            terminal::DaemonPhase::Thinking | terminal::DaemonPhase::ExecutingTool
+        ) {
+            return AgentStatus::Running;
+        }
+    } else if let Some(raw) = t.agent_title() {
         if crate::osc::title_starts_with_spinner(raw.trim_start()) {
             return AgentStatus::Running;
         }
@@ -4205,6 +4249,44 @@ fn main() {
         cx.set_global(pet::PetMailbox::default());
         cx.set_global(agent::load_llm_config());
         pet::open_pet_window(cx);
+
+        // 状态通道：常驻订阅守护的 subscribe，维护 DaemonStates 全局单例，
+        // Session::status/pane_status 靠它把"猜"换成"读事实"（见
+        // docs/state-channel-plan.md）。阻塞的 socket 读循环放专门的 OS 线程，
+        // 断线/守护没起来就等一下重连；smol::channel 两头都能用（OS 线程用
+        // try_send，GPUI 任务用 async recv），跟 terminal.rs 的 redraw_tx/rx
+        // 是同一个搭桥模式。
+        let daemon_states = DaemonStates::default();
+        cx.set_global(daemon_states.clone());
+        let (daemon_state_tx, daemon_state_rx) =
+            smol::channel::unbounded::<terminal::DaemonStateEvent>();
+        thread::spawn(move || loop {
+            terminal::subscribe_daemon_states_blocking(&daemon_state_tx);
+            thread::sleep(Duration::from_secs(2)); // 断线/连不上，等一下重试
+        });
+        cx.spawn(async move |cx| {
+            while let Ok(event) = daemon_state_rx.recv().await {
+                let _ = cx.update(|cx| {
+                    let states = cx.global::<DaemonStates>().0.clone();
+                    {
+                        let mut map = states.lock().unwrap();
+                        match event {
+                            terminal::DaemonStateEvent::Snapshot(list) => {
+                                map.clear();
+                                for s in list {
+                                    map.insert(s.id.clone(), s);
+                                }
+                            }
+                            terminal::DaemonStateEvent::Update(s) => {
+                                map.insert(s.id.clone(), s);
+                            }
+                        }
+                    }
+                    cx.refresh_windows(); // 状态点跟着这次变化重绘
+                });
+            }
+        })
+        .detach();
 
         // 远程操作网关：只记「用户上次希望它开着」这个开关；真去问/让守护开的部分
         // 扔进后台任务——涉及连 unix socket、可能要等守护自己起来（最坏几秒），
