@@ -773,6 +773,13 @@ pub struct Terminal {
     search_matches: Mutex<Vec<(Point, Point)>>,
     /// 当前命中在 `search_matches` 里的下标。
     search_index: Mutex<usize>,
+    /// 重绘唤醒（Zed 式事件驱动）：读线程每喂完一批字节就 `try_send(())`，UI 侧
+    /// 一个 `cx.spawn` 任务 `recv().await` 后 `cx.notify()`。这样「喂内容」与「触发
+    /// 重绘」是同一个动作，不再依赖 30ms 轮询去 `take_damage()` 事后发现——reattach
+    /// 后 agent 空闲、只有唯一一次输出时，轮询的时序/过滤一旦漏掉就永久停帧，正是
+    /// 那个「底部画不出来、一敲键盘/框选才好」的 bug。`bounded(1)` 天然合并突发：
+    /// 空闲无输出＝无唤醒（保住 P0 那条空闲不重绘的优化），有输出才唤醒。
+    redraw_rx: smol::channel::Receiver<()>,
 }
 
 /// 新建/reattach 握手失败时的重试次数与间隔：守护无缝升级 exec 交接的一次性抖动是
@@ -848,6 +855,10 @@ impl Terminal {
         // 3) 后台读线程：守护转发的 PTY 字节 → vte 解析更新 Term 网格 + 扫 OSC 9/777。
         //    EOF = shell 退出或守护离线（网格冻结，重开会话即恢复）。
         //    复用尺寸行的 BufReader：重放字节可能已在其内部缓冲里。
+        // 重绘唤醒通道：读线程 → UI。bounded(1) 合并突发（已有待处理唤醒时后续 try_send
+        // 直接丢弃，不堆积）。见 Terminal::redraw_rx 字段注释。
+        let (redraw_tx, redraw_rx) = smol::channel::bounded::<()>(1);
+
         let mut reader = buffered;
         let term_reader = Arc::clone(&term);
         let notify_reader = notify.clone();
@@ -879,10 +890,18 @@ impl Terminal {
                         if let Ok(mut term) = term_reader.lock() {
                             parser.advance(&mut *term, &buf[..n]);
                         }
+                        // 喂完这批立刻请求一次重绘（Zed 式：内容生产者驱动重绘）。
+                        // bounded(1) + try_send：已有待处理唤醒就丢弃，天然合并。
+                        // 关键性质：最后一批喂完后必有一次待处理唤醒 → UI 必定再画一帧，
+                        // 与 reattach 快照喂完这个场景精确对应。
+                        let _ = redraw_tx.try_send(());
                     }
                     Err(_) => break,
                 }
             }
+            // 读线程退出（EOF/守护离线）：主动关掉发送端，让 UI 侧的 recv 任务收到
+            // Err 而退出，不空转。
+            drop(redraw_tx);
         });
 
         Ok(Self {
@@ -896,7 +915,13 @@ impl Terminal {
             search_query: Mutex::new(String::new()),
             search_matches: Mutex::new(Vec::new()),
             search_index: Mutex::new(0),
+            redraw_rx,
         })
+    }
+
+    /// 重绘唤醒的接收端（clone 一份给 UI 侧的 `cx.spawn` 任务 await）。见 `redraw_rx` 字段。
+    pub fn redraw_channel(&self) -> smol::channel::Receiver<()> {
+        self.redraw_rx.clone()
     }
 
     /// 一次性握手：连守护 + 声明会话 + 读首行尺寸 + 重放字节数，不重试（重试策略在
@@ -1298,7 +1323,10 @@ impl Terminal {
                 buf.extend_from_slice(seq);
             }
             self.send_input(&buf);
-        } else if let Ok(mut term) = self.term.lock() {
+        } else {
+            // 不用 if-let 挂 lock()：Edition 2024 下 if-let 临时值 drop 更早，
+            // 与 MutexGuard 同句时语义含糊；拆成块内绑定更清晰。
+            let Ok(mut term) = self.term.lock() else { return };
             term.scroll_display(Scroll::Delta(lines));
         }
     }
@@ -1942,6 +1970,11 @@ mod search_resync_tests {
             search_query: Mutex::new(String::new()),
             search_matches: Mutex::new(Vec::new()),
             search_index: Mutex::new(0),
+            // 测试不驱动 UI 重绘，给一个即时关闭的通道占位即可。
+            redraw_rx: {
+                let (_, rx) = smol::channel::bounded::<()>(1);
+                rx
+            },
         }
     }
 

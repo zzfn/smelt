@@ -482,7 +482,7 @@ impl PetView {
             return;
         }
         self.req_gen += 1;
-        let gen = self.req_gen;
+        let r#gen = self.req_gen;
         self.say("…"); // 思考中
         cx.spawn(async move |this, cx| {
             // 网络请求放后台执行器，别卡 UI。注意：reqwest 依赖 tokio 运行时，而 GPUI 的
@@ -498,7 +498,7 @@ impl PetView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.req_gen != gen {
+                if this.req_gen != r#gen {
                     return; // 已有更新的请求，丢弃这次
                 }
                 match reply {

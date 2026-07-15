@@ -653,7 +653,7 @@ impl Workspace {
     /// （解析期间又点了别的会话）。
     pub fn open_session_detail(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
         self.session_detail_gen = self.session_detail_gen.wrapping_add(1);
-        let gen = self.session_detail_gen;
+        let r#gen = self.session_detail_gen;
         self.session_detail = None;
         cx.notify();
 
@@ -662,7 +662,7 @@ impl Workspace {
             let detail =
                 cx.background_executor().spawn(async move { load_session_detail(&p) }).await;
             let _ = this.update(cx, |this, cx| {
-                if this.session_detail_gen != gen {
+                if this.session_detail_gen != r#gen {
                     return;
                 }
                 if let Some(detail) = detail {
@@ -747,10 +747,15 @@ mod tests {
         );
 
         let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        // Edition 2024：`set_var` 为 unsafe；测试串行跑、且只改本进程 HOME。
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
         let sessions = list_sessions("/x/y");
         if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
         }
         std::fs::remove_dir_all(&tmp).unwrap();
 

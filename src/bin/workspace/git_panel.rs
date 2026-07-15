@@ -1676,7 +1676,7 @@ impl Workspace {
     /// 跑 git + 着色放后台，用 file_gen 丢弃过期结果。
     pub fn open_diff(&mut self, root: String, path: String, untracked: bool, cx: &mut Context<Self>) {
         self.diff_gen = self.diff_gen.wrapping_add(1);
-        let gen = self.diff_gen;
+        let r#gen = self.diff_gen;
         self.git_diff = Some(GitDiff { path: path.clone(), lines: Rc::new(Vec::new()) });
         self.diff_selected.clear(); // 换文件/重开 diff：旧的行选区不再对应新内容
         cx.notify();
@@ -1704,7 +1704,7 @@ impl Workspace {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.diff_gen == gen {
+                if this.diff_gen == r#gen {
                     this.git_diff = Some(GitDiff { path, lines: Rc::new(lines) });
                     cx.notify();
                 }

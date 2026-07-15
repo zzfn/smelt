@@ -215,7 +215,9 @@ fn main() {
     // 无缝升级交接：上一代进程 exec 本二进制前写好交接文件并把路径放在环境变量里。
     // 立即摘掉环境变量：它只对"本次 exec 交接"有意义，不能传染给之后 spawn 的 shell。
     let handoff = std::env::var("SMELTD_HANDOFF").ok();
-    std::env::remove_var("SMELTD_HANDOFF");
+    // Edition 2024：`remove_var` 标为 unsafe（多线程改 env 非同步）。
+    // 此处在 main 最开头、尚未 spawn 任何线程，单线程访问安全。
+    unsafe { std::env::remove_var("SMELTD_HANDOFF") };
     let came_from_handoff = handoff.is_some();
 
     let path = sock_path();
@@ -1237,6 +1239,155 @@ mod snapshot_tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// 把整个网格（含 history）逐格 dump 成文本行——`\0`（宽字符占位格）画成 `·`，
+    /// 好让 assert 失败时能一眼看出「哪一列开始错位」。
+    fn grid_dump(term: &Term<VoidListener>) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut line = term.topmost_line();
+        let bottom = term.bottommost_line();
+        while line <= bottom {
+            let mut s = String::new();
+            for col in 0..term.columns() {
+                let c = term.grid()[line][Column(col)].c;
+                s.push(if c == '\0' { '·' } else { c });
+            }
+            rows.push(s);
+            line += 1;
+        }
+        rows
+    }
+
+    /// 逐格 dump **颜色与属性**——`grid_dump` 只比字符，颜色错了它一无所知（真实的
+    /// reattach bug 正是「字符都在、前景色被恢复成不可见」，字符级对比全绿）。
+    /// 只 dump 非空格单元，输出紧凑，assert 失败时能直接看出哪个格子的 fg/bg 变了。
+    fn attr_dump(term: &Term<VoidListener>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut line = term.topmost_line();
+        let bottom = term.bottommost_line();
+        while line <= bottom {
+            for col in 0..term.columns() {
+                let cell = &term.grid()[line][Column(col)];
+                if cell.c == ' ' || cell.c == '\0' {
+                    continue; // 空白格的前景色无所谓
+                }
+                out.push(format!(
+                    "({},{}) {:?} fg={:?} bg={:?} flags={:?}",
+                    line.0, col, cell.c, cell.fg, cell.bg, cell.flags
+                ));
+            }
+            line += 1;
+        }
+        out
+    }
+
+    /// 快照的根本契约：**重放后的网格必须和原网格逐格相同**。
+    /// 比「快照里含某段文本」强得多——丢格、列错位、行粘连都能抓到。
+    fn assert_roundtrip(rows: usize, cols: usize, input: &str, what: &str) {
+        let size = DaemonTermSize { rows, cols };
+        let mut a = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut pa: Processor = Processor::new();
+        pa.advance(&mut a, input.as_bytes());
+
+        let snap = snapshot_ansi(&a);
+
+        let mut b = Term::new(daemon_term_config(), &size, VoidListener);
+        let mut pb: Processor = Processor::new();
+        pb.advance(&mut b, &snap);
+
+        // 颜色/属性必须也一致——真实 bug 就藏在这里，字符级对比看不见。
+        let (want_attr, got_attr) = (attr_dump(&a), attr_dump(&b));
+        assert_eq!(
+            want_attr,
+            got_attr,
+            "\n{what}：快照重放后**颜色/属性**错了（字符可能都还在）\n快照字节: {:?}\n",
+            String::from_utf8_lossy(&snap)
+        );
+
+        let (want, got) = (grid_dump(&a), grid_dump(&b));
+        assert_eq!(
+            want,
+            got,
+            "\n{what}：快照重放后网格错位\n原始:\n{}\n重放:\n{}\n快照字节: {:?}",
+            want.join("\n"),
+            got.join("\n"),
+            String::from_utf8_lossy(&snap)
+        );
+    }
+
+    /// 行尾放不下宽字符：alacritty 在最后一列填 LEADING_WIDE_CHAR_SPACER，宽字符挪到下一行。
+    /// 快照 `continue` 跳过这个占位格 → 该行只吐 cols-1 个字符 → 不触发自动折行。
+    #[test]
+    fn roundtrip_wide_char_at_line_end() {
+        assert_roundtrip(4, 8, "abcdefg中x", "行尾宽字符占位格");
+    }
+
+    /// 类 Claude Code 底部状态栏：整行背景色铺满 + 中文 + 边框字形（重启后错位的就是这片）。
+    #[test]
+    fn roundtrip_status_bar_like() {
+        assert_roundtrip(
+            6,
+            40,
+            "\x1b[44m current  6%  5:30am │ weekly  48% \x1b[0m\r\n\
+             \x1b[2m ctx:18% │ cache:100% │ 检查当前模型 \x1b[0m\r\n> ",
+            "状态栏（背景色 + 中文 + 竖线）",
+        );
+    }
+
+    /// 满行（写满最后一列）后跟硬换行：pending-wrap 状态处理错就会多吞/多吐一行。
+    #[test]
+    fn roundtrip_full_width_row_then_newline() {
+        assert_roundtrip(4, 6, "abcdef\r\nxy", "满行 + 硬换行");
+    }
+
+    /// 中文占满整行（每字 2 列，正好铺满）。
+    #[test]
+    fn roundtrip_cjk_fills_row() {
+        assert_roundtrip(4, 6, "中文字\r\nab", "中文铺满行");
+    }
+
+    /// SGR 2（DIM）——Claude Code 状态栏的灰字大量用它。怀疑对象 #1。
+    #[test]
+    fn roundtrip_sgr_dim() {
+        assert_roundtrip(3, 20, "\x1b[2mdim gray\x1b[0m ok", "DIM 灰字");
+    }
+
+    /// DIM + 前景色组合（暗绿等）。
+    #[test]
+    fn roundtrip_sgr_dim_with_color() {
+        assert_roundtrip(3, 20, "\x1b[2;32mdimgreen\x1b[0m ok", "DIM + 绿");
+    }
+
+    /// bright black（90）——另一种常见灰。
+    #[test]
+    fn roundtrip_sgr_bright_black() {
+        assert_roundtrip(3, 20, "\x1b[90mgray\x1b[0m ok", "bright black 灰");
+    }
+
+    /// 256 色前景（38;5;244 = 中灰）。
+    #[test]
+    fn roundtrip_sgr_256color() {
+        assert_roundtrip(3, 20, "\x1b[38;5;244mgray\x1b[0m ok", "256 色灰");
+    }
+
+    /// 24-bit 真彩前景。
+    #[test]
+    fn roundtrip_sgr_truecolor() {
+        assert_roundtrip(3, 20, "\x1b[38;2;136;136;136mgray\x1b[0m ok", "真彩灰");
+    }
+
+    /// 状态栏全家桶：灰边框 + DIM + 绿数字 + 中文，一行内多次切色。
+    #[test]
+    fn roundtrip_sgr_status_bar_mix() {
+        assert_roundtrip(
+            4,
+            60,
+            "\x1b[2m────\x1b[0m\r\n\
+             \x1b[2m ctx:\x1b[0m\x1b[32m18%\x1b[0m \x1b[2m│ cache:\x1b[0m\x1b[32m100%\x1b[0m\r\n\
+             \x1b[90m current \x1b[0m\x1b[92m11%\x1b[0m \x1b[2m检查模型\x1b[0m",
+            "状态栏多色混排",
+        );
     }
 
     #[test]

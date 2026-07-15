@@ -277,6 +277,8 @@ impl TerminalView {
     ) -> Self {
         let terminal = Terminal::spawn(24, 80, cwd.as_deref(), &session_id, launch)
             .expect("启动内嵌终端失败");
+        // Zed 式事件驱动重绘：读线程一有新内容就唤醒这里 cx.notify()（见 drive_redraws）。
+        Self::drive_redraws(terminal.redraw_channel(), cx);
         let launch_kind = classify_launch(launch);
         let launch_label = launch_label
             .map(str::trim)
@@ -349,6 +351,9 @@ impl TerminalView {
                 // 外观设置（背景色/图/透明度/模糊）单独比较，因为这些跟 PTY 内容无关、
                 // damage tracking 感知不到。拖选高亮 / Cmd 悬停链接不受影响：它们各自
                 // 的鼠标事件处理里已经各自调用过 cx.notify()，跟这里无关。
+                // 注：内容变化的重绘现在主要由事件驱动任务（drive_redraws）负责——读线程
+                // 一有输出就唤醒；这里的 content_changed 仍保留，一是驱动外观变化的重绘，
+                // 二是作内容重绘的兜底（万一 channel 那条漏了，轮询还能兜住）。
                 let content_changed = this.terminal.take_damage();
                 let ap_now = cx.global::<crate::Appearance>().clone();
                 let ap_changed = match &this.last_appearance {
@@ -445,6 +450,19 @@ impl TerminalView {
         &self.session_id
     }
 
+    /// 驱动重绘的常驻任务：await 读线程的唤醒 → `cx.notify()`。内容一到就画，
+    /// 不靠轮询。读线程退出（发送端 drop）时 recv 返回 Err，任务随之结束。
+    fn drive_redraws(rx: smol::channel::Receiver<()>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            while rx.recv().await.is_ok() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break; // 视图已销毁
+                }
+            }
+        })
+        .detach();
+    }
+
     /// 守护整个重启后（旧会话随守护进程一起死掉，见 `terminal::restart_daemon`），
     /// 换一个全新会话顶替冻结的旧连接——同 id 在全新守护里查无此会话，走 `handle_open`
     /// 的新建分支，等效于重开一个终端。旧网格尺寸不丢：grid_size 仍是上次量到的值，
@@ -456,6 +474,9 @@ impl TerminalView {
             return;
         };
         self.terminal = terminal;
+        // 旧 Terminal 一 drop，它读线程的发送端随之关闭，老的 redraw 任务 recv 到 Err
+        // 自行退出；这里给新连接挂一个新的重绘任务。
+        Self::drive_redraws(self.terminal.redraw_channel(), cx);
         self.notification = None;
         self.notified_at = None;
         self.was_running = false;
@@ -1423,7 +1444,7 @@ impl TerminalView {
         &self,
         info: terminal::ScrollInfo,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let (_, h) = self.grid_size.get();
         let track_h = (h - 2.0 * PAD_Y).max(1.0);
         let (thumb_h, thumb_y) =

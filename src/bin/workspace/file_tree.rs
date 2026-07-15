@@ -905,7 +905,7 @@ impl Workspace {
         self.view = crate::MainView::Files;
 
         self.file_gen = self.file_gen.wrapping_add(1);
-        let gen = self.file_gen;
+        let r#gen = self.file_gen;
 
         let language = editor_language_for_path(&path);
         let editor = cx.new(|cx| {
@@ -933,7 +933,7 @@ impl Workspace {
             let read = cx.background_executor().spawn(async move { std::fs::read_to_string(&p) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 // 只有当前仍是这次打开的文件才写入，避免旧任务覆盖新文件。
-                if this.file_gen != gen {
+                if this.file_gen != r#gen {
                     return;
                 }
                 let Some(of) = this.open_file.as_mut() else { return };
@@ -989,7 +989,7 @@ impl Workspace {
         // Rc<String> 不是 Send，进不了 background_executor；克隆成普通 String 再带过去。
         let expected_on_disk = (*of.saved_content).clone();
         let force = of.conflict_pending;
-        let gen = self.file_gen;
+        let r#gen = self.file_gen;
 
         cx.spawn(async move |this, cx| {
             let check_path = path.clone();
@@ -1011,7 +1011,7 @@ impl Workspace {
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.file_gen != gen {
+                if this.file_gen != r#gen {
                     return; // 写盘期间又切了别的文件，这次结果不再相关
                 }
                 let switch_target = this.pending_switch_after_save.take();
@@ -1047,7 +1047,7 @@ impl Workspace {
             return;
         }
         self.search_gen = self.search_gen.wrapping_add(1);
-        let gen = self.search_gen;
+        let r#gen = self.search_gen;
         // 先占位：done=false 让列表顶部显示「搜索中…」，遍历完成后替换。
         self.search_results = Some(SearchState {
             query: query.clone(),
@@ -1065,7 +1065,7 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // 只有仍是最新一次搜索才写入，丢弃期间被新查询取代的过期结果。
-                if this.search_gen == gen {
+                if this.search_gen == r#gen {
                     this.search_results = Some(SearchState {
                         query,
                         done: true,
