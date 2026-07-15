@@ -29,6 +29,8 @@
 //!                                                              把远程网关暴露到公网（见下「Cloudflare Tunnel」）
 //!   {"op":"tunnel_stop"}                                     → 回 {"ok":true} 后关闭
 //!   {"op":"tunnel_status"}                                   → 回 {"running":bool,"url":".."} 后关闭
+//!   {"op":"state","id":"..","phase":"..","question":".."}    → 回 {"ok":true} 后关闭，hook 直写（见下
+//!                                                              「状态通道」），question 可省
 //!
 //! 流模式：
 //!   守护 → 客户端：先发 JSON 尺寸行（含 replay_len=快照字节数）→ ANSI 网格快照
@@ -216,7 +218,7 @@ struct SessionState {
     updated_at: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Phase {
     Thinking,
@@ -228,34 +230,50 @@ enum Phase {
     Dead,
 }
 
+/// `subscribe` 连接的全局池——状态订阅是「一条连接看全部会话」，不像 `watch`
+/// 那样挂在单个 Session 底下（见 docs/state-channel-plan.md 的 subscribe 设计）。
+type Subscribers = Arc<Mutex<Vec<UnixStream>>>;
+
+/// 状态变化推给所有订阅者；写失败（已断线）的连接直接摘掉，跟 watchers 的
+/// 惰性清理是同一个模式。
+fn broadcast_state(subscribers: &Subscribers, state: &SessionState) {
+    let payload = serde_json::json!({ "session": state }).to_string();
+    subscribers.lock().unwrap().retain_mut(|s| writeln!(s, "{payload}").is_ok());
+}
+
 /// 常驻 Term 的事件监听：接住 alacritty 解析出的 `Event::Title`/`Event::Bell`，
-/// 写进共享的 `SessionState`。**只在这里猜 phase**（OSC 0/2 标题 spinner，最低
-/// 可信度信源）——Task 8 的 hook `state` op 是协议事实，之后接进来的写入应该
-/// 覆盖这里猜出来的值；这条 listener 因此保守地只在检测到 spinner 时置
-/// `Thinking`，标题不是 spinner 时**不**反过来猜别的 phase（缺乏证据不代表
-/// idle，瞎猜比不猜更容易把 hook 刚写好的准确状态带偏）。
+/// 写进共享的 `SessionState`，顺带广播给所有 `subscribe` 连接。**只在这里猜
+/// phase**（OSC 0/2 标题 spinner，最低可信度信源）——`state` op 是协议事实，
+/// 之后接进来的写入应该覆盖这里猜出来的值；这条 listener 因此保守地只在检测到
+/// spinner 时置 `Thinking`，标题不是 spinner 时**不**反过来猜别的 phase（缺乏
+/// 证据不代表 idle，瞎猜比不猜更容易把 hook 刚写好的准确状态带偏）。
 #[derive(Clone)]
 struct StateListener {
     state: Arc<Mutex<SessionState>>,
+    subscribers: Subscribers,
 }
 
 impl EventListener for StateListener {
     fn send_event(&self, event: Event) {
-        let Ok(mut st) = self.state.lock() else { return };
-        match event {
-            Event::Title(t) => {
-                if osc::title_starts_with_spinner(t.trim_start()) {
-                    st.phase = Phase::Thinking;
-                    st.phase_since = now_unix();
+        let snapshot = {
+            let Ok(mut st) = self.state.lock() else { return };
+            match event {
+                Event::Title(t) => {
+                    if osc::title_starts_with_spinner(t.trim_start()) {
+                        st.phase = Phase::Thinking;
+                        st.phase_since = now_unix();
+                    }
+                    st.title = Some(t);
+                    st.updated_at = now_unix();
                 }
-                st.title = Some(t);
-                st.updated_at = now_unix();
+                Event::Bell => {
+                    st.updated_at = now_unix();
+                }
+                _ => return,
             }
-            Event::Bell => {
-                st.updated_at = now_unix();
-            }
-            _ => {}
-        }
+            st.clone()
+        };
+        broadcast_state(&self.subscribers, &snapshot);
     }
 }
 
@@ -348,9 +366,6 @@ struct Session {
     /// 结构化状态（见 SessionState）。跟 `term` 的监听器共用同一个 Arc，
     /// `state` op（hook 直写）和 `subscribe` 的转发都读/改这一份。
     state: Arc<Mutex<SessionState>>,
-    /// `subscribe` 连接：状态变化时逐个推一行 JSON。跟 watch/client 是完全独立的
-    /// 连接池——一个是字节流，这个是状态流，互不干扰。
-    subscribers: Mutex<Vec<UnixStream>>,
 }
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
@@ -579,7 +594,11 @@ fn main() {
     let came_from_handoff = handoff.is_some();
 
     let path = sock_path();
-    let (listener, sessions) = match handoff.and_then(|p| resume_handoff(&p)) {
+    // 不参与无缝升级交接：每次进程启动（含 upgrade 后的新进程）都是全新的空列表——
+    // subscribe 连接是网络层面的东西，跟 out.client/watchers 一样没必要假装还在。
+    // 建在 resume_handoff 之前：交接恢复的会话也需要一份 Subscribers 去广播状态。
+    let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+    let (listener, sessions) = match handoff.and_then(|p| resume_handoff(&p, &subscribers)) {
         Some(x) => x,
         None => {
             // 单实例检查只在「不是从交接来的」这条路径上做：能连上说明已有活守护，
@@ -618,7 +637,10 @@ fn main() {
         let sessions = Arc::clone(&sessions);
         let remote_state = Arc::clone(&remote_state);
         let tunnel_state = Arc::clone(&tunnel_state);
-        thread::spawn(move || handle_conn(conn, sessions, exe_mtime, listen_fd, remote_state, tunnel_state));
+        let subscribers = Arc::clone(&subscribers);
+        thread::spawn(move || {
+            handle_conn(conn, sessions, exe_mtime, listen_fd, remote_state, tunnel_state, subscribers)
+        });
     }
 }
 
@@ -630,7 +652,7 @@ fn handoff_path() -> std::path::PathBuf {
 /// 从交接文件恢复：认领监听 socket 和各会话的 PTY master fd，重建会话表 + 泵线程。
 /// 任何全局性错误（文件读不到/解析失败/监听 fd 无效）返回 None 走全新启动——会话
 /// 保不住但守护必须活着；单个会话的 fd 坏了只跳过那一个。
-fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
+fn resume_handoff(path: &str, subscribers: &Subscribers) -> Option<(UnixListener, Sessions)> {
     let data = std::fs::read_to_string(path).ok()?;
     let _ = std::fs::remove_file(path); // 读到手就删，避免残留被下次启动误认
     let v: serde_json::Value = serde_json::from_str(&data).ok()?;
@@ -684,7 +706,8 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
             ..Default::default()
         }));
         // 尽量用交接带来的字节重建 Term（可能腰斩，仅 best-effort）；jolt 会让 TUI 再刷。
-        let mut term = new_daemon_term(rows, cols, StateListener { state: Arc::clone(&state) });
+        let listener = StateListener { state: Arc::clone(&state), subscribers: Arc::clone(subscribers) };
+        let mut term = new_daemon_term(rows, cols, listener);
         if !buf.is_empty() {
             feed_term(&mut term, &buf);
         }
@@ -706,7 +729,6 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
             }),
             term: Mutex::new(term),
             state,
-            subscribers: Mutex::new(Vec::new()),
         });
         sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&sess));
         start_pty_pump(sess, Box::new(reader), id.to_string(), Arc::clone(&sessions));
@@ -812,11 +834,15 @@ mod tunnel_tests {
 mod state_listener_tests {
     use super::*;
 
+    fn no_subscribers() -> Subscribers {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
     /// 标题以 spinner 开头 → 认定 Thinking，且更新 phase_since；标题本身也要存。
     #[test]
     fn title_with_spinner_sets_thinking_phase() {
         let state = Arc::new(Mutex::new(SessionState::default()));
-        let listener = StateListener { state: Arc::clone(&state) };
+        let listener = StateListener { state: Arc::clone(&state), subscribers: no_subscribers() };
         listener.send_event(Event::Title("⠋ doing work".to_string()));
 
         let st = state.lock().unwrap();
@@ -833,7 +859,7 @@ mod state_listener_tests {
             phase: Phase::AwaitingApproval,
             ..Default::default()
         }));
-        let listener = StateListener { state: Arc::clone(&state) };
+        let listener = StateListener { state: Arc::clone(&state), subscribers: no_subscribers() };
         listener.send_event(Event::Title("zsh %".to_string()));
 
         let st = state.lock().unwrap();
@@ -845,12 +871,28 @@ mod state_listener_tests {
     #[test]
     fn bell_touches_timestamp_without_changing_phase() {
         let state = Arc::new(Mutex::new(SessionState { phase: Phase::Idle, ..Default::default() }));
-        let listener = StateListener { state: Arc::clone(&state) };
+        let listener = StateListener { state: Arc::clone(&state), subscribers: no_subscribers() };
         listener.send_event(Event::Bell);
 
         let st = state.lock().unwrap();
         assert_eq!(st.phase, Phase::Idle);
         assert!(st.updated_at > 0);
+    }
+
+    /// 广播：state 变化后，所有订阅者都该收到一行 `{"session": ...}`。
+    #[test]
+    fn send_event_broadcasts_to_subscribers() {
+        let (a, mut a_client) = UnixStream::pair().unwrap();
+        let subscribers: Subscribers = Arc::new(Mutex::new(vec![a]));
+        let state = Arc::new(Mutex::new(SessionState { id: "t".into(), ..Default::default() }));
+        let listener = StateListener { state, subscribers };
+        listener.send_event(Event::Title("⠋ working".to_string()));
+
+        let mut line = String::new();
+        BufReader::new(&mut a_client).read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["session"]["id"], "t");
+        assert_eq!(v["session"]["phase"], "thinking");
     }
 }
 
@@ -861,6 +903,7 @@ fn handle_conn(
     listen_fd: RawFd,
     remote_state: RemoteState,
     tunnel_state: TunnelState,
+    subscribers: Subscribers,
 ) {
     // 头一行 JSON。之后的帧字节可能已被 BufReader 预读，故帧循环必须复用同一个 reader。
     let Ok(rc) = conn.try_clone() else { return };
@@ -872,12 +915,18 @@ fn handle_conn(
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { return };
 
     match v["op"].as_str() {
-        Some("open") => handle_open(conn, reader, &v, sessions),
+        Some("open") => handle_open(conn, reader, &v, sessions, Arc::clone(&subscribers)),
         Some("watch") => handle_watch(conn, reader, &v, sessions),
+        Some("subscribe") => handle_subscribe(conn, &sessions, &subscribers),
         Some("list") => {
-            let ids: Vec<String> = sessions.lock().unwrap().keys().cloned().collect();
+            let (ids, states): (Vec<String>, Vec<SessionState>) = sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, s)| (id.clone(), s.state.lock().unwrap().clone()))
+                .unzip();
             let mut c = conn;
-            let _ = writeln!(c, "{}", serde_json::json!({ "sessions": ids }));
+            let _ = writeln!(c, "{}", serde_json::json!({ "sessions": ids, "states": states }));
         }
         Some("kill") => {
             let id = v["id"].as_str().unwrap_or_default();
@@ -970,6 +1019,27 @@ fn handle_conn(
             };
             let _ = writeln!(c, "{}", body);
         }
+        Some("state") => {
+            // hook 直写，协议事实——三个信源里可信度最高，无条件覆盖 StateListener
+            // 猜出来的值（见 SessionState 定义处注释）。会话不存在（hook 跑得比
+            // spawn 还快，或者会话已经被 kill）就静默丢弃，不算错误。
+            let id = v["id"].as_str().unwrap_or_default();
+            if let Some(sess) = sessions.lock().unwrap().get(id).cloned() {
+                if let Ok(phase) = serde_json::from_value::<Phase>(v["phase"].clone()) {
+                    let snapshot = {
+                        let mut st = sess.state.lock().unwrap();
+                        st.phase = phase;
+                        st.phase_since = now_unix();
+                        st.pending_question = v["question"].as_str().map(String::from);
+                        st.updated_at = now_unix();
+                        st.clone()
+                    };
+                    broadcast_state(&subscribers, &snapshot);
+                }
+            }
+            let mut c = conn;
+            let _ = writeln!(c, "{}", serde_json::json!({ "ok": true }));
+        }
         _ => {}
     }
 }
@@ -979,6 +1049,7 @@ fn handle_open(
     mut reader: BufReader<UnixStream>,
     v: &serde_json::Value,
     sessions: Sessions,
+    subscribers: Subscribers,
 ) {
     let id = v["id"].as_str().unwrap_or_default().to_string();
     if id.is_empty() {
@@ -1000,7 +1071,7 @@ fn handle_open(
         }
         None => {
             let Ok((sess, pty_reader)) =
-                spawn_session(&id, rows, cols, cwd.as_deref(), launch.as_deref())
+                spawn_session(&id, rows, cols, cwd.as_deref(), launch.as_deref(), &subscribers)
             else {
                 return;
             };
@@ -1180,6 +1251,37 @@ fn handle_watch(
     out.watchers.retain(|w| w.as_raw_fd() != attached_fd);
 }
 
+/// 状态订阅：跟 `watch` 是同一种只读连接模式，但订阅面是**全部会话**，不是单个
+/// session（见 Subscribers 类型定义处注释）。首帧全量快照，之后每次任何会话的
+/// state 变化都会推一行——广播逻辑在 broadcast_state / StateListener::send_event /
+/// `state` op 里，这里只管连接的注册与清理。
+fn handle_subscribe(conn: UnixStream, sessions: &Sessions, subscribers: &Subscribers) {
+    let Ok(mut c) = conn.try_clone() else { return };
+    let fd = c.as_raw_fd();
+
+    // snapshot 写出去、push 进订阅列表之间不能放 subscribers 锁：否则中间这个空隙里
+    // 一次 broadcast_state 可能两头都漏掉——快照里没有它（早于快照），也没收到广播
+    // （晚于注册），这次状态变化对这个订阅者来说凭空消失。跟 handle_watch 的
+    // snapshot-与-挂载不放锁是同一个道理。
+    let mut subs = subscribers.lock().unwrap();
+    let snapshot: Vec<SessionState> = {
+        let sessions = sessions.lock().unwrap();
+        sessions.values().map(|s| s.state.lock().unwrap().clone()).collect()
+    };
+    if writeln!(c, "{}", serde_json::json!({ "sessions": snapshot })).is_err() {
+        return;
+    }
+    subs.push(c);
+    drop(subs);
+
+    // 只读：不认帧协议，读到任何东西（含 EOF/出错）都收尾，跟 handle_watch 一致。
+    let mut reader = BufReader::new(conn);
+    let mut scratch = [0u8; 64];
+    let _ = reader.read(&mut scratch);
+
+    subscribers.lock().unwrap().retain(|s| s.as_raw_fd() != fd);
+}
+
 /// 无缝升级：快照会话表 → 写交接文件 → exec 磁盘上的新二进制（流程见文件头注释）。
 ///
 /// 锁策略：只短暂持 sessions 锁拿一份 Arc 列表就放掉——不像早期版本那样一直攥到
@@ -1270,6 +1372,7 @@ fn spawn_session(
     cols: u16,
     cwd: Option<&str>,
     launch: Option<&str>,
+    subscribers: &Subscribers,
 ) -> anyhow::Result<(Session, Box<dyn Read + Send>)> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
@@ -1340,9 +1443,12 @@ fn spawn_session(
             client: None,
             watchers: Vec::new(),
         }),
-        term: Mutex::new(new_daemon_term(rows, cols, StateListener { state: Arc::clone(&state) })),
+        term: Mutex::new(new_daemon_term(
+            rows,
+            cols,
+            StateListener { state: Arc::clone(&state), subscribers: Arc::clone(subscribers) },
+        )),
         state,
-        subscribers: Mutex::new(Vec::new()),
     };
     Ok((sess, Box::new(pty_reader)))
 }
@@ -2112,12 +2218,13 @@ mod watch_tests {
         drop(child); // Child::drop 不 wait()，留成 zombie，交给 pump 收尾时的 waitpid
 
         let state = Arc::new(Mutex::new(SessionState::default()));
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        let listener = StateListener { state: Arc::clone(&state), subscribers };
         Arc::new(Session {
             ctl: Mutex::new(Ctl { master, pid, jolt: false, cols, rows, cwd: None }),
             out: Mutex::new(Out { buf: Vec::new(), client: None, watchers: Vec::new() }),
-            term: Mutex::new(new_daemon_term(rows, cols, StateListener { state: Arc::clone(&state) })),
+            term: Mutex::new(new_daemon_term(rows, cols, listener)),
             state,
-            subscribers: Mutex::new(Vec::new()),
         })
     }
 
@@ -2144,9 +2251,16 @@ mod watch_tests {
         // 第一路：open（同 id 唯一 client）。
         let (open_server, open_client) = UnixStream::pair().unwrap();
         let sessions_a = Arc::clone(&sessions);
+        let subscribers_a: Subscribers = Arc::new(Mutex::new(Vec::new()));
         thread::spawn(move || {
             let reader = BufReader::new(open_server.try_clone().unwrap());
-            handle_open(open_server, reader, &serde_json::json!({"id":"t","cols":80,"rows":24}), sessions_a);
+            handle_open(
+                open_server,
+                reader,
+                &serde_json::json!({"id":"t","cols":80,"rows":24}),
+                sessions_a,
+                subscribers_a,
+            );
         });
         let mut open_br = BufReader::new(open_client.try_clone().unwrap());
         read_header_and_snapshot(&mut open_br);
@@ -2196,5 +2310,45 @@ mod watch_tests {
 
         drop(open_br);
         drop(open_client);
+    }
+
+    /// subscribe：首帧全量快照，之后 state 变化推一行——跟真实 `state` op 走的是
+    /// 同一条 broadcast_state 路径。
+    #[test]
+    fn subscribe_gets_snapshot_then_broadcast_on_state_change() {
+        let sess = make_dummy_session(24, 80);
+        sess.state.lock().unwrap().id = "sub-test".to_string();
+
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().unwrap().insert("sub-test".to_string(), Arc::clone(&sess));
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+
+        let (sub_server, sub_client) = UnixStream::pair().unwrap();
+        let sessions_b = Arc::clone(&sessions);
+        let subscribers_b = Arc::clone(&subscribers);
+        thread::spawn(move || {
+            handle_subscribe(sub_server, &sessions_b, &subscribers_b);
+        });
+
+        let mut br = BufReader::new(sub_client.try_clone().unwrap());
+        let mut line = String::new();
+        br.read_line(&mut line).unwrap();
+        let first: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(first["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(first["sessions"][0]["id"], "sub-test");
+
+        let snapshot = {
+            let mut st = sess.state.lock().unwrap();
+            st.phase = Phase::AwaitingApproval;
+            st.pending_question = Some("要不要继续".to_string());
+            st.clone()
+        };
+        broadcast_state(&subscribers, &snapshot);
+
+        let mut line2 = String::new();
+        br.read_line(&mut line2).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&line2).unwrap();
+        assert_eq!(second["session"]["phase"], "awaiting_approval");
+        assert_eq!(second["session"]["pending_question"], "要不要继续");
     }
 }
