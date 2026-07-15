@@ -12,13 +12,19 @@
 //! 仍保留一小段原始字节缓冲，仅供无缝 upgrade 交接后尽量重建 Term 状态。
 //!
 //! 协议（Unix socket ~/.smelt/smeltd.sock）——连接后客户端先发一行 JSON：
-//!   {"op":"open","id":"..","cwd":"..","cols":120,"rows":30}  → 进入流模式
+//!   {"op":"open","id":"..","cwd":"..","cols":120,"rows":30}  → 进入流模式（唯一 client，
+//!                                                              同 id 第二次 open 顶掉前一个）
+//!   {"op":"watch","id":".."}                                 → 进入**只读**流模式（旁观，见下）
 //!   {"op":"list"}                                            → 回 {"sessions":[..]} 后关闭
 //!   {"op":"kill","id":".."}                                  → 回 {"ok":true} 后关闭
 //!   {"op":"version"}                                         → 回 {"version":"..","exe_mtime":123} 后关闭
 //!   {"op":"shutdown"}                                        → 回 {"ok":true} 后进程退出（杀掉所有会话！）
 //!   {"op":"upgrade"}                                         → 回 {"ok":true} 后 exec 磁盘上的新二进制，
 //!                                                              PTY fd 原地交接，**所有会话不中断**（见下）
+//!   {"op":"remote_start","bind":"..","port":0}               → 回 {"ok":true,"token":"..","addr":".."}，
+//!                                                              见下「内嵌远程网关」（bind/port 可省，默认回环随机口）
+//!   {"op":"remote_stop"}                                     → 回 {"ok":true} 后关闭
+//!   {"op":"remote_status"}                                   → 回 {"running":bool,"token":"..","addr":".."} 后关闭
 //!
 //! 流模式：
 //!   守护 → 客户端：先发 JSON 尺寸行（含 replay_len=快照字节数）→ ANSI 网格快照
@@ -29,6 +35,15 @@
 //!       payload 16 字节：cols + rows + cell_w + cell_h（各 u32 BE）→
 //!         ws_xpixel = cols*cell_w，ws_ypixel = rows*cell_h
 //! shell 退出 → 守护关闭该连接（客户端读到 EOF）。
+//!
+//! ## `watch`：只读旁观，不参与「同 id 唯一 client」的顶替
+//!
+//! 远程操作/观战席这类场景需要「GUI 开着的同时，另一路也能看画面」——但 `open` 的语义
+//! 是「同 id 只允许一个 GUI」（第二次 open 会 shutdown 前一个连接），不能照搬。`watch`
+//! 是独立的第二条路径：会话必须已存在（不会像 `open` 那样兜底新建）；进来后收一份和
+//! `open` 一样的尺寸行 + ANSI 快照，但**不进入帧循环**——不认输入/resize，收到任何客户端
+//! 发来的字节都当异常直接断开。多个 `watch` 连接可以并存，也不影响 `open` 的那个唯一
+//! client；某个 watcher 断线只清自己，不影响其他 watcher 或 client。
 //!
 //! ## 无缝升级（"upgrade" op，nginx 风格 exec 交接）
 //!
@@ -50,6 +65,22 @@
 //! 工作。交接文件读不出/解析失败（极端情况）时新进程走全新启动兜底：**不**做「能连上
 //! 说明已有守护」这条单实例检查——此时我们可能还继承着旧监听 fd，检查会连上自己而
 //! 误判、直接自杀，见 main() 里的 came_from_handoff 分支。
+//!
+//! ## 内嵌远程网关（`remote_start`/`remote_stop`/`remote_status`）
+//!
+//! 路由/handler 全在 `remote_gateway.rs`（跟独立进程版 `gateway.rs` 共用一份，见那边
+//! 的模块注释）——这里只是按需把它跑起来。守护本身是同步/阻塞线程模型，**不**把
+//! `main()` 整个改成 async；`remote_start` 只是另起一条 OS 线程，在那条线程里私自建
+//! 一个 tokio runtime 跑 axum server，跟守护主循环完全隔离，互不影响。
+//!
+//! 幂等：已经开着时 `remote_start` 直接回现有的 token/addr，不重启、不换 token；
+//! 想要新 token 得先 `remote_stop` 再 `remote_start`。**不**参与无缝升级交接——
+//! `upgrade` 之后如果之前开着远程网关，会随旧进程退出而关闭，新进程里默认是关的
+//! （GUI 那边在 upgrade 完成后按需重新 `remote_start`）。安全默认跟 `watch` 一致：
+//! 默认关闭、绑回环，见 collaboration.md 的安全底线。
+
+#[path = "../remote_gateway.rs"]
+mod remote_gateway;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -166,6 +197,9 @@ struct Out {
     /// upgrade 交接用；attach 主路径已改走网格快照。
     buf: Vec<u8>,
     client: Option<UnixStream>,
+    /// `watch` 连接：只读旁观，不参与 client 的顶替逻辑，可多个并存。
+    /// 复用 `out` 这把已有的锁（不新增锁），锁序与顶替逻辑因此天然保持一致。
+    watchers: Vec<UnixStream>,
 }
 
 /// 守护侧常驻终端状态机尺寸（实现 alacritty Dimensions）。
@@ -211,6 +245,71 @@ struct Session {
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 
+/// 内嵌远程网关开着时的状态：token、绑定地址、喊停用的信号。见文件头「内嵌远程
+/// 网关」一节——这条不参与无缝升级交接，`upgrade` 后新进程里永远是 None。
+struct RemoteGateway {
+    token: String,
+    addr: std::net::SocketAddr,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+type RemoteState = Arc<Mutex<Option<RemoteGateway>>>;
+
+/// 幂等：已经开着直接回现有 token/addr，不重启、不换 token。
+/// bind 非法 / 端口绑不上都走 Err，调用方原样透传给客户端。
+fn start_remote_gateway(state: &RemoteState, bind: &str, port: u16) -> Result<(String, std::net::SocketAddr), String> {
+    let mut guard = state.lock().unwrap();
+    if let Some(g) = guard.as_ref() {
+        return Ok((g.token.clone(), g.addr));
+    }
+
+    let ip: std::net::IpAddr = bind.parse().map_err(|e| format!("非法绑定地址 {bind}：{e}"))?;
+    let std_listener = std::net::TcpListener::bind((ip, port))
+        .map_err(|e| format!("绑定 {bind}:{port} 失败：{e}"))?;
+    std_listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let addr = std_listener.local_addr().map_err(|e| e.to_string())?;
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let token_for_thread = token.clone();
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("远程网关起不了 tokio runtime：{e}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let listener = match tokio::net::TcpListener::from_std(std_listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("远程网关认领监听 fd 失败：{e}");
+                    return;
+                }
+            };
+            let app = remote_gateway::build_router(token_for_thread);
+            let serve = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                });
+            if let Err(e) = serve.await {
+                eprintln!("远程网关退出：{e}");
+            }
+        });
+    });
+
+    *guard = Some(RemoteGateway { token: token.clone(), addr, shutdown_tx });
+    Ok((token, addr))
+}
+
+fn stop_remote_gateway(state: &RemoteState) {
+    if let Some(g) = state.lock().unwrap().take() {
+        let _ = g.shutdown_tx.send(());
+    }
+}
+
 fn main() {
     // 无缝升级交接：上一代进程 exec 本二进制前写好交接文件并把路径放在环境变量里。
     // 立即摘掉环境变量：它只对"本次 exec 交接"有意义，不能传染给之后 spawn 的 shell。
@@ -251,10 +350,14 @@ fn main() {
 
     let listen_fd = listener.as_raw_fd();
     let exe_mtime = exe_mtime_secs();
+    // 不参与无缝升级交接：每次进程启动（含 upgrade 后的新进程）都是全新的 None，
+    // 见 RemoteGateway 定义处注释。
+    let remote_state: RemoteState = Arc::new(Mutex::new(None));
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let sessions = Arc::clone(&sessions);
-        thread::spawn(move || handle_conn(conn, sessions, exe_mtime, listen_fd));
+        let remote_state = Arc::clone(&remote_state);
+        thread::spawn(move || handle_conn(conn, sessions, exe_mtime, listen_fd, remote_state));
     }
 }
 
@@ -329,6 +432,7 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
             out: Mutex::new(Out {
                 buf,
                 client: None,
+                watchers: Vec::new(),
             }),
             term: Mutex::new(term),
         });
@@ -400,7 +504,13 @@ mod handoff_tests {
     }
 }
 
-fn handle_conn(conn: UnixStream, sessions: Sessions, exe_mtime: u64, listen_fd: RawFd) {
+fn handle_conn(
+    conn: UnixStream,
+    sessions: Sessions,
+    exe_mtime: u64,
+    listen_fd: RawFd,
+    remote_state: RemoteState,
+) {
     // 头一行 JSON。之后的帧字节可能已被 BufReader 预读，故帧循环必须复用同一个 reader。
     let Ok(rc) = conn.try_clone() else { return };
     let mut reader = BufReader::new(rc);
@@ -412,6 +522,7 @@ fn handle_conn(conn: UnixStream, sessions: Sessions, exe_mtime: u64, listen_fd: 
 
     match v["op"].as_str() {
         Some("open") => handle_open(conn, reader, &v, sessions),
+        Some("watch") => handle_watch(conn, reader, &v, sessions),
         Some("list") => {
             let ids: Vec<String> = sessions.lock().unwrap().keys().cloned().collect();
             let mut c = conn;
@@ -424,8 +535,12 @@ fn handle_conn(conn: UnixStream, sessions: Sessions, exe_mtime: u64, listen_fd: 
                 unsafe {
                     libc::kill(s.ctl.lock().unwrap().pid, libc::SIGKILL);
                 }
-                if let Some(c) = s.out.lock().unwrap().client.take() {
+                let mut out = s.out.lock().unwrap();
+                if let Some(c) = out.client.take() {
                     let _ = c.shutdown(Shutdown::Both);
+                }
+                for w in out.watchers.drain(..) {
+                    let _ = w.shutdown(Shutdown::Both);
                 }
             }
             let mut c = conn;
@@ -447,6 +562,38 @@ fn handle_conn(conn: UnixStream, sessions: Sessions, exe_mtime: u64, listen_fd: 
             // 直接退出：PTY 全归子进程持有，本进程一死子进程读端 EOF/SIGHUP，
             // 所有会话随之终止 —— 这是「重启守护」明知故犯的代价，调用方必须先提示用户。
             std::process::exit(0);
+        }
+        Some("remote_start") => {
+            let bind = v["bind"].as_str().unwrap_or("127.0.0.1").to_string();
+            let port = v["port"].as_u64().unwrap_or(0) as u16;
+            let mut c = conn;
+            match start_remote_gateway(&remote_state, &bind, port) {
+                Ok((token, addr)) => {
+                    let _ = writeln!(
+                        c,
+                        "{}",
+                        serde_json::json!({ "ok": true, "token": token, "addr": addr.to_string() })
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(c, "{}", serde_json::json!({ "ok": false, "err": e }));
+                }
+            }
+        }
+        Some("remote_stop") => {
+            stop_remote_gateway(&remote_state);
+            let mut c = conn;
+            let _ = writeln!(c, "{}", serde_json::json!({ "ok": true }));
+        }
+        Some("remote_status") => {
+            let mut c = conn;
+            let body = match remote_state.lock().unwrap().as_ref() {
+                Some(g) => {
+                    serde_json::json!({ "running": true, "token": g.token, "addr": g.addr.to_string() })
+                }
+                None => serde_json::json!({ "running": false }),
+            };
+            let _ = writeln!(c, "{}", body);
         }
         _ => {}
     }
@@ -596,6 +743,67 @@ fn handle_open(
     }
 }
 
+/// 只读旁观：观战席/远程查看这类场景用。跟 `handle_open` 的核心区别——
+/// 1. 不兜底 spawn：会话必须已存在，旁观一个不存在的会话没有意义；
+/// 2. 不顶替 `out.client`，也不顶替其它 watcher——`push` 进去，多个旁观者可并存；
+/// 3. 没有帧循环：旁观连接只读，收到客户端发来的任何字节都当异常直接断开清理。
+fn handle_watch(
+    conn: UnixStream,
+    mut reader: BufReader<UnixStream>,
+    v: &serde_json::Value,
+    sessions: Sessions,
+) {
+    let id = v["id"].as_str().unwrap_or_default().to_string();
+    if id.is_empty() {
+        return;
+    }
+    let Some(sess) = sessions.lock().unwrap().get(&id).cloned() else {
+        return;
+    };
+
+    let (cur_cols, cur_rows) = {
+        let ctl = sess.ctl.lock().unwrap();
+        (ctl.cols, ctl.rows)
+    };
+
+    // 锁序、snapshot-与-挂载之间不放锁的道理跟 handle_open 完全一致（见其注释）：
+    // 用 out 锁本身当「挂载点」，snapshot 拼好、watcher push 进 Vec 一步做完，
+    // 中间不放 out 锁，泵线程就不会在这个间隙 advance 出一段没人接住的字节。
+    let attached_fd = {
+        let Ok(mut c) = conn.try_clone() else { return };
+        let fd = c.as_raw_fd();
+        let _ = c.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
+
+        let term = sess.term.lock().unwrap();
+        let mut out = sess.out.lock().unwrap();
+        let snapshot = snapshot_ansi(&term);
+        drop(term);
+
+        let replay_len = snapshot.len();
+        if writeln!(
+            c,
+            "{}",
+            serde_json::json!({ "cols": cur_cols, "rows": cur_rows, "replay_len": replay_len })
+        )
+        .is_err()
+        {
+            return;
+        }
+        if replay_len > 0 && c.write_all(&snapshot).is_err() {
+            return;
+        }
+        out.watchers.push(c);
+        fd
+    };
+
+    // 只读：不认帧协议，读到任何东西（含 EOF/出错）都收尾——旁观者本就不该往这条连接写字节。
+    let mut scratch = [0u8; 64];
+    let _ = reader.read(&mut scratch);
+
+    let mut out = sess.out.lock().unwrap();
+    out.watchers.retain(|w| w.as_raw_fd() != attached_fd);
+}
+
 /// 无缝升级：快照会话表 → 写交接文件 → exec 磁盘上的新二进制（流程见文件头注释）。
 ///
 /// 锁策略：只短暂持 sessions 锁拿一份 Arc 列表就放掉——不像早期版本那样一直攥到
@@ -741,6 +949,7 @@ fn spawn_session(
         out: Mutex::new(Out {
             buf: Vec::new(),
             client: None,
+            watchers: Vec::new(),
         }),
         term: Mutex::new(new_daemon_term(rows, cols)),
     };
@@ -780,6 +989,8 @@ fn start_pty_pump(
                             out.client = None; // 客户端已断，会话继续养着
                         }
                     }
+                    // 旁观者逐个转发，写失败（已断线）就摘掉；跟 client 互不影响。
+                    out.watchers.retain_mut(|w| w.write_all(chunk).is_ok());
                 }
             }
         }
@@ -787,6 +998,9 @@ fn start_pty_pump(
         let mut out = sess.out.lock().unwrap();
         if let Some(c) = out.client.take() {
             let _ = c.shutdown(Shutdown::Both); // GUI 读到 EOF 即知 shell 退出
+        }
+        for w in out.watchers.drain(..) {
+            let _ = w.shutdown(Shutdown::Both); // 旁观者同样该收到 EOF
         }
         drop(out);
         // 收尸避免僵尸进程。shell 是本进程的子进程，且 exec 交接不改变父子关系
@@ -1488,5 +1702,105 @@ mod snapshot_tests {
             "快照应含 OSC 8 URI，got {s}"
         );
         assert!(snap.windows(4).any(|w| w == b"link"));
+    }
+}
+
+/// Phase 0：`watch` 只读旁观必须能跟 `open` 独占连接并存，且互不干扰。
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    /// 造一个不依赖真实 shell 的会话：`Ctl.master` 指向 `/dev/null`（测试不发输入帧，
+    /// 用不上真正的 PTY 写端），`pid` 用一个已退出、还没被 reap 的真实子进程——
+    /// 给 `start_pty_pump` 结束时的 `waitpid` 一个安全、真实存在的目标，不借用 -1
+    /// 或随便一个不相关的 pid。
+    fn make_dummy_session(rows: u16, cols: u16) -> Arc<Session> {
+        let master = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        drop(child); // Child::drop 不 wait()，留成 zombie，交给 pump 收尾时的 waitpid
+
+        Arc::new(Session {
+            ctl: Mutex::new(Ctl { master, pid, jolt: false, cols, rows }),
+            out: Mutex::new(Out { buf: Vec::new(), client: None, watchers: Vec::new() }),
+            term: Mutex::new(new_daemon_term(rows, cols)),
+        })
+    }
+
+    /// 读一行 JSON 尺寸头 + `replay_len` 字节快照——跟真实客户端的 attach 协议一致。
+    fn read_header_and_snapshot(br: &mut BufReader<UnixStream>) {
+        let mut line = String::new();
+        br.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let replay_len = v["replay_len"].as_u64().unwrap() as usize;
+        let mut snap = vec![0u8; replay_len];
+        br.read_exact(&mut snap).unwrap();
+    }
+
+    #[test]
+    fn watch_coexists_with_open_and_survives_watcher_disconnect() {
+        let sess = make_dummy_session(24, 80);
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().unwrap().insert("t".to_string(), Arc::clone(&sess));
+
+        // 模拟 PTY：pump 从一端读，测试从另一端写，模拟"shell 产生了输出"。
+        let (pty_reader_end, mut pty_writer_end) = UnixStream::pair().unwrap();
+        start_pty_pump(Arc::clone(&sess), Box::new(pty_reader_end), "t".to_string(), Arc::clone(&sessions));
+
+        // 第一路：open（同 id 唯一 client）。
+        let (open_server, open_client) = UnixStream::pair().unwrap();
+        let sessions_a = Arc::clone(&sessions);
+        thread::spawn(move || {
+            let reader = BufReader::new(open_server.try_clone().unwrap());
+            handle_open(open_server, reader, &serde_json::json!({"id":"t","cols":80,"rows":24}), sessions_a);
+        });
+        let mut open_br = BufReader::new(open_client.try_clone().unwrap());
+        read_header_and_snapshot(&mut open_br);
+
+        // 第二路：watch（只读旁观）。这一步不该顶掉上面那个 open 连接。
+        let (watch_server, watch_client) = UnixStream::pair().unwrap();
+        let sessions_b = Arc::clone(&sessions);
+        thread::spawn(move || {
+            let reader = BufReader::new(watch_server.try_clone().unwrap());
+            handle_watch(watch_server, reader, &serde_json::json!({"id":"t"}), sessions_b);
+        });
+        let mut watch_br = BufReader::new(watch_client.try_clone().unwrap());
+        read_header_and_snapshot(&mut watch_br);
+
+        // 模拟 shell 输出一行字节，open 和 watch 都该收到同一份转发。
+        pty_writer_end.write_all(b"hello\r\n").unwrap();
+
+        let mut open_buf = [0u8; 7];
+        open_br.read_exact(&mut open_buf).unwrap();
+        assert_eq!(&open_buf, b"hello\r\n", "open 没收到转发——watch 的接入可能把它顶掉了");
+
+        let mut watch_buf = [0u8; 7];
+        watch_br.read_exact(&mut watch_buf).unwrap();
+        assert_eq!(&watch_buf, b"hello\r\n", "watch 没收到转发");
+
+        // watcher 断开，不该影响 open 那一路继续收转发（惰性清理：写失败即摘除，
+        // 不依赖 handle_watch 自己那个线程的清理时序）。
+        drop(watch_br);
+        drop(watch_client);
+
+        pty_writer_end.write_all(b"world!\n").unwrap();
+        let mut open_buf2 = [0u8; 7];
+        open_br.read_exact(&mut open_buf2).unwrap();
+        assert_eq!(&open_buf2, b"world!\n", "watcher 断线后不该影响 open 那一路的转发");
+
+        // 收尾：关掉模拟 PTY 的写端，触发 pump 的退出清理（移除会话表项 + waitpid）。
+        drop(pty_writer_end);
+        let mut removed = false;
+        for _ in 0..50 {
+            if !sessions.lock().unwrap().contains_key("t") {
+                removed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(removed, "pump 应在 PTY EOF 后把会话从表里摘掉");
+
+        drop(open_br);
+        drop(open_client);
     }
 }
