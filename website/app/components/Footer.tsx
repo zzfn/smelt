@@ -9,13 +9,13 @@ export function Footer() {
           <span>· MIT License</span>
         </div>
         <a
-          href="https://github.com/zzfn/smelt"
+          href="https://github.com/smelt-ai/smelt"
           target="_blank"
           rel="noopener noreferrer"
           className="flex items-center gap-1.5 transition-colors hover:text-foreground"
         >
           <GitHubIcon className="h-4 w-4" />
-          github.com/zzfn/smelt
+          github.com/smelt-ai/smelt
         </a>
       </div>
     </footer>

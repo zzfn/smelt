@@ -1,4 +1,4 @@
-const REPO_URL = "https://github.com/zzfn/smelt";
+const REPO_URL = "https://github.com/smelt-ai/smelt";
 
 const LINKS = [
   {

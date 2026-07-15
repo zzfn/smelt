@@ -6,7 +6,7 @@ prototype，接口和默认行为可能会变。
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/zzfn/smelt/releases) 下载 `Smelt.dmg`，拖进
+从 [GitHub Releases](https://github.com/smelt-ai/smelt/releases) 下载 `Smelt.dmg`，拖进
 应用程序文件夹，打开即可，只支持 Apple Silicon Mac。
 
 退出 smelt 甚至它崩溃了，里面跑着的 shell（包括正在干活的 `claude`）不会被杀掉，
@@ -188,7 +188,7 @@ Claude Code 自己写在 `~/.claude/projects/**/*.jsonl` 里的记录，不是 s
 目前只做 Mac。GPU 渲染依赖 Metal，暂时没有跨平台计划。
 
 **在哪反馈问题？**
-仓库还没有开放稳定的 issue 流程，先看 [README](https://github.com/zzfn/smelt) 或直接
+仓库还没有开放稳定的 issue 流程，先看 [README](https://github.com/smelt-ai/smelt) 或直接
 去看源码。
 
 **想从源码构建、了解内部架构、或者参与开发？**

@@ -26,7 +26,7 @@ export function Hero() {
 
         <div className="mt-8 flex flex-wrap items-center gap-3">
           <a
-            href="https://github.com/zzfn/smelt/releases"
+            href="https://github.com/smelt-ai/smelt/releases"
             target="_blank"
             rel="noopener noreferrer"
             className="rounded-lg bg-gradient-to-r from-accent to-accent-2 px-5 py-2.5 text-sm font-medium text-[#08090c] transition-opacity hover:opacity-90"
@@ -34,7 +34,7 @@ export function Hero() {
             下载 Smelt.dmg（macOS）
           </a>
           <a
-            href="https://github.com/zzfn/smelt"
+            href="https://github.com/smelt-ai/smelt"
             target="_blank"
             rel="noopener noreferrer"
             className="rounded-lg px-4 py-2.5 text-sm font-medium text-muted transition-colors hover:text-foreground"

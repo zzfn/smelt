@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const REPO: &str = "zzfn/smelt";
+const REPO: &str = "smelt-ai/smelt";
 const BUNDLE_ID: &str = "com.zzfn.smelt";
 const APP_NAME: &str = "Smelt";
 const DMG_ASSET_NAME: &str = "Smelt.dmg";

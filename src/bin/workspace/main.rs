@@ -3348,9 +3348,9 @@ impl Render for Workspace {
                             .child(version)
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                                 cx.open_url(if has_update {
-                                    "https://github.com/zzfn/smelt/releases"
+                                    "https://github.com/smelt-ai/smelt/releases"
                                 } else {
-                                    "https://github.com/zzfn/smelt"
+                                    "https://github.com/smelt-ai/smelt"
                                 });
                             })
                     }),

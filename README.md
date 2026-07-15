@@ -10,8 +10,8 @@
 Claude Code、Codex、Gemini CLI……凡是跑在终端里的 agent，都能在这里并排看住。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/zzfn/smelt)](https://github.com/zzfn/smelt/releases)
-[![Platform](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-lightgrey)](https://github.com/zzfn/smelt/releases)
+[![Release](https://img.shields.io/github/v/release/smelt-ai/smelt)](https://github.com/smelt-ai/smelt/releases)
+[![Platform](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-lightgrey)](https://github.com/smelt-ai/smelt/releases)
 
 > **状态**：working prototype，持续迭代中。
 
@@ -29,7 +29,7 @@ smelt 把终端——agent 真正干活的地方——变成主战场。
 
 ## 安装
 
-从 [Releases](https://github.com/zzfn/smelt/releases) 下载 `Smelt.dmg`，拖进 Applications 即可。
+从 [Releases](https://github.com/smelt-ai/smelt/releases) 下载 `Smelt.dmg`，拖进 Applications 即可。
 应用内置在线更新，后续版本会自动检查并静默下载。
 
 > 目前仅支持 **macOS（Apple Silicon）**。

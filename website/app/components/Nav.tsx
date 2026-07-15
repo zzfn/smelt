@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter, usePathname } from "next/navigation";
 import { GitHubIcon } from "./icons";
 
-const REPO_URL = "https://github.com/zzfn/smelt";
+const REPO_URL = "https://github.com/smelt-ai/smelt";
 
 function scrollToId(id: string) {
   document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });

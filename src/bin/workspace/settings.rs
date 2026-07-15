@@ -1158,7 +1158,7 @@ impl Workspace {
                                             .hover(|s| s.text_color(fg))
                                             .child("GitHub ↗")
                                             .on_mouse_down(MouseButton::Left, |_, _window, cx| {
-                                                cx.open_url("https://github.com/zzfn/smelt");
+                                                cx.open_url("https://github.com/smelt-ai/smelt");
                                             }),
                                     ),
                             )
