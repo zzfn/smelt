@@ -103,6 +103,8 @@
 
 #[path = "../remote_gateway.rs"]
 mod remote_gateway;
+#[path = "../osc.rs"]
+mod osc;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -114,7 +116,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener, VoidListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
@@ -176,6 +178,85 @@ struct Ctl {
     /// 终端建成同尺寸再解析，否则行宽错位（zsh 行尾 % 盖不掉、TUI 布局撕裂）。
     cols: u16,
     rows: u16,
+    /// spawn 时的静态目录（作战地图要）。**不**跟随 shell 的 `cd`——真实 cwd 要
+    /// OSC 7，这里只是「这个会话是从哪打开的」，见 SessionState.cwd 用法。
+    cwd: Option<String>,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 会话状态通道（见 docs/state-channel-plan.md）。三个信源按可信度覆盖：
+/// hook 直写（`state` op，协议事实，最高）> OSC 9/777（终端协议，中）>
+/// OSC 0/2 标题的 spinner 猜测（最低，纯猜）。schema 定死，字段不够用再加，
+/// 不删不改类型——远程端/GUI 都按这份 schema 解码。
+#[derive(Clone, Default, serde::Serialize)]
+struct SessionState {
+    id: String,
+    cwd: Option<String>,
+    /// claude / codex / copilot（来自 spawn 时的 launch 命令）。
+    launch: Option<String>,
+    /// OSC 0/2 标题，GUI 现在也读这个显示 tab 名。
+    title: Option<String>,
+    phase: Phase,
+    /// unix 秒。「空转多久了」靠它算——作战地图用。
+    phase_since: u64,
+    /// 在问什么——远程遥控的命脉，Phase 6 的 action 门闩靠它判断能不能安全写入。
+    pending_question: Option<String>,
+    /// 累计花费口径（各轮 cache_read 都加了），**不是**上下文占用，不能当余量分母。
+    /// 见 session_history::SessionSummary.total_tokens；目前没接，先占位。
+    tokens_used: Option<u64>,
+    /// 撞车预警要用；目前没接（见 git_panel.rs 的 GitStatusData），先占位。
+    branch: Option<String>,
+    dirty_files: Vec<String>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Phase {
+    Thinking,
+    ExecutingTool,
+    AwaitingApproval,
+    WaitingForUser,
+    #[default]
+    Idle,
+    Dead,
+}
+
+/// 常驻 Term 的事件监听：接住 alacritty 解析出的 `Event::Title`/`Event::Bell`，
+/// 写进共享的 `SessionState`。**只在这里猜 phase**（OSC 0/2 标题 spinner，最低
+/// 可信度信源）——Task 8 的 hook `state` op 是协议事实，之后接进来的写入应该
+/// 覆盖这里猜出来的值；这条 listener 因此保守地只在检测到 spinner 时置
+/// `Thinking`，标题不是 spinner 时**不**反过来猜别的 phase（缺乏证据不代表
+/// idle，瞎猜比不猜更容易把 hook 刚写好的准确状态带偏）。
+#[derive(Clone)]
+struct StateListener {
+    state: Arc<Mutex<SessionState>>,
+}
+
+impl EventListener for StateListener {
+    fn send_event(&self, event: Event) {
+        let Ok(mut st) = self.state.lock() else { return };
+        match event {
+            Event::Title(t) => {
+                if osc::title_starts_with_spinner(t.trim_start()) {
+                    st.phase = Phase::Thinking;
+                    st.phase_since = now_unix();
+                }
+                st.title = Some(t);
+                st.updated_at = now_unix();
+            }
+            Event::Bell => {
+                st.updated_at = now_unix();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 按行列 + 可选像素尺寸 resize PTY（TIOCSWINSZ）。
@@ -250,19 +331,26 @@ fn daemon_term_config() -> TermConfig {
     }
 }
 
-fn new_daemon_term(rows: u16, cols: u16) -> Term<VoidListener> {
+fn new_daemon_term<T: EventListener>(rows: u16, cols: u16, listener: T) -> Term<T> {
     let size = DaemonTermSize {
         rows: rows.max(1) as usize,
         cols: cols.max(1) as usize,
     };
-    Term::new(daemon_term_config(), &size, VoidListener)
+    Term::new(daemon_term_config(), &size, listener)
 }
 
 struct Session {
     ctl: Mutex<Ctl>,
     out: Mutex<Out>,
-    /// 常驻网格：PTY 输出持续 advance；attach 时序列化成 ANSI 快照。
-    term: Mutex<Term<VoidListener>>,
+    /// 常驻网格：PTY 输出持续 advance；attach 时序列化成 ANSI 快照。挂的是
+    /// `StateListener`（不再是 `VoidListener`）——守护自己也要看得见 Title/Bell。
+    term: Mutex<Term<StateListener>>,
+    /// 结构化状态（见 SessionState）。跟 `term` 的监听器共用同一个 Arc，
+    /// `state` op（hook 直写）和 `subscribe` 的转发都读/改这一份。
+    state: Arc<Mutex<SessionState>>,
+    /// `subscribe` 连接：状态变化时逐个推一行 JSON。跟 watch/client 是完全独立的
+    /// 连接池——一个是字节流，这个是状态流，互不干扰。
+    subscribers: Mutex<Vec<UnixStream>>,
 }
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
@@ -587,8 +675,16 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
         let buf = item["buf"].as_str().and_then(hex_decode).unwrap_or_default();
         let cols = item["cols"].as_u64().unwrap_or(80) as u16;
         let rows = item["rows"].as_u64().unwrap_or(24) as u16;
+        let cwd = item["cwd"].as_str().map(String::from);
+        // 状态通道不参与交接：新进程里全新一份 SessionState，hook/OSC 很快会
+        // 重新填上（跟 out.client/watchers 一样，网络层面的东西本就不该假装还在）。
+        let state = Arc::new(Mutex::new(SessionState {
+            id: id.to_string(),
+            cwd: cwd.clone(),
+            ..Default::default()
+        }));
         // 尽量用交接带来的字节重建 Term（可能腰斩，仅 best-effort）；jolt 会让 TUI 再刷。
-        let mut term = new_daemon_term(rows, cols);
+        let mut term = new_daemon_term(rows, cols, StateListener { state: Arc::clone(&state) });
         if !buf.is_empty() {
             feed_term(&mut term, &buf);
         }
@@ -601,6 +697,7 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
                 jolt: true,
                 cols,
                 rows,
+                cwd,
             }),
             out: Mutex::new(Out {
                 buf,
@@ -608,6 +705,8 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
                 watchers: Vec::new(),
             }),
             term: Mutex::new(term),
+            state,
+            subscribers: Mutex::new(Vec::new()),
         });
         sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&sess));
         start_pty_pump(sess, Box::new(reader), id.to_string(), Arc::clone(&sessions));
@@ -616,7 +715,7 @@ fn resume_handoff(path: &str) -> Option<(UnixListener, Sessions)> {
 }
 
 /// 把字节喂进常驻 Term；panic 时吞掉，避免畸形序列拖死整个守护。
-fn feed_term(term: &mut Term<VoidListener>, bytes: &[u8]) {
+fn feed_term<T: EventListener>(term: &mut Term<T>, bytes: &[u8]) {
     let mut parser: Processor = Processor::new();
     let _ = catch_unwind(AssertUnwindSafe(|| {
         parser.advance(term, bytes);
@@ -706,6 +805,52 @@ mod tunnel_tests {
     fn connected_marker_matches_real_cloudflared_log_line() {
         let line = "2026-07-15T08:26:46Z INF Registered tunnel connection connIndex=0 connection=0cc8452d-281b-43d2-892a-a60480f845d9 event=0 ip=198.18.20.145 location=lax07 protocol=http2";
         assert!(line.contains(TUNNEL_CONNECTED_MARKER));
+    }
+}
+
+#[cfg(test)]
+mod state_listener_tests {
+    use super::*;
+
+    /// 标题以 spinner 开头 → 认定 Thinking，且更新 phase_since；标题本身也要存。
+    #[test]
+    fn title_with_spinner_sets_thinking_phase() {
+        let state = Arc::new(Mutex::new(SessionState::default()));
+        let listener = StateListener { state: Arc::clone(&state) };
+        listener.send_event(Event::Title("⠋ doing work".to_string()));
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.phase, Phase::Thinking);
+        assert_eq!(st.title.as_deref(), Some("⠋ doing work"));
+        assert!(st.phase_since > 0);
+    }
+
+    /// 标题不是 spinner 时**不猜**别的 phase——缺乏证据不等于 idle，避免把更
+    /// 可信的信源（hook state op）刚写好的值带偏。标题本身还是要照存。
+    #[test]
+    fn title_without_spinner_does_not_touch_phase() {
+        let state = Arc::new(Mutex::new(SessionState {
+            phase: Phase::AwaitingApproval,
+            ..Default::default()
+        }));
+        let listener = StateListener { state: Arc::clone(&state) };
+        listener.send_event(Event::Title("zsh %".to_string()));
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.phase, Phase::AwaitingApproval, "不该被标题猜测覆盖");
+        assert_eq!(st.title.as_deref(), Some("zsh %"));
+    }
+
+    /// Bell 只更新时间戳，不改 phase——单独响铃太不可靠，只能当辅助信号。
+    #[test]
+    fn bell_touches_timestamp_without_changing_phase() {
+        let state = Arc::new(Mutex::new(SessionState { phase: Phase::Idle, ..Default::default() }));
+        let listener = StateListener { state: Arc::clone(&state) };
+        listener.send_event(Event::Bell);
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.phase, Phase::Idle);
+        assert!(st.updated_at > 0);
     }
 }
 
@@ -854,7 +999,8 @@ fn handle_open(
             s
         }
         None => {
-            let Ok((sess, pty_reader)) = spawn_session(rows, cols, cwd.as_deref(), launch.as_deref())
+            let Ok((sess, pty_reader)) =
+                spawn_session(&id, rows, cols, cwd.as_deref(), launch.as_deref())
             else {
                 return;
             };
@@ -1071,6 +1217,7 @@ fn handle_upgrade(conn: UnixStream, sessions: &Sessions, listen_fd: RawFd) {
             "pid": ctl.pid,
             "cols": ctl.cols,
             "rows": ctl.rows,
+            "cwd": ctl.cwd,
             "buf": hex_encode(&out.buf),
         }));
         fds.push(fd);
@@ -1118,6 +1265,7 @@ fn handle_upgrade(conn: UnixStream, sessions: &Sessions, listen_fd: RawFd) {
 /// 这样从根上没有"shell 是否已经在读 stdin"的时序问题，命令跑完会 exec 回一个
 /// 正常交互 login shell，之后就是一个普通会话。
 fn spawn_session(
+    id: &str,
     rows: u16,
     cols: u16,
     cwd: Option<&str>,
@@ -1147,6 +1295,10 @@ fn spawn_session(
     if std::env::var("LANG").is_err() {
         cmd.env("LANG", "en_US.UTF-8");
     }
+    // 整条 hook 链路的地基：没有它，smelt-notify 没法知道自己在哪个会话里，
+    // 后面的 state op 全是空中楼阁（见 docs/state-channel-plan.md）。
+    cmd.env("SMELT_SESSION_ID", id);
+    cmd.env("SMELT_SOCK", sock_path());
     // 共享锁：多个新会话可以互相并发 spawn，但跟 handle_upgrade 的独占锁互斥——
     // 挡住「fork 出的子进程意外继承 upgrade 正在清 CLOEXEC 的其它会话 fd」（见
     // SPAWN_GATE 定义处注释）。
@@ -1168,6 +1320,12 @@ fn spawn_session(
         .ok_or_else(|| anyhow::anyhow!("拿不到 PTY master fd"))?;
     let master = dup_file(raw)?;
     let pty_reader = master.try_clone()?;
+    let state = Arc::new(Mutex::new(SessionState {
+        id: id.to_string(),
+        cwd: cwd.map(String::from),
+        launch: launch.map(String::from),
+        ..Default::default()
+    }));
     let sess = Session {
         ctl: Mutex::new(Ctl {
             master,
@@ -1175,13 +1333,16 @@ fn spawn_session(
             jolt: false,
             cols,
             rows,
+            cwd: cwd.map(String::from),
         }),
         out: Mutex::new(Out {
             buf: Vec::new(),
             client: None,
             watchers: Vec::new(),
         }),
-        term: Mutex::new(new_daemon_term(rows, cols)),
+        term: Mutex::new(new_daemon_term(rows, cols, StateListener { state: Arc::clone(&state) })),
+        state,
+        subscribers: Mutex::new(Vec::new()),
     };
     Ok((sess, Box::new(pty_reader)))
 }
@@ -1285,7 +1446,7 @@ impl Default for SgrState {
 /// - 恢复光标形状/可见性、常用私有模式（bracketed paste / app cursor / 鼠标）
 ///
 /// 不依赖可能被环形缓冲腰斩的原始字节流。
-fn snapshot_ansi(term: &Term<VoidListener>) -> Vec<u8> {
+fn snapshot_ansi<T: EventListener>(term: &Term<T>) -> Vec<u8> {
     let grid = term.grid();
     let cols = term.columns().max(1);
     let screen_lines = term.screen_lines().max(1);
@@ -1950,10 +2111,13 @@ mod watch_tests {
         let pid = child.id() as i32;
         drop(child); // Child::drop 不 wait()，留成 zombie，交给 pump 收尾时的 waitpid
 
+        let state = Arc::new(Mutex::new(SessionState::default()));
         Arc::new(Session {
-            ctl: Mutex::new(Ctl { master, pid, jolt: false, cols, rows }),
+            ctl: Mutex::new(Ctl { master, pid, jolt: false, cols, rows, cwd: None }),
             out: Mutex::new(Out { buf: Vec::new(), client: None, watchers: Vec::new() }),
-            term: Mutex::new(new_daemon_term(rows, cols)),
+            term: Mutex::new(new_daemon_term(rows, cols, StateListener { state: Arc::clone(&state) })),
+            state,
+            subscribers: Mutex::new(Vec::new()),
         })
     }
 
