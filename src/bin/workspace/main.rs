@@ -350,7 +350,42 @@ impl Session {
     fn notification_msg(&self, cx: &App) -> Option<String> {
         let mut v = Vec::new();
         collect_leaves(&self.layout, &mut v);
+        // 优先：网格解析出的权限摘要 → OSC 审批文案 → 任意通知
+        if let Some(p) = self.permission_prompt(cx) {
+            if let Some(s) = p.summary {
+                return Some(s);
+            }
+        }
+        if let Some(t) = v.iter().find(|t| t.read(cx).is_awaiting_approval()) {
+            if let Some(s) = t.read(cx).notification() {
+                return Some(s.to_string());
+            }
+        }
         v.iter().find_map(|t| t.read(cx).notification().map(|s| s.to_string()))
+    }
+
+    /// 会话内扫到的权限菜单（优先含审批/菜单的 pane）。
+    fn permission_prompt(&self, cx: &App) -> Option<terminal_view::PermissionPrompt> {
+        let mut v = Vec::new();
+        collect_leaves(&self.layout, &mut v);
+        if let Some(t) = v.iter().find(|t| t.read(cx).is_awaiting_approval()) {
+            if let Some(p) = t.read(cx).permission_prompt() {
+                return Some(p);
+            }
+        }
+        v.iter().find_map(|t| t.read(cx).permission_prompt())
+    }
+
+    /// 需要用户处理的 pane：优先等审批 / 权限菜单，其次任意「需要注意」。
+    fn attention_pane(&self, cx: &App) -> Option<Entity<TerminalView>> {
+        let mut v = Vec::new();
+        collect_leaves(&self.layout, &mut v);
+        if let Some(t) = v.iter().find(|t| t.read(cx).is_awaiting_approval()) {
+            return Some(t.clone());
+        }
+        v.iter()
+            .find(|t| t.read(cx).attention_kind().is_some())
+            .cloned()
     }
 
     /// 活动 pane 末尾 n 行文本（总览卡片迷你预览）。
@@ -369,8 +404,8 @@ impl Session {
     fn status(&self, cx: &App) -> AgentStatus {
         let mut v = Vec::new();
         collect_leaves(&self.layout, &mut v);
-        // 等审批（红）压过一般注意（橙）。daemon 说等审批是协议事实，优先于
-        // OSC 猜出来的 attention_kind。
+        // 等审批（红）压过一般注意（橙）：
+        // 1) daemon 状态通道事实  2) OSC 文案  3) 网格权限菜单
         let mut attention = None;
         for t in &v {
             if let Some(state) = daemon_state_for(t, cx) {
@@ -378,14 +413,15 @@ impl Session {
                     return AgentStatus::WaitingApproval;
                 }
             }
-            match t.read(cx).attention_kind() {
-                Some(terminal_view::AttentionKind::Approval) => {
-                    return AgentStatus::WaitingApproval
-                }
-                Some(terminal_view::AttentionKind::Attention) => {
-                    attention = Some(AgentStatus::NeedsAttention)
-                }
-                None => {}
+            let tv = t.read(cx);
+            if tv.is_awaiting_approval() {
+                return AgentStatus::WaitingApproval;
+            }
+            if matches!(
+                tv.attention_kind(),
+                Some(terminal_view::AttentionKind::Attention)
+            ) {
+                attention = Some(AgentStatus::NeedsAttention);
             }
         }
         if let Some(s) = attention {
@@ -1581,6 +1617,50 @@ impl Workspace {
         self.activate_pane(&pane, window, cx);
     }
 
+    /// 总览：打开会话，并尽量聚焦到「需要处理」的那个 pane。
+    fn overview_open_session(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ix >= self.sessions.len() {
+            return;
+        }
+        let attention = self.sessions[ix].attention_pane(cx);
+        self.activate(ix, window, cx);
+        if let Some(pane) = attention {
+            self.activate_pane(&pane, window, cx);
+        }
+    }
+
+    /// 总览审批：向权限菜单所在 pane 注入选项键（来自网格解析的 `key`，如 `1`/`3`）。
+    /// 留在总览，方便连批；不强制切终端页。
+    fn overview_select_permission(
+        &mut self,
+        ix: usize,
+        key: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ix >= self.sessions.len() || key.is_empty() {
+            return;
+        }
+        let pane = self.sessions[ix]
+            .attention_pane(cx)
+            .unwrap_or_else(|| self.sessions[ix].active.clone());
+        if let Some(sess) = self.sessions.get_mut(ix) {
+            sess.active = pane.clone();
+        }
+        self.active_session = ix;
+        let key = key.to_string();
+        pane.update(cx, |tv, cx| {
+            tv.type_text(&key, cx);
+            tv.send_enter(cx);
+        });
+        cx.notify();
+    }
+
     /// 切换到第 ix 个会话并聚焦。
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.sessions.len() {
@@ -2030,7 +2110,9 @@ impl Workspace {
                     .text_xs()
                     .text_color(muted)
                     .child(if need_attn > 0 {
-                        format!("会话监控 · {need_attn} 需关注 · 点卡片进入终端")
+                        format!(
+                            "会话监控 · {need_attn} 需关注 · 权限菜单从终端解析，可直接点选项"
+                        )
                     } else {
                         format!("会话监控 · {} · 点卡片进入终端", self.sessions.len())
                     }),
@@ -2165,18 +2247,33 @@ impl Workspace {
                     .next()
                     .unwrap_or("")
                     .to_string();
-                let (dot, label, tint) = match statuses[ix] {
+                let status = statuses[ix];
+                let (dot, label, tint) = match status {
                     AgentStatus::WaitingApproval => (c_red, "等你批准", red_tint),
                     AgentStatus::NeedsAttention => (c_amber, "需要处理", amber_tint),
                     AgentStatus::Running => (c_blue, "运行中", blue_tint),
                     AgentStatus::Done => (c_green, "已完成", green_tint),
                     AgentStatus::Idle => (c_muted_dot, "空闲", soft_bg),
                 };
+                let needs_user = matches!(
+                    status,
+                    AgentStatus::WaitingApproval | AgentStatus::NeedsAttention
+                );
+                let is_approval = status == AgentStatus::WaitingApproval;
+                let perm = s.permission_prompt(cx);
                 let panes = s.pane_count();
                 let notif = s.notification_msg(cx);
                 let when = s.notified_at(cx).map(ago);
                 let preview = s.preview(cx, 3);
                 let git = cwd_opt.as_ref().and_then(|c| self.git_cache.get(c).cloned());
+                // 等审批时描红边，方便在网格里扫到
+                let card_edge: Hsla = if is_approval {
+                    c_red.into()
+                } else if status == AgentStatus::NeedsAttention {
+                    c_amber.into()
+                } else {
+                    card_border.into()
+                };
 
                 div()
                     .id(("ov-card", ix))
@@ -2184,7 +2281,7 @@ impl Workspace {
                     .p_4()
                     .rounded(px(18.))
                     .border_1()
-                    .border_color(card_border)
+                    .border_color(card_edge)
                     .bg(card_bg)
                     .shadow_sm()
                     .cursor_pointer()
@@ -2194,7 +2291,9 @@ impl Workspace {
                     .gap_3()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _ev, window, cx| this.activate(ix, window, cx)),
+                        cx.listener(move |this, _ev, window, cx| {
+                            this.overview_open_session(ix, window, cx);
+                        }),
                     )
                     .child(
                         div()
@@ -2250,14 +2349,19 @@ impl Workspace {
                         div().text_xs().text_color(muted).truncate().child(line)
                     }))
                     .children(notif.map(|m| {
+                        let (bg, tc) = if is_approval {
+                            (rgba(0xef444422), c_red)
+                        } else {
+                            (rgba(0xf59e0b22), c_amber)
+                        };
                         div()
                             .px(px(8.))
                             .py(px(4.))
                             .rounded_lg()
-                            .bg(rgba(0xef444418))
+                            .bg(bg)
                             .text_xs()
-                            .text_color(c_red)
-                            .truncate()
+                            .text_color(tc)
+                            .line_clamp(3)
                             .child(m)
                     }))
                     .children((!preview.is_empty()).then(|| {
@@ -2278,6 +2382,75 @@ impl Workspace {
                                 })
                             }))
                     }))
+                    // 需要用户时：网格解析出的选项按钮 / 打开终端
+                    .when(needs_user, |card| {
+                        let ix_open = ix;
+                        let opts = perm.as_ref().map(|p| p.options.clone()).unwrap_or_default();
+                        let has_opts = !opts.is_empty();
+                        card.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_2()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .children(opts.into_iter().enumerate().map(|(oi, opt)| {
+                                    let ix_sel = ix;
+                                    let key = opt.key.clone();
+                                    let label = opt.button_label();
+                                    let primary = opt.is_primary();
+                                    Button::new(SharedString::from(format!("ov-perm-{ix_sel}-{oi}")))
+                                        .label(label)
+                                        .small()
+                                        .when(primary, |b| b.primary())
+                                        .when(!primary, |b| b.ghost())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.overview_select_permission(
+                                                ix_sel, &key, window, cx,
+                                            );
+                                        }))
+                                }))
+                                // 网格没扫到菜单时的兜底：固定 1/3（旧行为）
+                                .when(is_approval && !has_opts, |row| {
+                                    let ix_a = ix;
+                                    let ix_d = ix;
+                                    row.child(
+                                        Button::new(("ov-allow", ix_a))
+                                            .label("允许")
+                                            .small()
+                                            .primary()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.overview_select_permission(
+                                                    ix_a, "1", window, cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("ov-deny", ix_d))
+                                            .label("拒绝")
+                                            .small()
+                                            .ghost()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.overview_select_permission(
+                                                    ix_d, "3", window, cx,
+                                                );
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    Button::new(("ov-open", ix_open))
+                                        .label(if is_approval { "打开终端" } else { "打开" })
+                                        .small()
+                                        .when(!is_approval && !has_opts, |b| b.primary())
+                                        .when(is_approval || has_opts, |b| b.ghost())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.overview_open_session(ix_open, window, cx);
+                                        })),
+                                ),
+                        )
+                    })
             })
             .collect();
 

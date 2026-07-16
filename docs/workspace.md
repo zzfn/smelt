@@ -3,7 +3,7 @@
 基于 [GPUI](https://gpui.rs) 的个人工作台桌面应用：内嵌一个真正的终端，让你在自己的项目里跑
 `claude` / `codex` / `gemini` 等交互式 agent，定位是「AI coding 驾驶舱」——多项目 × 多终端的外壳。
 
-外壳与状态感知都与具体 agent 无关——状态靠终端标题（OSC 0/2）+ OSC 9/777 通知 + 响铃
+外壳与状态感知都与具体 agent 无关——状态靠终端标题（OSC 0/2）+ OSC 9/99/777 通知 + 响铃
 读出来，是终端协议而非私有格式。只有用量统计与历史会话浏览要读
 `~/.claude/projects/**/*.jsonl`，这两项仅支持 Claude Code。
 

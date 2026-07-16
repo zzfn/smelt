@@ -237,6 +237,230 @@ fn classify_attention(msg: &str) -> AttentionKind {
     }
 }
 
+/// 权限菜单里的一个可选项（从终端网格解析）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionOption {
+    /// 注入 PTY 的键（通常是 `"1"` / `"2"` / `"3"`）。
+    pub key: String,
+    /// 选项原文。
+    pub label: String,
+    pub kind: PermissionOptionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionOptionKind {
+    Allow,
+    Deny,
+    Other,
+}
+
+/// 从可视区扫出的权限提示（Claude Code 等 TUI 数字菜单）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionPrompt {
+    pub summary: Option<String>,
+    pub options: Vec<PermissionOption>,
+}
+
+impl PermissionOption {
+    /// 总览按钮短标签。
+    pub fn button_label(&self) -> String {
+        match self.kind {
+            PermissionOptionKind::Allow => {
+                let l = self.label.to_ascii_lowercase();
+                if l == "yes" || l.starts_with("yes.") || l == "allow" || l == "approve" {
+                    "允许".into()
+                } else {
+                    truncate_chars(&self.label, 16)
+                }
+            }
+            PermissionOptionKind::Deny => {
+                let l = self.label.to_ascii_lowercase();
+                if l == "no"
+                    || l.starts_with("no,")
+                    || l.starts_with("no ")
+                    || l == "deny"
+                    || l == "reject"
+                    || l == "cancel"
+                    || self.label.starts_with('否')
+                {
+                    "拒绝".into()
+                } else {
+                    truncate_chars(&self.label, 16)
+                }
+            }
+            PermissionOptionKind::Other => truncate_chars(&self.label, 16),
+        }
+    }
+
+    /// 主按钮：第一个「允许」类且不是「不再询问」。
+    pub fn is_primary(&self) -> bool {
+        matches!(self.kind, PermissionOptionKind::Allow)
+            && !self.label.to_ascii_lowercase().contains("don't ask")
+            && !self.label.contains("不再")
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        t.to_string()
+    } else {
+        format!(
+            "{}…",
+            t.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
+    }
+}
+
+fn classify_option_label(label: &str) -> PermissionOptionKind {
+    let l = label.to_ascii_lowercase();
+    if l == "no"
+        || l.starts_with("no,")
+        || l.starts_with("no ")
+        || l.starts_with("no.")
+        || l.contains("deny")
+        || l.contains("reject")
+        || l.contains("cancel")
+        || l.contains("refuse")
+        || label.contains("拒绝")
+        || label.starts_with('否')
+    {
+        return PermissionOptionKind::Deny;
+    }
+    if l == "yes"
+        || l.starts_with("yes")
+        || l.contains("allow")
+        || l.contains("approve")
+        || l.contains("proceed")
+        || l.contains("accept")
+        || label.contains("允许")
+        || label.contains("批准")
+        || label.starts_with('是')
+    {
+        return PermissionOptionKind::Allow;
+    }
+    PermissionOptionKind::Other
+}
+
+/// 尝试把一行解析成 `1. label` / `1) label` / `[1] label`。
+fn parse_numbered_option_line(raw: &str) -> Option<(String, String)> {
+    let line = raw.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let line = line
+        .trim_start_matches(['❯', '>', '*', '•', '●', '◆', ' '])
+        .trim_start();
+
+    if let Some(rest) = line.strip_prefix('[') {
+        let (n, after) = rest.split_once(']')?;
+        let n = n.trim();
+        if n.is_empty() || n.len() > 2 || !n.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let label = after
+            .trim()
+            .trim_start_matches(['.', ')', ':', '-', ' '])
+            .trim();
+        if label.is_empty() {
+            return None;
+        }
+        return Some((n.to_string(), label.to_string()));
+    }
+
+    let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 2 {
+        return None;
+    }
+    let rest = line[digits.len()..].trim_start();
+    // 必须有分隔符，避免把 `1foo` 当选项
+    let rest = if let Some(r) = rest.strip_prefix('.') {
+        r
+    } else if let Some(r) = rest.strip_prefix(')') {
+        r
+    } else if let Some(r) = rest.strip_prefix(':') {
+        r
+    } else {
+        return None;
+    };
+    let label = rest.trim();
+    if label.is_empty() || label.starts_with('/') || label.starts_with("http") {
+        return None;
+    }
+    Some((digits, label.to_string()))
+}
+
+/// 从终端末尾行解析权限数字菜单（Claude Code 等）。
+///
+/// 典型形态：
+/// ```text
+/// Do you want to proceed?
+/// ❯ 1. Yes
+///   2. Yes, and don't ask again …
+///   3. No, and tell Claude what to do differently
+/// ```
+pub fn parse_permission_prompt(lines: &[String]) -> Option<PermissionPrompt> {
+    let mut options: Vec<PermissionOption> = Vec::new();
+    let mut option_line_idxs: Vec<usize> = Vec::new();
+
+    for (i, raw) in lines.iter().enumerate() {
+        let Some((key, label)) = parse_numbered_option_line(raw) else {
+            continue;
+        };
+        options.push(PermissionOption {
+            key,
+            label: label.clone(),
+            kind: classify_option_label(&label),
+        });
+        option_line_idxs.push(i);
+    }
+
+    if options.len() < 2 {
+        return None;
+    }
+
+    let has_perm_word = options
+        .iter()
+        .any(|o| !matches!(o.kind, PermissionOptionKind::Other));
+    let first = *option_line_idxs.first()?;
+    let last = *option_line_idxs.last()?;
+    let ctx_start = first.saturating_sub(4);
+    let context_hint = lines[ctx_start..=last].iter().any(|l| {
+        let t = l.to_ascii_lowercase();
+        t.contains("permission")
+            || t.contains("approv")
+            || t.contains("proceed")
+            || t.contains("allow")
+            || t.contains("do you want")
+            || t.contains("bash command")
+            || t.contains("tool call")
+            || t.contains("run this")
+            || t.contains("权限")
+            || t.contains("批准")
+            || t.contains("是否")
+            || t.contains("允许")
+            || t.contains("esc to cancel")
+            || t.contains("don't ask")
+    });
+    if !has_perm_word && !context_hint {
+        return None;
+    }
+
+    let summary = lines[..first].iter().rev().find_map(|l| {
+        let t = l.trim();
+        if t.is_empty() || parse_numbered_option_line(t).is_some() {
+            return None;
+        }
+        Some(truncate_chars(t, 120))
+    });
+
+    if options.len() > 4 {
+        options.truncate(4);
+    }
+
+    Some(PermissionPrompt { summary, options })
+}
+
 /// 同一终端同文本的系统通知最小间隔。
 const NOTIFY_DEDUP: Duration = Duration::from_secs(60);
 
@@ -478,6 +702,18 @@ impl TerminalView {
     /// 当前注意力等级：有待处理通知时按文本分类（等审批 > 一般注意）。
     pub fn attention_kind(&self) -> Option<AttentionKind> {
         self.notification.as_deref().map(classify_attention)
+    }
+
+    /// 从终端末尾网格解析权限菜单；无菜单时 `None`。
+    pub fn permission_prompt(&self) -> Option<PermissionPrompt> {
+        let lines = self.last_lines(28);
+        parse_permission_prompt(&lines)
+    }
+
+    /// 是否像「等审批」：OSC 文案分类 **或** 网格里扫到权限菜单。
+    pub fn is_awaiting_approval(&self) -> bool {
+        matches!(self.attention_kind(), Some(AttentionKind::Approval))
+            || self.permission_prompt().is_some()
     }
 
     /// 是否「任务完成未读」（Running→Idle 后用户还没回应过）。
@@ -2756,5 +2992,54 @@ mod tests {
         let (thumb_h, thumb_y) = scrollbar_thumb(track_h, 40, 0, 0);
         assert_eq!(thumb_h, track_h);
         assert_eq!(thumb_y, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod permission_prompt_tests {
+    use super::{parse_permission_prompt, PermissionOptionKind};
+
+    fn lines(s: &str) -> Vec<String> {
+        s.lines().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_claude_style_numbered_menu() {
+        let p = parse_permission_prompt(&lines(
+            "Do you want to proceed?\n\
+             ❯ 1. Yes\n\
+               2. Yes, and don't ask again for bash commands\n\
+               3. No, and tell Claude what to do differently\n\
+             Esc to cancel",
+        ))
+        .expect("prompt");
+        assert_eq!(p.summary.as_deref(), Some("Do you want to proceed?"));
+        assert_eq!(p.options.len(), 3);
+        assert_eq!(p.options[0].key, "1");
+        assert_eq!(p.options[0].kind, PermissionOptionKind::Allow);
+        assert!(p.options[0].is_primary());
+        assert_eq!(p.options[1].kind, PermissionOptionKind::Allow);
+        assert!(!p.options[1].is_primary());
+        assert_eq!(p.options[2].key, "3");
+        assert_eq!(p.options[2].kind, PermissionOptionKind::Deny);
+        assert_eq!(p.options[0].button_label(), "允许");
+        assert_eq!(p.options[2].button_label(), "拒绝");
+    }
+
+    #[test]
+    fn rejects_plain_numbered_list_without_permission_context() {
+        assert!(
+            parse_permission_prompt(&lines("1. install deps\n2. run tests\n3. deploy")).is_none()
+        );
+    }
+
+    #[test]
+    fn accepts_bracket_style_with_permission_hint() {
+        let p = parse_permission_prompt(&lines(
+            "Permission required\n[1] Allow\n[2] Deny",
+        ))
+        .expect("prompt");
+        assert_eq!(p.options[0].kind, PermissionOptionKind::Allow);
+        assert_eq!(p.options[1].kind, PermissionOptionKind::Deny);
     }
 }

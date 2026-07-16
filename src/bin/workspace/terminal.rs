@@ -221,7 +221,7 @@ impl Dimensions for TermSize {
     }
 }
 
-/// 通知消息的共享槽：EventProxy（响铃 Bell）与 reader 线程（OSC 9/777）都往这写，
+/// 通知消息的共享槽：EventProxy（响铃 Bell）与 reader 线程（OSC 9/99/777）都往这写，
 /// UI 侧轮询 take_notification 取走，用作「agent 需要注意」提示。
 type NotifySlot = Arc<Mutex<Option<String>>>;
 
@@ -358,7 +358,7 @@ fn os_clipboard_read() -> String {
     String::new()
 }
 
-// OSC 9/777 扫描（`OscScan`）挪到 crate::osc 了，跟守护共用一份，不在这再复制。
+// OSC 9/99/777 扫描（`OscScan`）在 crate::osc，跟守护共用；含 Kitty OSC 99。
 
 // ===================== smeltd 守护连接层 =====================
 
@@ -940,6 +940,22 @@ pub struct Terminal {
 const HANDSHAKE_RETRIES: u32 = 5;
 const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(300);
 
+/// reattach 快照整段灌进客户端 Term 之后：贴底 + 补鼠标模式位。
+///
+/// 守护快照应已带 `1006/1002…`，但实机偶发客户端 Term 停在备用屏却没有
+/// `MOUSE_MODE`，`scroll_wheel` 会误滚本地 history（Grok/Claude「外面滚」）。
+/// 这里只改**本地**解析状态，让分流走应用滚轮；应用侧若已开鼠标会吃到事件。
+fn finalize_reattach_term(term: &mut Term<EventProxy>, parser: &mut Processor) {
+    term.scroll_display(Scroll::Bottom);
+    let mode = *term.mode();
+    let alt = mode.contains(TermMode::ALT_SCREEN);
+    let mouse = mode.intersects(TermMode::MOUSE_MODE);
+    if alt && !mouse {
+        // SGR + cell motion：与 Claude/Grok 常见组合一致
+        parser.advance(term, b"\x1b[?1006h\x1b[?1002h");
+    }
+}
+
 impl Terminal {
     /// 打开（或重连）守护里 id 对应的会话：shell 环境由 smeltd 负责（-l / TERM /
     /// iTerm2 伪装 / LANG 兜底，见 smeltd.rs）。id 已存在 → attach，守护先重放输出
@@ -1005,7 +1021,7 @@ impl Terminal {
         );
         let term = Arc::new(Mutex::new(term));
 
-        // 3) 后台读线程：守护转发的 PTY 字节 → vte 解析更新 Term 网格 + 扫 OSC 9/777。
+        // 3) 后台读线程：守护转发的 PTY 字节 → vte 解析更新 Term 网格 + 扫 OSC 9/99/777。
         //    EOF = shell 退出或守护离线（网格冻结，重开会话即恢复）。
         //    复用尺寸行的 BufReader：重放字节可能已在其内部缓冲里。
         // 重绘唤醒通道：读线程 → UI。bounded(1) 合并突发（已有待处理唤醒时后续 try_send
@@ -1023,7 +1039,7 @@ impl Terminal {
             let mut osc = crate::osc::OscScan::default();
             let mut buf = [0u8; 4096];
             let mut bytes_seen: usize = 0;
-            // 重放缓冲里的历史字节可能藏着早就处理完的 OSC 9/777 通知（比如 Claude
+            // 重放缓冲里的历史字节可能藏着早就处理完的 OSC 9/99/777 通知（比如 Claude
             // 之前问过的权限确认，用户当时已经批准、任务也跑完了）——reattach 时如果
             // 原样喂给通知扫描，会把它们当成刚发生的事件重新弹出来，把明明已完成的
             // 会话错误标红（"重开 app 状态变红"那个 bug）。sink 接住落在 replay_len
@@ -1031,11 +1047,13 @@ impl Terminal {
             // 每个字节仍然逐一喂给 osc（状态机不断流），只是根据这个字节的绝对位置
             // 决定它触发的通知该进哪个槽，边界处不会解析错位。
             let sink: Mutex<Option<String>> = Mutex::new(None);
+            // reattach 快照是否已整段喂完；越过边界时补一次「贴底 + 鼠标位兜底」。
+            let mut replay_finalized = replay_len == 0;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF：shell 退出
                     Ok(n) => {
-                        // OSC 9/777 通知：alacritty 不解析，自己扫字节提取
+                        // OSC 9/99/777 通知：alacritty 不解析，自己扫字节提取
                         for (i, &b) in buf[..n].iter().enumerate() {
                             let target =
                                 if bytes_seen + i < replay_len { &sink } else { &notify_reader };
@@ -1048,6 +1066,13 @@ impl Terminal {
                         bytes_seen += n;
                         if let Ok(mut term) = term_reader.lock() {
                             parser.advance(&mut *term, &buf[..n]);
+                            // 快照刚灌完：强制贴底，并在「备用屏却无鼠标上报」时本地补上
+                            // 1006+1002，让 scroll_wheel 走应用滚轮而不是本地 history
+                            // （reattach 后 Grok/Claude 整屏被外壳滚的根因）。
+                            if !replay_finalized && bytes_seen >= replay_len {
+                                replay_finalized = true;
+                                finalize_reattach_term(&mut term, &mut parser);
+                            }
                         }
                         // 喂完这批立刻请求一次重绘（Zed 式：内容生产者驱动重绘）。
                         // bounded(1) + try_send：已有待处理唤醒就丢弃，天然合并。
@@ -1119,7 +1144,7 @@ impl Terminal {
         Ok((buffered, size, replay_len))
     }
 
-    /// 取走最新通知消息（读并清）：响铃或 OSC 9/777 上报的「需要注意」文本。
+    /// 取走最新通知消息（读并清）：响铃或 OSC 9/99/777 上报的「需要注意」文本。
     pub fn take_notification(&self) -> Option<String> {
         self.notify.lock().ok().and_then(|mut g| g.take())
     }
@@ -1444,10 +1469,11 @@ impl Terminal {
 
     /// 滚轮：按终端当前模式分流，`lines` 正数向上、负数向下，`(row,col)` 为 0 基单元格。
     ///
-    /// - 应用开了鼠标上报（MOUSE_MODE）→ 把滚轮编码成鼠标滚轮事件发给应用。**Claude Code
-    ///   等 TUI 就是靠这个滚动**（它们在备用屏、无本地 scrollback，等的是鼠标事件）。
-    /// - 备用屏 + 备用滚动（ALT_SCREEN+ALTERNATE_SCROLL）→ 发方向键。
-    /// - 否则（普通主屏）→ 滚本地历史缓冲。
+    /// - 应用开了鼠标上报（MOUSE_MODE）→ SGR/X10 滚轮事件发给应用（Claude/Grok TUI）。
+    /// - **备用屏但鼠标位丢失**（reattach 常见）→ 仍发 SGR 滚轮，避免滚本地 history
+    ///   「在 Grok 外面整屏滚」。
+    /// - 否则若开了 ALTERNATE_SCROLL → 方向键。
+    /// - 普通主屏 → 滚本地历史缓冲。
     pub fn scroll_wheel(&mut self, lines: i32, row: usize, col: usize) {
         let mode = match self.term.lock() {
             Ok(term) => *term.mode(),
@@ -1457,28 +1483,37 @@ impl Terminal {
         let up = lines > 0;
 
         // intersects 而非 contains：MOUSE_MODE 是 REPORT_CLICK|MOTION|DRAG 的组合，很多 TUI
-        // （如 Claude Code）只开其中一位（MOUSE_MOTION），contains 会漏判，intersects 才对。
-        if mode.intersects(TermMode::MOUSE_MODE) {
-            // 鼠标滚轮「按下」事件：上=64 下=65；坐标 1 基。
+        // 只开其中一位（MOUSE_MOTION），contains 会漏判。
+        let mouse_on = mode.intersects(TermMode::MOUSE_MODE);
+        let alt_screen = mode.contains(TermMode::ALT_SCREEN);
+        if mouse_on {
+            // 上=64 下=65；坐标 1 基。
             let cb: u8 = if up { 64 } else { 65 };
             let cx = col.saturating_add(1);
             let cy = row.saturating_add(1);
+            let sgr = mode.contains(TermMode::SGR_MOUSE);
             let mut buf = Vec::new();
             for _ in 0..count {
-                if mode.contains(TermMode::SGR_MOUSE) {
+                if sgr {
                     buf.extend_from_slice(format!("\x1b[<{cb};{cx};{cy}M").as_bytes());
                 } else {
-                    // 普通 X10 编码：各值偏移 32，坐标裁到 223。
                     let bx = 32u8.saturating_add(cx.min(223) as u8);
                     let by = 32u8.saturating_add(cy.min(223) as u8);
                     buf.extend_from_slice(&[0x1b, b'[', b'M', 32 + cb, bx, by]);
                 }
             }
             self.send_input(&buf);
-        } else if mode.contains(TermMode::ALT_SCREEN)
-            && mode.contains(TermMode::ALTERNATE_SCROLL)
-        {
-            // 备用屏无本地历史：发方向键（应用光标模式用 SS3，否则 CSI）。
+        } else if alt_screen {
+            // reattach 丢 mouse 位时的兜底：备用屏按 TUI 发 SGR 滚轮，绝不滚本地 history。
+            let cb: u8 = if up { 64 } else { 65 };
+            let cx = col.saturating_add(1);
+            let cy = row.saturating_add(1);
+            let mut buf = Vec::new();
+            for _ in 0..count {
+                buf.extend_from_slice(format!("\x1b[<{cb};{cx};{cy}M").as_bytes());
+            }
+            self.send_input(&buf);
+        } else if mode.contains(TermMode::ALTERNATE_SCROLL) {
             let seq: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
                 (true, true) => b"\x1bOA",
                 (true, false) => b"\x1b[A",
@@ -1491,8 +1526,6 @@ impl Terminal {
             }
             self.send_input(&buf);
         } else {
-            // 不用 if-let 挂 lock()：Edition 2024 下 if-let 临时值 drop 更早，
-            // 与 MutexGuard 同句时语义含糊；拆成块内绑定更清晰。
             let Ok(mut term) = self.term.lock() else { return };
             term.scroll_display(Scroll::Delta(lines));
         }
@@ -2229,6 +2262,8 @@ mod mouse_encode_tests {
         assert_eq!(encode_mouse(sgr, 32, true, 2, 4), b"\x1b[<32;5;3M");
     }
 }
+
+// OSC 通知解析单测见 crate::osc（workspace 与 smeltd 共用）。
 
 #[cfg(test)]
 mod search_literal_tests {
