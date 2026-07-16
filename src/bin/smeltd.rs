@@ -182,6 +182,25 @@ fn sock_path() -> std::path::PathBuf {
     dir.join("smeltd.sock")
 }
 
+/// 追加一行到 ~/.smelt/daemon.log。只给「守护无声死亡」的几条路径留痕用——
+/// 守护被 SIGKILL（例：装新版时用 cp 覆盖了已签名二进制，upgrade 的 exec 会被
+/// macOS 内核直接杀掉，无输出无崩溃报告）或静默 return 时，这份日志是唯一线索：
+/// 日志停在「即将 exec」而没有下一行「交接完成」，就是 exec 被杀。
+fn dlog(msg: &str) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sock_path().with_file_name("daemon.log"))
+    {
+        let _ = writeln!(f, "[{ts}] pid={} {msg}", std::process::id());
+    }
+}
+
 /// 本进程可执行文件的 mtime（unix 秒）：作为「版本身份」上报给 GUI。GUI 拿磁盘上
 /// smeltd 二进制的当前 mtime 一比，就知道正在跑的守护是不是重装/重编译前的旧进程。
 fn exe_mtime_secs() -> u64 {
@@ -878,8 +897,14 @@ fn main() {
     // 建在 resume_handoff 之前：交接恢复的会话也需要一份 Subscribers 去广播状态。
     let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
     let (listener, sessions) = match handoff.and_then(|p| resume_handoff(&p, &subscribers)) {
-        Some(x) => x,
+        Some(x) => {
+            dlog(&format!("upgrade: 交接完成，恢复 {} 个会话", x.1.lock().map(|s| s.len()).unwrap_or(0)));
+            x
+        }
         None => {
+            if came_from_handoff {
+                dlog("upgrade: 交接文件恢复失败，走全新启动（会话丢失但守护存活）");
+            }
             // 单实例检查只在「不是从交接来的」这条路径上做：能连上说明已有活守护，
             // 直接退出。若 came_from_handoff 为真，说明本进程就是刚从上一代 exec
             // 过来的替身——这种情况下绝不能做这个检查：上一代把监听 fd 的 CLOEXEC
@@ -895,7 +920,15 @@ fn main() {
             }
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(handoff_path()); // 清掉可能残留的上次交接文件
-            let Ok(listener) = UnixListener::bind(&path) else { return };
+            let listener = match UnixListener::bind(&path) {
+                Ok(l) => l,
+                Err(e) => {
+                    // 曾经是静默 return：守护无声消失、sock 残留，外面完全查不到
+                    // 死因（排障时被坑过——必须留痕）。
+                    dlog(&format!("bind {} 失败，守护退出：{e}", path.display()));
+                    return;
+                }
+            };
             // socket 仅本用户可读写。
             let _ = std::fs::set_permissions(
                 &path,
@@ -2039,6 +2072,11 @@ fn handle_upgrade(conn: UnixStream, sessions: &Sessions, listen_fd: RawFd) {
     // exec 失败的情况客户端会看到 ok:true 但轮询版本发现没变，按"升级未生效"处理。
     let _ = writeln!(c, "{}", serde_json::json!({ "ok": true }));
 
+    // 死前留痕：exec 可能不返回也不失败——被 macOS 内核 SIGKILL（新二进制以
+    // cp 覆盖方式安装、同 inode 改写破坏签名时）。日志停在这一行而没有后续的
+    // 「交接完成」，就是这种死法。
+    dlog(&format!("upgrade: 即将 exec {}（{} 个会话交接）", exe.display(), fds.len()));
+
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(&exe).env("SMELTD_HANDOFF", &hp).exec();
 
@@ -2047,6 +2085,7 @@ fn handle_upgrade(conn: UnixStream, sessions: &Sessions, listen_fd: RawFd) {
     for &fd in &fds {
         set_cloexec(fd, true);
     }
+    dlog(&format!("upgrade: exec 失败已回滚，继续用旧版服务：{err}"));
     eprintln!("smeltd 无缝升级 exec 失败: {err}");
 }
 
