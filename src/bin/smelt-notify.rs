@@ -55,9 +55,30 @@ fn map_hook_event(hook: &serde_json::Value) -> Option<(&'static str, Option<Stri
     match event {
         "UserPromptSubmit" => Some(("thinking", None)),
         "PreToolUse" => {
-            let tool = hook["tool_name"].as_str().map(String::from);
+            // question 槽位复用为「当前工具」展示（结构面板 / 总览）。
+            let tool = hook["tool_name"].as_str().map(|t| {
+                // 尽量带一点路径/命令摘要
+                let input = &hook["tool_input"];
+                if let Some(cmd) = input["command"].as_str() {
+                    let short = if cmd.len() > 48 {
+                        format!("{}…", &cmd[..48])
+                    } else {
+                        cmd.to_string()
+                    };
+                    format!("Bash: {short}")
+                } else if let Some(p) = input["file_path"]
+                    .as_str()
+                    .or_else(|| input["path"].as_str())
+                {
+                    let name = p.rsplit('/').next().unwrap_or(p);
+                    format!("{t}: {name}")
+                } else {
+                    t.to_string()
+                }
+            });
             Some(("executing_tool", tool))
         }
+        "PostToolUse" => Some(("thinking", None)),
         // 独立的权限请求事件（比 Notification 更明确），见官方 hooks 文档。
         "PermissionRequest" => {
             let tool = hook["tool_name"].as_str().unwrap_or("");

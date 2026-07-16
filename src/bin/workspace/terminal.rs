@@ -1242,12 +1242,65 @@ pub fn tunnel_status() -> TunnelStatus {
 // main.rs 处理，这里只管纯数据结构和阻塞的 socket 通信，跟文件里其它daemon 通信
 // 函数保持同一种分工。
 
-/// GUI 侧订阅状态通道时用的精简镜像（serde 反序列化；多出来的 JSON 字段自动忽略）。
-/// 目前只用到 `id`（map key）和 `phase`（审批/状态点）；要展示更多再按需加字段。
-#[derive(Clone, Debug, serde::Deserialize)]
+/// GUI 侧订阅状态通道的镜像（serde 反序列化；多出来的 JSON 字段自动忽略）。
+/// 字段对齐 smeltd `SessionState` 广播——B 路线「语义面板」的数据源。
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct DaemonSessionState {
     pub id: String,
+    #[serde(default)]
     pub phase: DaemonPhase,
+    /// hook 上报的问句 / 当前工具名（PreToolUse 时 question 常是 tool_name）。
+    #[serde(default)]
+    pub pending_question: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub launch: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// unix 秒，进入当前 phase 的时刻。
+    #[serde(default)]
+    pub phase_since: u64,
+}
+
+impl DaemonSessionState {
+    /// 结构面板用：phase 中文标签。
+    pub fn phase_label(&self) -> &'static str {
+        match self.phase {
+            DaemonPhase::Thinking => "思考中",
+            DaemonPhase::ExecutingTool => "执行工具",
+            DaemonPhase::AwaitingApproval => "等你批准",
+            DaemonPhase::WaitingForUser => "等你输入",
+            DaemonPhase::Idle => "空闲",
+            DaemonPhase::Dead => "已结束",
+        }
+    }
+
+    /// 结构面板副文案：工具名或审批问句。
+    pub fn detail_line(&self) -> Option<String> {
+        let q = self.pending_question.as_deref()?.trim();
+        if q.is_empty() {
+            return None;
+        }
+        Some(match self.phase {
+            DaemonPhase::ExecutingTool => format!("🔧 {q}"),
+            DaemonPhase::AwaitingApproval => format!("⚠ {q}"),
+            DaemonPhase::WaitingForUser => format!("💬 {q}"),
+            _ => q.to_string(),
+        })
+    }
+
+    /// 进入当前 phase 多久（秒）；phase_since 为 0 则 None。
+    pub fn phase_age_secs(&self) -> Option<u64> {
+        if self.phase_since == 0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(now.saturating_sub(self.phase_since))
+    }
 }
 
 /// 跟 smeltd.rs 的 `Phase` 对应，同样 `rename_all = "snake_case"`。

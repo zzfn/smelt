@@ -224,6 +224,16 @@ enum AgentStatus {
     Idle,
 }
 
+/// 总览页筛选：基于 AgentStatus / 状态通道，不猜 TUI。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum OverviewFilter {
+    #[default]
+    All,
+    /// 等批准 + 需要处理
+    NeedsMe,
+    Running,
+}
+
 /// 守护上报的会话状态镜像（全局单例，跨窗口共享）。key = smeltd session id
 /// （每个 pane 一个，见 TerminalView.session_id——不是每个 GUI Session 一个）。
 /// 由 main.rs 启动时那条常驻 subscribe 转发任务维护，`Session::status`/`pane_status`
@@ -232,6 +242,13 @@ enum AgentStatus {
 struct DaemonStates(Arc<Mutex<HashMap<String, terminal::DaemonSessionState>>>);
 
 impl Global for DaemonStates {}
+
+/// 状态通道待弹出的应用内 Notification（subscribe 线程无 Window，render 时 drain）。
+#[derive(Clone, Default)]
+struct PendingAgentNotifs(Arc<Mutex<Vec<(String, String, bool)>>>);
+// (title, message, is_approval)
+
+impl Global for PendingAgentNotifs {}
 
 /// 取某个 pane 对应的守护状态；没有全局单例（比如极早期尚未走到注册那一步）或
 /// 那个 session id 还没有数据都返回 None。
@@ -464,7 +481,8 @@ fn status_color(status: AgentStatus) -> gpui::Rgba {
 /// 设置窗口 pages 列表里的页下标——调整 `render_settings_content` 末尾那个
 /// `pages(vec![...])` 的顺序时必须同步改这里，否则应用菜单「检查更新…」会跳错页。
 const SETTINGS_PAGE_APPEARANCE: usize = 0;
-const SETTINGS_PAGE_UPDATE: usize = 3;
+// appearance / 桌面宠物 / 启动 / Claude 集成 / 更新 / 远程
+const SETTINGS_PAGE_UPDATE: usize = 4;
 
 /// 重命名弹窗改的是谁：侧栏会话行改整个会话的名，分屏子行只改那一个 pane 的名。
 #[derive(Clone)]
@@ -541,6 +559,38 @@ fn pane_status(view: &Entity<TerminalView>, cx: &App) -> AgentStatus {
         return AgentStatus::Done;
     }
     AgentStatus::Idle
+}
+
+/// 总览卡片事实块是否值得展示（过滤终端预览/说明文案误入）。
+fn overview_fact_is_usable(m: &str) -> bool {
+    let t = m.trim();
+    if t.is_empty() || t.len() < 2 {
+        return false;
+    }
+    // 终端状态行 / 快捷键提示
+    if t.contains("Shift+") || t.contains("Ctrl+") || t.contains("manual mode") {
+        return false;
+    }
+    // 开发说明、UI 文案泄漏
+    const BAD: &[&str] = &[
+        "空筛选",
+        "打开终端",
+        "卡片信息",
+        "完全退出",
+        "重开 Smelt",
+        "进 总览",
+        "hook 事实",
+        "待我处理",
+        "权限菜单",
+    ];
+    if BAD.iter().any(|b| t.contains(b)) {
+        return false;
+    }
+    // 纯状态栏碎片
+    if t.starts_with("current ") || t.starts_with("weekly ") {
+        return false;
+    }
+    true
 }
 
 /// 相对时间：「刚刚 / N 秒前 / N 分钟前 / N 小时前」。
@@ -901,6 +951,8 @@ struct Workspace {
     active_session: usize,
     /// 主区当前视图：终端 / 文件树 / Git。
     view: MainView,
+    /// 总览页筛选（全部 / 待我处理 / 运行中）。
+    overview_filter: OverviewFilter,
     /// 文件树里已展开的文件夹绝对路径。
     expanded: HashSet<String>,
     /// 目录列表缓存（绝对路径 → 已排序过滤的直接子项 (名, 是否目录)）。后台读盘填充，
@@ -1188,6 +1240,7 @@ impl Workspace {
             sessions,
             active_session,
             view: MainView::Terminal,
+            overview_filter: OverviewFilter::All,
             expanded: HashSet::new(),
             dir_cache: HashMap::new(),
             dir_inflight: HashSet::new(),
@@ -2616,7 +2669,7 @@ impl Workspace {
                     .text_color(muted)
                     .child(if need_attn > 0 {
                         format!(
-                            "会话监控 · {need_attn} 需关注 · 权限菜单从终端解析，可直接点选项"
+                            "会话监控 · {need_attn} 需关注 · hook 事实 + 终端权限菜单"
                         )
                     } else {
                         format!("会话监控 · {} · 点卡片进入终端", self.sessions.len())
@@ -2668,15 +2721,40 @@ impl Workspace {
             .count();
         let running = statuses.iter().filter(|s| matches!(s, AgentStatus::Running)).count();
         let done = statuses.iter().filter(|s| matches!(s, AgentStatus::Done)).count();
-        let pill = |text: String, color: Hsla, bg: Hsla| {
+        let filter = self.overview_filter;
+        // 筛选：要一眼像「分段按钮」，未选中也有底/边/hover，别和装饰 pill 混。
+        let filter_chip = |id: &'static str, label: String, f: OverviewFilter, color: Hsla, tint: Hsla| {
+            let on = filter == f;
+            let idle_bg: Hsla = rgba(0xffffff14).into();
+            let idle_border: Hsla = rgba(0xffffff28).into();
             div()
-                .px(px(11.))
-                .py(px(4.))
-                .rounded_full()
-                .bg(bg)
+                .id(id)
+                .px(px(12.))
+                .py(px(6.))
+                .rounded_md()
+                .cursor_pointer()
+                .bg(if on { tint } else { idle_bg })
+                .border_1()
+                .border_color(if on { color } else { idle_border })
                 .text_sm()
-                .text_color(color)
-                .child(text)
+                .font_weight(if on {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
+                .text_color(if on { color } else { fg })
+                .hover(|d| {
+                    d.bg(if on { tint } else { rgba(0xffffff22).into() })
+                        .border_color(color)
+                })
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.overview_filter = f;
+                        cx.notify();
+                    }),
+                )
         };
 
         let summary = div()
@@ -2685,10 +2763,38 @@ impl Workspace {
             .gap_2()
             .flex_wrap()
             .mb_4()
-            .child(pill(format!("{} 会话", self.sessions.len()), fg, soft_bg))
-            .child(pill(format!("{need} 需要处理"), c_red, red_tint))
-            .child(pill(format!("{running} 运行中"), c_blue, blue_tint))
-            .children((done > 0).then(|| pill(format!("{done} 已完成"), c_green, green_tint)));
+            .child(filter_chip(
+                "ov-f-all",
+                format!("全部 {}", self.sessions.len()),
+                OverviewFilter::All,
+                fg,
+                soft_bg,
+            ))
+            .child(filter_chip(
+                "ov-f-need",
+                format!("待我处理 {need}"),
+                OverviewFilter::NeedsMe,
+                c_red,
+                red_tint,
+            ))
+            .child(filter_chip(
+                "ov-f-run",
+                format!("运行中 {running}"),
+                OverviewFilter::Running,
+                c_blue,
+                blue_tint,
+            ))
+            .children((done > 0).then(|| {
+                // 纯统计，不可点——灰一点与上面筛选按钮区分
+                div()
+                    .px(px(12.))
+                    .py(px(6.))
+                    .rounded_md()
+                    .bg(soft_bg)
+                    .text_sm()
+                    .text_color(muted)
+                    .child(format!("{done} 已完成"))
+            }));
 
         if self.sessions.is_empty() {
             return div()
@@ -2707,7 +2813,16 @@ impl Workspace {
                 );
         }
 
-        let mut order: Vec<usize> = (0..self.sessions.len()).collect();
+        let mut order: Vec<usize> = (0..self.sessions.len())
+            .filter(|&ix| match filter {
+                OverviewFilter::All => true,
+                OverviewFilter::NeedsMe => matches!(
+                    statuses[ix],
+                    AgentStatus::WaitingApproval | AgentStatus::NeedsAttention
+                ),
+                OverviewFilter::Running => matches!(statuses[ix], AgentStatus::Running),
+            })
+            .collect();
         order.sort_by_key(|&ix| match statuses[ix] {
             AgentStatus::WaitingApproval => 0,
             AgentStatus::NeedsAttention => 1,
@@ -2715,6 +2830,25 @@ impl Workspace {
             AgentStatus::Done => 3,
             AgentStatus::Idle => 4,
         });
+
+        if order.is_empty() {
+            let empty_hint = match filter {
+                OverviewFilter::NeedsMe => "当前没有需要你处理的会话",
+                OverviewFilter::Running => "当前没有运行中的会话",
+                OverviewFilter::All => "没有会话",
+            };
+            return div()
+                .child(summary)
+                .child(
+                    div()
+                        .py_12()
+                        .flex()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(empty_hint),
+                );
+        }
 
         let cards: Vec<_> = order
             .into_iter()
@@ -2727,20 +2861,36 @@ impl Workspace {
                     .as_deref()
                     .and_then(|c| self.session_list.get(c))
                     .and_then(|(_, list)| list.first());
-                let mut live_parts: Vec<String> = Vec::new();
+                // 状态通道（hook 事实）优先；jsonl 作补充。
+                let daemon_detail = {
+                    let mut leaves = Vec::new();
+                    collect_leaves(&self.sessions[ix].layout, &mut leaves);
+                    leaves
+                        .iter()
+                        .find_map(|t| daemon_state_for(t, cx))
+                        .or_else(|| daemon_state_for(&self.sessions[ix].active, cx))
+                };
+                let phase_label = daemon_detail
+                    .as_ref()
+                    .map(|d| d.phase_label().to_string());
+                let phase_detail = daemon_detail.as_ref().and_then(|d| d.detail_line());
+                let phase_age = daemon_detail.as_ref().and_then(|d| d.phase_age_secs());
+                let mut meta_parts: Vec<String> = Vec::new();
                 if let Some((a, b)) = live.and_then(|s| s.started_at.zip(s.last_active_at)) {
                     let mins = (b - a).num_minutes().max(0);
                     if mins > 0 {
-                        live_parts.push(format!("⏱ 跑了 {mins} 分钟"));
+                        meta_parts.push(format!("⏱ {mins} 分钟"));
                     }
                 }
                 if let Some(tokens) = live.map(|s| s.total_tokens).filter(|t| *t > 0) {
-                    live_parts.push(format!("🔢 {} tokens", format_count(tokens)));
+                    meta_parts.push(format!("🔢 {}", format_count(tokens)));
                 }
-                if let Some(tool) = live.and_then(|s| s.last_tool.clone()) {
-                    live_parts.push(format!("🔧 最近 {tool}"));
+                if phase_detail.is_none() {
+                    if let Some(tool) = live.and_then(|s| s.last_tool.clone()) {
+                        meta_parts.push(format!("🔧 最近 {tool}"));
+                    }
                 }
-                let live_line = (!live_parts.is_empty()).then(|| live_parts.join(" · "));
+                let meta_line = (!meta_parts.is_empty()).then(|| meta_parts.join(" · "));
 
                 let s = &self.sessions[ix];
                 let name = s.title(cx);
@@ -2779,6 +2929,28 @@ impl Workspace {
                 } else {
                     card_border.into()
                 };
+                // 审批/工具事实：hook 优先；过滤掉终端预览误扫、说明文案等垃圾。
+                let fact_question = phase_detail
+                    .clone()
+                    .or_else(|| {
+                        // 仅审批/需关注时用 OSC 通知垫底，避免空闲会话把预览塞进红块
+                        if matches!(
+                            statuses[ix],
+                            AgentStatus::WaitingApproval | AgentStatus::NeedsAttention
+                        ) {
+                            notif.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|m| overview_fact_is_usable(m));
+                let age_str = phase_age.map(|a| {
+                    if a < 60 {
+                        format!("已等 {a} 秒")
+                    } else {
+                        format!("已等 {} 分钟", a / 60)
+                    }
+                });
 
                 div()
                     .id(("ov-card", ix))
@@ -2787,7 +2959,12 @@ impl Workspace {
                     .rounded(px(18.))
                     .border_1()
                     .border_color(card_edge)
-                    .bg(card_bg)
+                    .when(is_approval, |d| d.border_2().border_color(c_red))
+                    .bg(if is_approval {
+                        rgb(0x1a1214)
+                    } else {
+                        card_bg
+                    })
                     .shadow_sm()
                     .cursor_pointer()
                     .hover(|d| d.border_color(dot).shadow_lg().bg(rgb(0x1c1e24)))
@@ -2816,8 +2993,12 @@ impl Workspace {
                                     .text_color(fg)
                                     .child(name),
                             )
-                            .children(when.map(|w| {
-                                div().text_xs().text_color(muted).flex_shrink_0().child(w)
+                            .children(age_str.clone().or(when).map(|w| {
+                                div()
+                                    .text_xs()
+                                    .text_color(if is_approval { c_red } else { muted })
+                                    .flex_shrink_0()
+                                    .child(w)
                             })),
                     )
                     .child(
@@ -2833,11 +3014,36 @@ impl Workspace {
                                     .rounded_full()
                                     .bg(tint)
                                     .text_color(dot)
-                                    .child(label),
+                                    .child(
+                                        phase_label
+                                            .clone()
+                                            .unwrap_or_else(|| label.to_string()),
+                                    ),
                             )
                             .child(div().text_color(muted).child(cwd))
                             .child(div().text_color(muted).child(format!("· {panes} 窗格"))),
                     )
+                    // hook 事实块：工具 / 审批问句（审批时更醒目）
+                    .children(fact_question.as_ref().map(|q| {
+                        let (bg, tc) = if is_approval {
+                            (rgba(0xef444433), c_red)
+                        } else if matches!(status, AgentStatus::Running) {
+                            (rgba(0x4a9eff22), c_blue)
+                        } else if matches!(status, AgentStatus::NeedsAttention) {
+                            (rgba(0xf59e0b22), c_amber)
+                        } else {
+                            (rgba(0xffffff0d), muted)
+                        };
+                        div()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .rounded_lg()
+                            .bg(bg)
+                            .text_sm()
+                            .text_color(tc)
+                            .line_clamp(4)
+                            .child(q.clone())
+                    }))
                     .children(git.map(|(branch, changed)| {
                         div()
                             .flex()
@@ -2850,25 +3056,34 @@ impl Workspace {
                                 div().text_color(c_amber).child(format!("● {changed} 改动"))
                             }))
                     }))
-                    .children(live_line.map(|line| {
+                    .children(meta_line.map(|line| {
                         div().text_xs().text_color(muted).truncate().child(line)
                     }))
-                    .children(notif.map(|m| {
-                        let (bg, tc) = if is_approval {
-                            (rgba(0xef444422), c_red)
-                        } else {
-                            (rgba(0xf59e0b22), c_amber)
-                        };
-                        div()
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded_lg()
-                            .bg(bg)
-                            .text_xs()
-                            .text_color(tc)
-                            .line_clamp(3)
-                            .child(m)
-                    }))
+                    // OSC 通知且与 hook 问句不同时再显示
+                    .children(
+                        notif
+                            .filter(|m| {
+                                fact_question
+                                    .as_ref()
+                                    .is_none_or(|q| !q.contains(m.as_str()) && m != q)
+                            })
+                            .map(|m| {
+                                let (bg, tc) = if is_approval {
+                                    (rgba(0xef444422), c_red)
+                                } else {
+                                    (rgba(0xf59e0b22), c_amber)
+                                };
+                                div()
+                                    .px(px(8.))
+                                    .py(px(4.))
+                                    .rounded_lg()
+                                    .bg(bg)
+                                    .text_xs()
+                                    .text_color(tc)
+                                    .line_clamp(2)
+                                    .child(m)
+                            }),
+                    )
                     .children((!preview.is_empty()).then(|| {
                         div()
                             .p_2()
@@ -2887,17 +3102,20 @@ impl Workspace {
                                 })
                             }))
                     }))
-                    // 需要用户时：网格解析出的选项按钮 / 打开终端
+                    // 需要用户时：实心/描边按钮，和侧栏「新建终端」一样有底有边
                     .when(needs_user, |card| {
                         let ix_open = ix;
                         let opts = perm.as_ref().map(|p| p.options.clone()).unwrap_or_default();
                         let has_opts = !opts.is_empty();
+                        let btn_idle: Hsla = rgba(0xffffff18).into();
+                        let btn_border: Hsla = rgba(0xffffff30).into();
                         card.child(
                             div()
                                 .flex()
                                 .flex_wrap()
                                 .items_center()
                                 .gap_2()
+                                .pt_1()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation()
                                 })
@@ -2906,53 +3124,127 @@ impl Workspace {
                                     let key = opt.key.clone();
                                     let label = opt.button_label();
                                     let primary = opt.is_primary();
-                                    Button::new(SharedString::from(format!("ov-perm-{ix_sel}-{oi}")))
-                                        .label(label)
-                                        .small()
-                                        .when(primary, |b| b.primary())
-                                        .when(!primary, |b| b.ghost())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.overview_select_permission(
-                                                ix_sel, &key, window, cx,
-                                            );
-                                        }))
+                                    div()
+                                        .id(SharedString::from(format!("ov-perm-{ix_sel}-{oi}")))
+                                        .px(px(12.))
+                                        .py(px(6.))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(if primary {
+                                            c_green
+                                        } else {
+                                            btn_border
+                                        })
+                                        .bg(if primary {
+                                            green_tint
+                                        } else {
+                                            btn_idle
+                                        })
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(if primary { c_green } else { fg })
+                                        .hover(|d| d.opacity(0.88).border_color(fg))
+                                        .child(label)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.overview_select_permission(
+                                                    ix_sel, &key, window, cx,
+                                                );
+                                            }),
+                                        )
                                 }))
-                                // 网格没扫到菜单时的兜底：固定 1/3（旧行为）
+                                // 网格没扫到菜单时的兜底：固定 1/3
                                 .when(is_approval && !has_opts, |row| {
                                     let ix_a = ix;
                                     let ix_d = ix;
                                     row.child(
-                                        Button::new(("ov-allow", ix_a))
-                                            .label("允许")
-                                            .small()
-                                            .primary()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.overview_select_permission(
-                                                    ix_a, "1", window, cx,
-                                                );
-                                            })),
+                                        div()
+                                            .id(("ov-allow", ix_a))
+                                            .px(px(12.))
+                                            .py(px(6.))
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(c_green)
+                                            .bg(green_tint)
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(c_green)
+                                            .hover(|d| d.opacity(0.88))
+                                            .child("允许")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.overview_select_permission(
+                                                        ix_a, "1", window, cx,
+                                                    );
+                                                }),
+                                            ),
                                     )
                                     .child(
-                                        Button::new(("ov-deny", ix_d))
-                                            .label("拒绝")
-                                            .small()
-                                            .ghost()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.overview_select_permission(
-                                                    ix_d, "3", window, cx,
-                                                );
-                                            })),
+                                        div()
+                                            .id(("ov-deny", ix_d))
+                                            .px(px(12.))
+                                            .py(px(6.))
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(c_red)
+                                            .bg(red_tint)
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(c_red)
+                                            .hover(|d| d.opacity(0.88))
+                                            .child("拒绝")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.overview_select_permission(
+                                                        ix_d, "3", window, cx,
+                                                    );
+                                                }),
+                                            ),
                                     )
                                 })
                                 .child(
-                                    Button::new(("ov-open", ix_open))
-                                        .label(if is_approval { "打开终端" } else { "打开" })
-                                        .small()
-                                        .when(!is_approval && !has_opts, |b| b.primary())
-                                        .when(is_approval || has_opts, |b| b.ghost())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.overview_open_session(ix_open, window, cx);
-                                        })),
+                                    div()
+                                        .id(("ov-open", ix_open))
+                                        .px(px(12.))
+                                        .py(px(6.))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(if is_approval || has_opts {
+                                            btn_border
+                                        } else {
+                                            c_blue
+                                        })
+                                        .bg(if is_approval || has_opts {
+                                            btn_idle
+                                        } else {
+                                            blue_tint
+                                        })
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(if is_approval || has_opts {
+                                            fg
+                                        } else {
+                                            c_blue
+                                        })
+                                        .hover(|d| d.opacity(0.88).border_color(c_blue))
+                                        .child(if is_approval {
+                                            "打开终端"
+                                        } else {
+                                            "打开"
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.overview_open_session(ix_open, window, cx);
+                                            }),
+                                        ),
                                 ),
                         )
                     })
@@ -3346,6 +3638,327 @@ impl Workspace {
         }
     }
 
+    /// B 路线：终端右侧「结构」条——读守护状态通道（hook 事实），不解析 TUI 像素。
+    /// 可折叠（窄条）；总开关在设置 → Claude 集成。
+    fn render_agent_structure_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (fg, muted, border) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground, t.border)
+        };
+        let soft: Hsla = rgba(0xffffff0a).into();
+        let c_red: Hsla = rgb(0xef4444).into();
+        let c_blue: Hsla = rgb(0x4a9eff).into();
+        let c_amber: Hsla = rgb(0xf59e0b).into();
+        let c_green: Hsla = rgb(0x22c55e).into();
+        let red_tint: Hsla = rgba(0xef444422).into();
+        let blue_tint: Hsla = rgba(0x4a9eff22).into();
+        let amber_tint: Hsla = rgba(0xf59e0b22).into();
+        let green_tint: Hsla = rgba(0x22c55e22).into();
+
+        let expanded = cx
+            .try_global::<settings::AgentUiConfig>()
+            .map(|c| c.structure_panel_expanded)
+            .unwrap_or(true);
+
+        // 折叠：窄条，点一下展开
+        if !expanded {
+            return div()
+                .id("agent-structure-collapsed")
+                .w(px(28.))
+                .flex_shrink_0()
+                .h_full()
+                .border_l_1()
+                .border_color(border)
+                .bg(rgb(0x12141a))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt_2()
+                .gap_1()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x1a1c24)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("‹"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(fg)
+                        .child("状"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(fg)
+                        .child("态"),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _, _, cx| {
+                        settings::apply_agent_ui(|c| c.structure_panel_expanded = true, cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element();
+        }
+
+        let sess = self.sessions.get(self.active_session);
+        let mut leaves = Vec::new();
+        if let Some(s) = sess {
+            collect_leaves(&s.layout, &mut leaves);
+        }
+        // 活动 pane 优先，否则扫分屏找有状态的
+        let active = sess.map(|s| s.active.clone());
+        let state = active
+            .as_ref()
+            .and_then(|t| daemon_state_for(t, cx))
+            .or_else(|| leaves.iter().find_map(|t| daemon_state_for(t, cx)));
+
+        let (phase_color, phase_bg) = match state.as_ref().map(|s| s.phase) {
+            Some(terminal::DaemonPhase::AwaitingApproval) => (c_red, red_tint),
+            Some(terminal::DaemonPhase::WaitingForUser) => (c_amber, amber_tint),
+            Some(terminal::DaemonPhase::Thinking | terminal::DaemonPhase::ExecutingTool) => {
+                (c_blue, blue_tint)
+            }
+            Some(terminal::DaemonPhase::Dead) => (muted, soft),
+            _ => (c_green, green_tint),
+        };
+
+        let phase_label = state
+            .as_ref()
+            .map(|s| s.phase_label())
+            .unwrap_or("无守护数据");
+        let detail = state.as_ref().and_then(|s| s.detail_line());
+        let age = state.as_ref().and_then(|s| s.phase_age_secs());
+        let title = state
+            .as_ref()
+            .and_then(|s| s.title.clone())
+            .or_else(|| active.as_ref().map(|t| pane_title(t, cx)));
+        let launch = state.as_ref().and_then(|s| s.launch.clone());
+        let is_approval = matches!(
+            state.as_ref().map(|s| s.phase),
+            Some(terminal::DaemonPhase::AwaitingApproval)
+        );
+        let session_ix = self.active_session;
+
+        let pill = |text: &str, color: Hsla, bg: Hsla| {
+            div()
+                .px(px(8.))
+                .py(px(3.))
+                .rounded_full()
+                .bg(bg)
+                .text_xs()
+                .text_color(color)
+                .child(text.to_string())
+        };
+
+        div()
+            .id("agent-structure-panel")
+            .w(px(220.))
+            .flex_shrink_0()
+            .h_full()
+            .min_h_0()
+            .border_l_1()
+            .border_color(border)
+            .bg(rgb(0x12141a))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(fg)
+                            .child("状态"),
+                    )
+                    .child(
+                        div()
+                            .id("structure-collapse")
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(muted)
+                            .hover(|s| s.bg(border).text_color(fg))
+                            .child("›")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_this, _, _, cx| {
+                                    settings::apply_agent_ui(
+                                        |c| c.structure_panel_expanded = false,
+                                        cx,
+                                    );
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_hidden()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(pill(phase_label, phase_color, phase_bg))
+                    .children(age.map(|a| {
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(if a < 60 {
+                                format!("已 {a} 秒")
+                            } else {
+                                format!("已 {} 分钟", a / 60)
+                            })
+                    }))
+                    .children(title.map(|t| {
+                        div()
+                            .text_xs()
+                            .text_color(fg)
+                            .font_semibold()
+                            .child(t)
+                    }))
+                    .children(launch.map(|l| {
+                        div().text_xs().text_color(muted).child(format!("启动 · {l}"))
+                    }))
+                    .children(
+                        state
+                            .as_ref()
+                            .and_then(|s| s.cwd.clone())
+                            .map(|c| {
+                                let short = c
+                                    .trim_end_matches('/')
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&c)
+                                    .to_string();
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("📁 {short}"))
+                            }),
+                    )
+                    .children(detail.map(|d| {
+                        div()
+                            .p_2()
+                            .rounded_md()
+                            .bg(soft)
+                            .text_xs()
+                            .text_color(fg)
+                            .child(d)
+                    }))
+                    .children(is_approval.then(|| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("快捷（写入活动 pane）"),
+                            )
+                            .child(
+                                div()
+                                    .id(("struct-approve", session_ix))
+                                    .px_2()
+                                    .py(px(6.))
+                                    .rounded_md()
+                                    .bg(green_tint)
+                                    .text_xs()
+                                    .text_color(c_green)
+                                    .cursor_pointer()
+                                    .hover(|s| s.opacity(0.85))
+                                    .child("批准（1 ↵）")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.structure_inject_keys(
+                                                session_ix,
+                                                "1",
+                                                true,
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("struct-deny", session_ix))
+                                    .px_2()
+                                    .py(px(6.))
+                                    .rounded_md()
+                                    .bg(red_tint)
+                                    .text_xs()
+                                    .text_color(c_red)
+                                    .cursor_pointer()
+                                    .hover(|s| s.opacity(0.85))
+                                    .child("拒绝（3 ↵）")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.structure_inject_keys(
+                                                session_ix,
+                                                "3",
+                                                true,
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                    ),
+                            )
+                    }))
+                    .when(state.is_none(), |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(
+                                    "暂无状态上报。用 smelt 新开 Claude 会话，并在设置 → Claude 集成里装好 hooks 后，这里会显示思考/工具/审批。",
+                                ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// 结构面板快捷键注入活动 pane（数字菜单审批等）。
+    fn structure_inject_keys(
+        &mut self,
+        ix: usize,
+        key: &str,
+        with_enter: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ix >= self.sessions.len() || key.is_empty() {
+            return;
+        }
+        let pane = self.sessions[ix].active.clone();
+        let key = key.to_string();
+        pane.update(cx, |tv, cx| {
+            tv.type_text(&key, cx);
+            if with_enter {
+                tv.send_enter(cx);
+            }
+        });
+        cx.notify();
+    }
+
     /// 递归渲染分屏布局树：Leaf 渲染一个终端（活动 pane 描边 + 点击聚焦），
     /// Split 用 h/v_resizable 把子节点排成可拖拽的并排 / 堆叠。
     fn render_pane(&self, pane: &Pane, path: &str, cx: &mut Context<Self>) -> AnyElement {
@@ -3507,6 +4120,18 @@ impl Render for Workspace {
         // 这个字段（后台任务里没有 Window，弹不了通知），render 一开始就取走弹成通知。
         if let Some(msg) = self.background_error.take() {
             window.push_notification(Notification::error(msg), cx);
+        }
+        // 状态通道：等批准 / 等输入 → gpui-component Notification
+        if let Some(pending) = cx.try_global::<PendingAgentNotifs>() {
+            let batch = std::mem::take(&mut *pending.0.lock().unwrap());
+            for (title, message, is_approval) in batch {
+                let n = if is_approval {
+                    Notification::warning(message).title(title)
+                } else {
+                    Notification::info(message).title(title)
+                };
+                window.push_notification(n, cx);
+            }
         }
 
         // Git 页：后台刷新改动列表 + 分支列表（git status/for-each-ref 慢，绝不在
@@ -4302,15 +4927,36 @@ impl Render for Workspace {
                     }),
             );
 
-        // 主内容：有会话就渲染当前会话的分屏布局树；无会话显示空状态引导。
+        // 主内容：有会话就渲染当前会话的分屏布局树 + 可选右侧结构面板。
         // 需 .flex()，否则单 pane 的叶子 flex_1 不生效、塌缩到内容高度（边框不到底）。
         let content = if self.sessions.get(self.active_session).is_some() {
-            div()
+            let show_struct = cx
+                .try_global::<settings::AgentUiConfig>()
+                .map(|c| c.show_structure_panel)
+                .unwrap_or(true);
+            let mut row = div()
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
                 .flex()
-                .child(self.render_pane(&self.sessions[self.active_session].layout, "pane", cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .flex()
+                        .child(
+                            self.render_pane(
+                                &self.sessions[self.active_session].layout,
+                                "pane",
+                                cx,
+                            ),
+                        ),
+                );
+            if show_struct {
+                row = row.child(self.render_agent_structure_panel(cx));
+            }
+            row
         } else {
             // 空状态：引导用户新建会话 / 打开项目。
             let btn = |id: &'static str, label: &'static str| {
@@ -5189,6 +5835,8 @@ fn main() {
         // 是同一个搭桥模式。
         let daemon_states = DaemonStates::default();
         cx.set_global(daemon_states.clone());
+        cx.set_global(PendingAgentNotifs::default());
+        cx.set_global(settings::load_agent_ui_config());
         let (daemon_state_tx, daemon_state_rx) =
             smol::channel::unbounded::<terminal::DaemonStateEvent>();
         thread::spawn(move || loop {
@@ -5199,6 +5847,13 @@ fn main() {
             while let Ok(event) = daemon_state_rx.recv().await {
                 let _ = cx.update(|cx| {
                     let states = cx.global::<DaemonStates>().0.clone();
+                    let notify_on = cx
+                        .try_global::<settings::AgentUiConfig>()
+                        .map(|c| c.notify_awaiting)
+                        .unwrap_or(true);
+                    let pending = cx
+                        .try_global::<PendingAgentNotifs>()
+                        .map(|p| p.0.clone());
                     {
                         let mut map = states.lock().unwrap();
                         match event {
@@ -5209,6 +5864,26 @@ fn main() {
                                 }
                             }
                             terminal::DaemonStateEvent::Update(s) => {
+                                let prev = map.get(&s.id).map(|p| p.phase);
+                                let entered_await = matches!(
+                                    s.phase,
+                                    terminal::DaemonPhase::AwaitingApproval
+                                        | terminal::DaemonPhase::WaitingForUser
+                                ) && prev != Some(s.phase);
+                                if notify_on && entered_await {
+                                    if let Some(q) = pending {
+                                        let title = s.phase_label().to_string();
+                                        let msg = s
+                                            .detail_line()
+                                            .or_else(|| s.title.clone())
+                                            .unwrap_or_else(|| {
+                                                format!("会话 {}", &s.id[..8.min(s.id.len())])
+                                            });
+                                        let is_appr = s.phase
+                                            == terminal::DaemonPhase::AwaitingApproval;
+                                        q.lock().unwrap().push((title, msg, is_appr));
+                                    }
+                                }
                                 map.insert(s.id.clone(), s);
                             }
                         }

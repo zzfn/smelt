@@ -229,6 +229,222 @@ fn apply_launch_config(f: impl FnOnce(&mut LaunchConfig), cx: &mut App) {
     cx.set_global(c);
 }
 
+// ===================== Agent UI / Claude hooks（B 路线） =====================
+
+fn default_true() -> bool {
+    true
+}
+
+/// 结构面板 + 审批通知等偏好（`~/.smelt/agent_ui.json`）。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentUiConfig {
+    /// 终端页是否显示「结构」侧栏（总开关）。
+    #[serde(default = "default_true")]
+    pub show_structure_panel: bool,
+    /// 结构侧栏是否展开（false = 只留窄条，可点展开）。
+    #[serde(default = "default_true")]
+    pub structure_panel_expanded: bool,
+    /// 状态通道进入「等你批准 / 等你输入」时用 Notification 组件弹出。
+    #[serde(default = "default_true")]
+    pub notify_awaiting: bool,
+}
+
+impl Default for AgentUiConfig {
+    fn default() -> Self {
+        Self {
+            show_structure_panel: true,
+            structure_panel_expanded: true,
+            notify_awaiting: true,
+        }
+    }
+}
+
+impl Global for AgentUiConfig {}
+
+fn agent_ui_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".smelt").join("agent_ui.json"))
+}
+
+pub fn load_agent_ui_config() -> AgentUiConfig {
+    crate::json_store::load_json(agent_ui_path())
+}
+
+fn save_agent_ui_config(c: &AgentUiConfig) {
+    crate::json_store::save_json(agent_ui_path(), c);
+}
+
+pub fn apply_agent_ui(f: impl FnOnce(&mut AgentUiConfig), cx: &mut App) {
+    let mut c = cx.global::<AgentUiConfig>().clone();
+    f(&mut c);
+    save_agent_ui_config(&c);
+    cx.set_global(c);
+}
+
+/// smelt-notify 安装路径（与 package/安装脚本约定一致）。
+pub fn smelt_notify_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| "/tmp".into())
+        .join(".smelt")
+        .join("bin")
+        .join("smelt-notify")
+}
+
+fn claude_settings_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
+}
+
+const SMELT_HOOK_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "Notification",
+    "UserPromptSubmit",
+    "Stop",
+    "SessionEnd",
+];
+
+/// Claude hooks 是否已装上 smelt-notify（任一事件含该 command 即视为已装）。
+pub fn claude_hooks_installed() -> bool {
+    let Some(path) = claude_settings_path() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let notify = smelt_notify_path();
+    let notify_s = notify.to_string_lossy();
+    let Some(hooks) = v.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    for ev in SMELT_HOOK_EVENTS {
+        let Some(arr) = hooks.get(*ev).and_then(|x| x.as_array()) else {
+            continue;
+        };
+        for m in arr {
+            let Some(hs) = m.get("hooks").and_then(|x| x.as_array()) else {
+                continue;
+            };
+            for h in hs {
+                if h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c == notify_s || c.ends_with("/smelt-notify"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 把 smelt-notify 写入 ~/.claude/settings.json（幂等）；成功返回 Ok。
+pub fn install_claude_hooks() -> Result<(), String> {
+    let notify = smelt_notify_path();
+    if !notify.is_file() {
+        return Err(format!(
+            "找不到 {}，请先编译安装 smelt-notify",
+            notify.display()
+        ));
+    }
+    let path = claude_settings_path().ok_or_else(|| "无 home 目录".to_string())?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut root: serde_json::Value = if path.is_file() {
+        let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    let hooks = root
+        .as_object_mut()
+        .ok_or_else(|| "settings.json 根不是对象".to_string())?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or_else(|| "hooks 不是对象".to_string())?;
+    let cmd = notify.to_string_lossy().to_string();
+    let entry = serde_json::json!({
+        "type": "command",
+        "command": cmd,
+    });
+    for ev in SMELT_HOOK_EVENTS {
+        let arr = hooks_obj
+            .entry(*ev)
+            .or_insert_with(|| serde_json::json!([]));
+        let list = arr
+            .as_array_mut()
+            .ok_or_else(|| format!("hooks.{ev} 不是数组"))?;
+        // 已有 smelt-notify 则跳过
+        let mut found = false;
+        for m in list.iter_mut() {
+            if let Some(hs) = m.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                if hs.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.ends_with("smelt-notify"))
+                }) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            list.push(serde_json::json!({
+                "matcher": "",
+                "hooks": [entry.clone()],
+            }));
+        }
+    }
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out + "\n").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 从 Claude settings 移除 smelt-notify hooks（其它 hook 保留）。
+pub fn uninstall_claude_hooks() -> Result<(), String> {
+    let path = claude_settings_path().ok_or_else(|| "无 home 目录".to_string())?;
+    if !path.is_file() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut root: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(());
+    };
+    for ev in SMELT_HOOK_EVENTS {
+        let Some(arr) = hooks.get_mut(*ev).and_then(|x| x.as_array_mut()) else {
+            continue;
+        };
+        arr.retain_mut(|m| {
+            let Some(hs) = m.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                return true;
+            };
+            hs.retain(|h| {
+                !h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.ends_with("smelt-notify"))
+            });
+            // 空 matcher 且 hooks 空则整段删
+            !(hs.is_empty()
+                && m.get("matcher")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| s.is_empty()))
+        });
+        if arr.is_empty() {
+            hooks.remove(*ev);
+        }
+    }
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out + "\n").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ===================== 远程操作网关（见 docs/remote-ops-roadmap.md） =====================
 
 /// 远程操作网关的持久化开关（全局单例，存 ~/.smelt/collab.json）。只记「用户希望
@@ -1576,6 +1792,153 @@ impl Workspace {
                 })),
         );
 
+        // —— Claude 集成：结构面板 + hooks 安装/还原 ——
+        let agent_page = SettingPage::new("Claude 集成").group(
+            SettingGroup::new()
+                .item(
+                    SettingItem::new(
+                        "终端显示状态面板",
+                        SettingField::switch(
+                            |cx: &App| {
+                                cx.try_global::<AgentUiConfig>()
+                                    .map(|c| c.show_structure_panel)
+                                    .unwrap_or(true)
+                            },
+                            |v: bool, cx: &mut App| {
+                                apply_agent_ui(|c| c.show_structure_panel = v, cx);
+                            },
+                        ),
+                    )
+                    .description(
+                        "终端页右侧显示 agent 状态（思考 / 工具 / 审批）。关闭后完全隐藏；\
+                         打开后仍可点 › 收成窄条。",
+                    )
+                    .keywords(["状态", "面板", "agent", "claude"]),
+                )
+                .item(
+                    SettingItem::new(
+                        "审批时弹出通知",
+                        SettingField::switch(
+                            |cx: &App| {
+                                cx.try_global::<AgentUiConfig>()
+                                    .map(|c| c.notify_awaiting)
+                                    .unwrap_or(true)
+                            },
+                            |v: bool, cx: &mut App| {
+                                apply_agent_ui(|c| c.notify_awaiting = v, cx);
+                            },
+                        ),
+                    )
+                    .description(
+                        "状态通道进入「等你批准 / 等你输入」时，用应用内 Notification 弹出提示\
+                         （不依赖系统横幅）。",
+                    )
+                    .keywords(["通知", "notification", "审批"]),
+                )
+                .item(SettingItem::render(move |_, _, cx: &mut App| {
+                    let installed = claude_hooks_installed();
+                    let (fg, muted, border) = {
+                        let t = cx.theme();
+                        (t.foreground, t.muted_foreground, t.border)
+                    };
+                    let status = if installed {
+                        "已安装 smelt-notify → Claude hooks"
+                    } else {
+                        "未安装（结构面板只能靠标题猜测，hook 事实不会上报）"
+                    };
+                    let status_color: Hsla = if installed {
+                        rgb(0x22c55e).into()
+                    } else {
+                        muted
+                    };
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(status_color)
+                                .child(status),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!(
+                                    "路径：{}",
+                                    smelt_notify_path().display()
+                                )),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("install-claude-hooks")
+                                        .px_3()
+                                        .py(px(6.))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(border)
+                                        .bg(rgba(0x22c55e22))
+                                        .text_sm()
+                                        .text_color(rgb(0x22c55e))
+                                        .hover(|s| s.opacity(0.9))
+                                        .child(if installed {
+                                            "重新安装 hooks"
+                                        } else {
+                                            "安装 hooks"
+                                        })
+                                        .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                                            match install_claude_hooks() {
+                                                Ok(()) => {
+                                                    // 触发设置页重绘
+                                                    cx.refresh_windows();
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[workspace] 安装 hooks 失败：{e}");
+                                                    cx.refresh_windows();
+                                                }
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("uninstall-claude-hooks")
+                                        .px_3()
+                                        .py(px(6.))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(border)
+                                        .text_sm()
+                                        .text_color(fg)
+                                        .hover(|s| s.bg(border))
+                                        .child("还原 hooks")
+                                        .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                                            match uninstall_claude_hooks() {
+                                                Ok(()) => cx.refresh_windows(),
+                                                Err(e) => {
+                                                    eprintln!("[workspace] 还原 hooks 失败：{e}");
+                                                    cx.refresh_windows();
+                                                }
+                                            }
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(
+                                    "写入 ~/.claude/settings.json（仅增删 smelt-notify 条目，其它 hook 保留）。\
+                                     还原 = 移除这些条目。改完后新开 Claude 会话生效。",
+                                ),
+                        )
+                        .into_any_element()
+                })),
+        );
+
         // —— 远程：总开关 + 选项自动联动 + 一张分享卡片 ——
         // 用户不需要知道「先开远程再开隧道」；依赖和重试都在逻辑里消化。
         let remote_page = SettingPage::new("远程").group(
@@ -1846,7 +2209,14 @@ impl Workspace {
                     page_ix: self.settings_page_ix,
                     group_ix: None,
                 })
-                .pages(vec![appearance_page, pet_page, launch_page, update_page, remote_page]),
+                .pages(vec![
+                    appearance_page,
+                    pet_page,
+                    launch_page,
+                    agent_page,
+                    update_page,
+                    remote_page,
+                ]),
         )
     }
 
