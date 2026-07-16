@@ -1,6 +1,6 @@
 [package]
 name = "smelt"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 
 # 老版 objc 0.2 的 msg_send!/class! 宏展开带 cfg(feature="cargo-clippy")，新 Rust 的
