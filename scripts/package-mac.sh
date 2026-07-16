@@ -207,6 +207,7 @@ rm -f "$DIST/$APP_NAME.dmg"
 # 固定 bug。竞争面消不掉，用重试兜住。
 export SMELT_APP="$APP"
 export SMELT_DMG_BG="$BG_TIFF"
+export SMELT_VOL_ICON="$ROOT/assets/AppIcon.icns"
 built=0
 for attempt in 1 2 3; do
   if "$VENV/bin/dmgbuild" -s "$ROOT/scripts/dmg-settings.py" "$VOL" "$DIST/$APP_NAME.dmg"; then
