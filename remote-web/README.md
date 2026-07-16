@@ -25,4 +25,8 @@ cd remote-web && npm run build
 cargo run --bin gateway -- --port 18765 --write
 ```
 
-未构建 dist 时，网关回退到内嵌 HTML 模板。
+打包 DMG 时 `scripts/package-mac.sh` 会把 `dist/` 拷进
+`Smelt.app/Contents/Resources/remote-web/`；smeltd 运行时用 `current_exe`
+解析该路径（不是编译机上的 `CARGO_MANIFEST_DIR`）。
+
+未构建 / 未打进包时回退内嵌旧 HTML，**手机端样式会乱**。

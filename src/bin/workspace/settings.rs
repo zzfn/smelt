@@ -1514,8 +1514,43 @@ impl Workspace {
                 )
                 .description(
                     "用 Cloudflare 生成公网链接，离开 Wi‑Fi 也能连。需要本机已安装 \
-                     cloudflared（brew install cloudflared）。打开时会自动开启上方「远程」。",
+                     cloudflared。打开时会自动开启上方「远程」。安装命令见下方（可一键复制）。",
                 ),
+                // GPUI 描述文案通常不可选中，单独给 brew 命令 + 复制按钮
+                SettingItem::render(move |_, _, cx: &mut App| {
+                    let muted = cx.theme().muted_foreground;
+                    let fg = cx.theme().foreground;
+                    let cmd = "brew install cloudflared";
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("未安装时请在终端执行："),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded(px(4.))
+                                .bg(cx.theme().secondary)
+                                .text_xs()
+                                .font_family("Menlo")
+                                .text_color(fg)
+                                .child(cmd),
+                        )
+                        .child(
+                            btn("copy-brew-cloudflared", "复制".into())
+                                .flex_shrink_0()
+                                .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        "brew install cloudflared".into(),
+                                    ));
+                                }),
+                        )
+                }),
                 SettingItem::new(
                     "允许远程写入",
                     SettingField::switch(
@@ -1557,7 +1592,9 @@ impl Workspace {
                     }
 
                     if let Some(err) = remote.error.as_ref().or(tunnel.error.as_ref()) {
-                        return v_flex()
+                        let need_cloudflared = err.contains("cloudflared")
+                            || err.contains("brew install");
+                        let mut box_ = v_flex()
                             .gap_2()
                             .child(div().text_xs().text_color(danger).child(format!("出了点问题：{err}")))
                             .child(
@@ -1566,6 +1603,37 @@ impl Workspace {
                                     |_, _window, cx: &mut App| retry_remote_setup(cx),
                                 ),
                             );
+                        if need_cloudflared {
+                            box_ = box_.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded(px(4.))
+                                            .bg(cx.theme().secondary)
+                                            .text_xs()
+                                            .font_family("Menlo")
+                                            .text_color(fg)
+                                            .child("brew install cloudflared"),
+                                    )
+                                    .child(
+                                        btn("copy-brew-on-err", "复制安装命令".into())
+                                            .flex_shrink_0()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_, _window, cx: &mut App| {
+                                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                                        "brew install cloudflared".into(),
+                                                    ));
+                                                },
+                                            ),
+                                    ),
+                            );
+                        }
+                        return box_;
                     }
 
                     let token = remote.token.clone().filter(|t| !t.is_empty());

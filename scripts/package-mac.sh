@@ -38,6 +38,23 @@ if [[ ! -f "$DAEMON_BIN" ]]; then
   exit 1
 fi
 
+# 远程 H5：手机端 CLI 面板（Preact + Tailwind + xterm）。
+# 必须打进 App Resources；否则 smeltd 找不到 SPA，会回退旧 HTML，移动端样式全乱。
+REMOTE_WEB_DIST="$ROOT/remote-web/dist"
+if [[ ! -f "$REMOTE_WEB_DIST/index.html" ]]; then
+  if command -v npm >/dev/null 2>&1; then
+    echo "▶ 构建 remote-web（npm run build）…"
+    (cd "$ROOT/remote-web" && npm install && npm run build)
+  else
+    echo "✗ 缺少 remote-web/dist，且本机无 npm。请先：cd remote-web && npm install && npm run build" >&2
+    exit 1
+  fi
+fi
+if [[ ! -f "$REMOTE_WEB_DIST/index.html" ]]; then
+  echo "✗ remote-web 构建失败：没有 $REMOTE_WEB_DIST/index.html" >&2
+  exit 1
+fi
+
 # 校验是 arm64，避免误把 Intel 产物发给 Apple Silicon 同事
 if ! file "$BIN" | grep -q "arm64"; then
   echo "✗ $BIN 不是 arm64，同事的 Apple Silicon Mac 会闪退。请在 Apple Silicon 上编译。" >&2
@@ -58,6 +75,17 @@ ICON_LINE=""
 if [[ -f "$ROOT/assets/AppIcon.icns" ]]; then
   cp "$ROOT/assets/AppIcon.icns" "$RES/AppIcon.icns"
   ICON_LINE=$'\t<key>CFBundleIconFile</key>\n\t<string>AppIcon</string>'
+fi
+
+# 远程 H5 → Contents/Resources/remote-web（smeltd 运行时按 current_exe 解析）
+echo "▶ 拷贝 remote-web → Resources …"
+rm -rf "$RES/remote-web"
+mkdir -p "$RES/remote-web"
+# dist 内容（index.html + assets/）直接落在 remote-web/ 下
+cp -R "$REMOTE_WEB_DIST"/. "$RES/remote-web/"
+if [[ ! -f "$RES/remote-web/index.html" ]]; then
+  echo "✗ 拷贝后缺少 $RES/remote-web/index.html" >&2
+  exit 1
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST

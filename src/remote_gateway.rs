@@ -25,10 +25,53 @@ const REFERENCE_PAGE: &str = include_str!("remote_gateway_page.html");
 const LIST_PAGE: &str = include_str!("remote_gateway_list_page.html");
 const CONSOLE_PAGE: &str = include_str!("remote_gateway_console_page.html");
 
-/// Preact 远程 H5 构建产物目录（`remote-web/dist`）。编译期锚定仓库根；
-/// 未 build 前端时回退到旧 HTML 模板，开发不断档。
+/// Preact 远程 H5 构建产物目录（内含 `index.html` + `assets/`）。
+///
+/// 查找顺序（第一个存在 `index.html` 的目录生效）：
+/// 1. 环境变量 `SMELT_REMOTE_WEB`（调试/自定义）
+/// 2. App 包：`Smelt.app/Contents/Resources/remote-web`（打包脚本拷入）
+/// 3. 与 smeltd 同目录下的 `remote-web/`
+/// 4. 开发：仓库根 `remote-web/dist`（`CARGO_MANIFEST_DIR`）
+///
+/// **不要**只依赖 `CARGO_MANIFEST_DIR`：编译机路径在用户 DMG 里不存在，
+/// 会误回退到旧内嵌 HTML，手机端样式看起来「全乱了」。
 fn remote_web_dist() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("remote-web").join("dist")
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<PathBuf> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Ok(p) = std::env::var("SMELT_REMOTE_WEB") {
+                let p = PathBuf::from(p);
+                if !p.as_os_str().is_empty() {
+                    candidates.push(p);
+                }
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(macos_dir) = exe.parent() {
+                    // …/Smelt.app/Contents/MacOS/smeltd → …/Contents/Resources/remote-web
+                    if let Some(contents) = macos_dir.parent() {
+                        candidates.push(contents.join("Resources").join("remote-web"));
+                    }
+                    candidates.push(macos_dir.join("remote-web"));
+                }
+            }
+            candidates.push(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("remote-web")
+                    .join("dist"),
+            );
+            for c in candidates {
+                if c.join("index.html").is_file() {
+                    return c;
+                }
+            }
+            // 占位：spa_ready() 为 false 时走旧 HTML
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("remote-web")
+                .join("dist")
+        })
+        .clone()
 }
 
 fn spa_index_path() -> PathBuf {

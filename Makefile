@@ -22,10 +22,10 @@ remote-web-dev: ## 远程 H5 热更新（需另开 gateway --port 18765）
 icon: ## 生成 app 图标（assets/AppIcon.icns）
 	./scripts/make-icon.sh
 
-dist: ## 用已有 release 产物打包 app + dmg
+dist: remote-web ## 用已有 release 产物打包 app + dmg（先确保 H5 已构建）
 	./scripts/package-mac.sh
 
-dist-build: ## 先编译再打包（一步到位）
+dist-build: remote-web ## 先编 H5 + release 再打包（一步到位）
 	./scripts/package-mac.sh --build
 
 clean: ## 清理 dist/ 产物
