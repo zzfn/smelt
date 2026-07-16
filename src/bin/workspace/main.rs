@@ -4291,6 +4291,10 @@ fn main() {
         // 远程操作网关：只记「用户上次希望它开着」这个开关；真去问/让守护开的部分
         // 扔进后台任务——涉及连 unix socket、可能要等守护自己起来（最坏几秒），
         // 不能卡首帧渲染。settings.rs 的「远程」设置页读 RemoteRuntimeState 展示。
+        //
+        // 网关和隧道**串在同一条后台任务**里对齐：先问守护现状（幂等 hydrate），
+        // 没有再 start。以前两条 spawn 并行时，隧道可能先回 URL、token 还是空的，
+        // UI 会拼出 `?token=` 的死链。
         let remote_config = settings::load_remote_config();
         let want_remote = remote_config.enabled;
         // 隧道依赖本机网关；配置里 tunnel_enabled=true 时 enabled 理应也是 true
@@ -4300,74 +4304,136 @@ fn main() {
         cx.set_global(remote_config);
         cx.set_global(settings::RemoteRuntimeState::default());
         cx.set_global(settings::TunnelRuntimeState::default());
-        if want_remote {
-            cx.spawn(async move |cx| {
-                let status = cx
-                    .background_executor()
-                    .spawn(async move {
-                        terminal::ensure_daemon_running();
-                        terminal::remote_start("127.0.0.1", want_write)
-                    })
-                    .await;
-                let _ = cx.update(|cx| {
-                    let rt = match status {
-                        Ok(s) => settings::RemoteRuntimeState {
-                            token: s.token,
-                            addr: s.addr,
-                            write: s.write,
-                            error: None,
-                        },
-                        Err(e) => settings::RemoteRuntimeState {
-                            token: None,
-                            addr: None,
-                            write: false,
-                            error: Some(e),
-                        },
-                    };
-                    cx.set_global(rt);
+        if want_remote || want_tunnel {
+            if want_tunnel {
+                cx.set_global(settings::TunnelRuntimeState {
+                    connecting: true,
+                    url: None,
+                    error: None,
+                    write: false,
                 });
-            })
-            .detach();
-        }
-        if want_tunnel {
-            cx.set_global(settings::TunnelRuntimeState {
-                connecting: true,
-                url: None,
-                error: None,
-                write: false,
-            });
+            }
             cx.spawn(async move |cx| {
-                let status = cx
+                let (remote_rt, tunnel_rt) = cx
                     .background_executor()
                     .spawn(async move {
                         terminal::ensure_daemon_running();
-                        terminal::tunnel_start(want_write)
+
+                        // 1) 本机网关：已在跑就复用 token，否则按配置 start
+                        let remote_rt = if want_remote || want_tunnel {
+                            let existing = terminal::remote_status();
+                            if existing.running
+                                && existing.token.as_ref().is_some_and(|t| !t.is_empty())
+                            {
+                                settings::RemoteRuntimeState {
+                                    token: existing.token,
+                                    addr: existing.addr,
+                                    write: existing.write,
+                                    error: None,
+                                }
+                            } else {
+                                match terminal::remote_start("127.0.0.1", want_write) {
+                                    Ok(s) => settings::RemoteRuntimeState {
+                                        token: s.token,
+                                        addr: s.addr,
+                                        write: s.write,
+                                        error: None,
+                                    },
+                                    Err(e) => settings::RemoteRuntimeState {
+                                        token: None,
+                                        addr: None,
+                                        write: false,
+                                        error: Some(e),
+                                    },
+                                }
+                            }
+                        } else {
+                            settings::RemoteRuntimeState::default()
+                        };
+
+                        // 2) 隧道：同样先 status 再 start；最终以「有 token 才能展示 URL」为准
+                        let tunnel_rt = if want_tunnel {
+                            let has_token =
+                                remote_rt.token.as_ref().is_some_and(|t| !t.is_empty());
+                            if !has_token {
+                                settings::TunnelRuntimeState {
+                                    connecting: false,
+                                    url: None,
+                                    error: Some(
+                                        "本机远程网关没起来，无法建立隧道".into(),
+                                    ),
+                                    write: false,
+                                }
+                            } else {
+                                let existing = terminal::tunnel_status();
+                                if existing.running && existing.url.is_some() {
+                                    settings::TunnelRuntimeState {
+                                        connecting: false,
+                                        url: existing.url,
+                                        error: None,
+                                        write: existing.write,
+                                    }
+                                } else {
+                                    match terminal::tunnel_start(want_write) {
+                                        Ok(s) => settings::TunnelRuntimeState {
+                                            connecting: false,
+                                            url: s.url,
+                                            error: None,
+                                            write: s.write,
+                                        },
+                                        Err(e) => settings::TunnelRuntimeState {
+                                            connecting: false,
+                                            url: None,
+                                            error: Some(e),
+                                            write: false,
+                                        },
+                                    }
+                                }
+                            }
+                        } else {
+                            settings::TunnelRuntimeState::default()
+                        };
+
+                        // 隧道 start 可能顺带（重）开了网关：再读一次 token，避免 UI 仍空
+                        let remote_rt = if want_remote || want_tunnel {
+                            let again = terminal::remote_status();
+                            if again.running && again.token.as_ref().is_some_and(|t| !t.is_empty())
+                            {
+                                settings::RemoteRuntimeState {
+                                    token: again.token,
+                                    addr: again.addr,
+                                    write: again.write,
+                                    error: None,
+                                }
+                            } else {
+                                remote_rt
+                            }
+                        } else {
+                            remote_rt
+                        };
+
+                        // token 仍空时，即使隧道有 URL 也不给 UI 展示（防 `?token=`）
+                        let tunnel_rt = if tunnel_rt.url.is_some()
+                            && !remote_rt.token.as_ref().is_some_and(|t| !t.is_empty())
+                        {
+                            settings::TunnelRuntimeState {
+                                connecting: false,
+                                url: None,
+                                error: Some(
+                                    "隧道在跑但拿不到网关 token，请在设置里重开远程访问".into(),
+                                ),
+                                write: false,
+                            }
+                        } else {
+                            tunnel_rt
+                        };
+
+                        (remote_rt, tunnel_rt)
                     })
                     .await;
                 let _ = cx.update(|cx| {
-                    let rt = match status {
-                        Ok(s) => settings::TunnelRuntimeState {
-                            connecting: false,
-                            url: s.url,
-                            error: None,
-                            write: s.write,
-                        },
-                        Err(e) => settings::TunnelRuntimeState {
-                            connecting: false,
-                            url: None,
-                            error: Some(e),
-                            write: false,
-                        },
-                    };
-                    cx.set_global(rt);
-                    // tunnel_start 顺带把本机网关也开了（如果之前没开），回填一下。
-                    let remote = terminal::remote_status();
-                    cx.set_global(settings::RemoteRuntimeState {
-                        token: remote.token,
-                        addr: remote.addr,
-                        write: remote.write,
-                        error: None,
-                    });
+                    cx.set_global(remote_rt);
+                    cx.set_global(tunnel_rt);
                 });
             })
             .detach();

@@ -6,45 +6,98 @@
 <title>smelt 远程操作 —— 会话列表</title>
 <style>
   html, body { margin: 0; background: #111; color: #ddd; }
-  body { font: 14px/1.6 -apple-system, BlinkMacSystemFont, sans-serif; padding: 1.5rem; }
-  h1 { font-size: 1.1rem; color: #fff; margin-bottom: .8rem; }
-  label.filter { display: inline-flex; align-items: center; gap: .4rem; color: #aaa; font-size: .9rem; margin-bottom: 1rem; }
-  ul { list-style: none; padding: 0; margin: 0; }
-  li.session {
-    border: 1px solid #2a2a2a; border-radius: 8px; padding: .6rem .8rem;
-    margin-bottom: .6rem;
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 1.2rem 1.2rem 2rem; max-width: 520px; margin: 0 auto;
   }
-  li.empty { color: #888; font-family: -apple-system, sans-serif; list-style: none; }
-  .row { display: flex; align-items: center; gap: .5rem; }
-  .dot { width: .6rem; height: .6rem; border-radius: 50%; flex-shrink: 0; }
+  h1 { font-size: 1.05rem; color: #fff; margin: 0 0 .9rem; font-weight: 600; }
+  label.filter {
+    display: inline-flex; align-items: center; gap: .4rem;
+    color: #999; font-size: .85rem; margin-bottom: 1rem; cursor: pointer;
+  }
+  .empty { color: #888; padding: .8rem 0; }
+  .hint { color: #666; font-size: .8rem; margin-top: 1.5rem; line-height: 1.5; }
+
+  /* 项目分组 —— 对齐 PC 侧栏文件夹形态 */
+  .project { margin-bottom: 1.1rem; }
+  .project-name {
+    font-size: .8rem; font-weight: 600; color: #aaa;
+    letter-spacing: .02em; margin: 0 0 .4rem .15rem;
+  }
+  ul.session-list, ul.nested-list {
+    list-style: none; padding: 0; margin: 0;
+  }
+  ul.nested-list { margin: .25rem 0 0 .55rem; padding-left: .55rem; border-left: 1px solid #2a2a2a; }
+
+  li.session {
+    border: 1px solid #2a2a2a; border-radius: 8px;
+    padding: .55rem .7rem; margin-bottom: .4rem;
+    background: #161616;
+  }
+  li.session.nested {
+    border-color: #252525; background: #141414;
+  }
+  li.session-group {
+    border: 1px solid #2a2a2a; border-radius: 8px;
+    padding: .45rem .55rem .35rem; margin-bottom: .45rem;
+    background: #141414;
+  }
+  .group-name {
+    font-size: .85rem; color: #bbb; font-weight: 500;
+    padding: .15rem .25rem .35rem;
+  }
+  .row { display: flex; align-items: center; gap: .45rem; min-width: 0; }
+  .dot { width: .55rem; height: .55rem; border-radius: 50%; flex-shrink: 0; }
   a { color: #6cf; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  a.primary { font-family: monospace; font-size: .95rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .label { color: #888; font-size: .8rem; margin-left: auto; flex-shrink: 0; }
-  .question { color: #ccc; font-size: .85rem; margin: .4rem 0 .3rem 1.1rem; }
-  a.secondary { font-size: .8rem; margin-left: 1.1rem; }
-  .hint { color: #888; font-size: .85rem; margin-top: 1.5rem; }
+  a.primary {
+    font-size: .95rem; font-weight: 500; color: #e8e8e8;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  a.primary:hover { color: #6cf; }
+  .label { color: #777; font-size: .75rem; margin-left: auto; flex-shrink: 0; }
+  .question {
+    color: #bbb; font-size: .82rem; margin: .35rem 0 .2rem 1.05rem;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  a.secondary {
+    display: inline-block; font-size: .75rem; color: #5a9; margin: .15rem 0 0 1.05rem;
+  }
 </style>
 </head>
 <body>
-<h1>smelt 远程操作 —— 会话列表</h1>
+<h1>会话</h1>
 <label class="filter">
   <input type="checkbox" id="filter-waiting">
   只看等你处理的
 </label>
-<ul id="list">
+<div id="list">
 __ROWS__
-</ul>
-<p class="hint">这条链接能看到这台机器上的全部活会话——分享前想清楚给谁看。</p>
+</div>
+<p class="hint">名称与分组来自本机工作台侧栏；点名称进操作台，需要完整键盘时再开终端。</p>
 <script>
   const WAITING = new Set(['awaiting_approval', 'waiting_for_user']);
   const checkbox = document.getElementById('filter-waiting');
-  checkbox.addEventListener('change', () => {
+
+  function applyFilter() {
+    const onlyWaiting = checkbox.checked;
     document.querySelectorAll('#list li.session').forEach((li) => {
-      const show = !checkbox.checked || WAITING.has(li.dataset.phase);
+      const show = !onlyWaiting || WAITING.has(li.dataset.phase);
       li.style.display = show ? '' : 'none';
     });
-  });
+    // 空的多 pane 组 / 空项目隐藏
+    document.querySelectorAll('#list li.session-group').forEach((g) => {
+      const any = [...g.querySelectorAll('li.session')].some((li) => li.style.display !== 'none');
+      g.style.display = any || !onlyWaiting ? '' : 'none';
+      if (onlyWaiting) g.style.display = any ? '' : 'none';
+    });
+    document.querySelectorAll('#list section.project').forEach((sec) => {
+      const any = [...sec.querySelectorAll('li.session')].some((li) => li.style.display !== 'none');
+      sec.style.display = onlyWaiting ? (any ? '' : 'none') : '';
+    });
+  }
+
+  checkbox.addEventListener('change', applyFilter);
 </script>
 </body>
 </html>

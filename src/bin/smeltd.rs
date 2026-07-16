@@ -36,6 +36,11 @@
 //!   {"op":"action","id":"..","kind":"approve|deny|reply","text":".."}
 //!                                                            → 回 {"ok":true}/{"ok":false,"err":".."} 后关闭，
 //!                                                              见下「远程操控」（text 仅 reply 需要）
+//!   {"op":"input","id":"..","data":".."}                     → 回 {"ok":true}/{"ok":false,"err":".."} 后关闭，
+//!                                                              `data` 是 UTF-8 字符串（控制字符用 JSON
+//!                                                              `\u00xx`），原样写入 PTY，**无 phase 门闩**
+//!   {"op":"resize","id":"..","cols":N,"rows":M}              → 回 {"ok":true} 后关闭，改 PTY 窗口尺寸
+//!                                                              （SIGWINCH，供手机端按视口重排 TUI）
 //!
 //! 流模式：
 //!   守护 → 客户端：先发 JSON 尺寸行（含 replay_len=快照字节数）→ ANSI 网格快照
@@ -108,22 +113,26 @@
 //! 的 URL 早于连接真正建好——只看到 URL 就上报成功，实测会先给出一个访问 530 的
 //! 死链接。`start_tunnel` 因此额外等一条 `Registered tunnel connection` 日志才算数。
 //!
-//! ## 远程操控（`action` op）
+//! ## 远程操控（`action` + `input` op）
 //!
-//! Phase 6：手机操作台点"批准"/"拒绝"/"回复"，最终落地成往 PTY 里写几个字节。
-//! 门闩（`phase` 必须是 `AwaitingApproval`/`WaitingForUser`）是**正确性**保护，
-//! 不是权限保护——agent 正在思考/执行工具时写入字节会被当成别的东西的输入，把
-//! 会话状态搞乱（这是真会发生的坑，不是假设）；不满足门闩直接拒绝，不排队。
+//! Phase 6：远程端是 PC 工作的**延续**——能力上要能往 PTY 写任意字节，交互上再
+//! 用操作台按钮减负。两条 op 分工：
 //!
-//! `kind` → 字节的映射刻意不猜终端 UI 的具体菜单结构（选项数量不是常数，数
-//! 方向键次数这条路本身就不成立，实测验证过）：
+//! **`input`**：原始字节写入 PTY，和本机键盘同权。**没有 phase 门闩**——用户可能
+//! 随时要 Ctrl+C、在 agent 思考时补一句、或在 TUI 里方向键导航。`data` 是 UTF-8
+//! 字符串（控制字符走 JSON `\u00xx`，xterm onData 出来的串 `JSON.stringify` 即可）；
+//! 空串拒绝。
+//!
+//! **`action`**：approve/deny/reply 映射成固定按键序列，是高频快捷方式，**不是**
+//! 能力上限。门闩（`phase` 必须是 `AwaitingApproval`/`WaitingForUser`）是**正确性**
+//! 保护，防止误点「批准」时 agent 其实在跑别的——不排队，直接拒绝：
 //! - `approve` → `\r`（回车，接受当前高亮的默认项）
 //! - `deny` → `\x1b`（Esc，不管菜单形状直接取消/拒绝）
-//! - `reply` → 文本 + `\r`（自由文本回复）
+//! - `reply` → 文本 + `\r`（便捷回复；自由输入更推荐走 `input`）
 //!
-//! 授权模型：这一版**没有**"可写模式必须主人当面点头"这条独立确认——链接本身
-//! 已经是一次授权动作，开没开写权限由生成链接时的开关决定（GUI 的"允许写入"
-//! 开关），不对每次 approve/deny 再加一层实时确认。
+//! 授权模型：链接本身就是授权；写权限（action + input）由生成链接时的开关决定
+//! （GUI 的"允许写入"），网关侧 `write_enabled` 把关，smeltd 的 action 门闩只管
+//! 时机、不管权限。
 
 #[path = "../remote_gateway.rs"]
 mod remote_gateway;
@@ -310,6 +319,31 @@ fn resize_fd(fd: RawFd, rows: u16, cols: u16, xpixel: u16, ypixel: u16) {
     };
     unsafe {
         libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
+    }
+}
+
+/// 会话 resize：PTY ioctl + 常驻 Term 同步 + 可选 jolt 抖动。
+/// 手机远程与 GUI open 帧共用，避免两套尺寸逻辑漂移。
+fn resize_session(sess: &Session, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let xpixel = cols.saturating_mul(cell_w);
+    let ypixel = rows.saturating_mul(cell_h);
+    let mut ctl = sess.ctl.lock().unwrap();
+    let fd = ctl.master.as_raw_fd();
+    if ctl.jolt {
+        ctl.jolt = false;
+        resize_fd(fd, rows.saturating_add(1), cols, xpixel, ypixel);
+    }
+    resize_fd(fd, rows, cols, xpixel, ypixel);
+    ctl.cols = cols;
+    ctl.rows = rows;
+    drop(ctl);
+    if let Ok(mut term) = sess.term.lock() {
+        term.resize(DaemonTermSize {
+            rows: rows as usize,
+            cols: cols as usize,
+        });
     }
 }
 
@@ -522,8 +556,84 @@ fn spawn_tunnel_output_scanner(
     });
 }
 
-/// 幂等：已经开着直接回现有 URL。会先确保本机远程网关已经开着（隧道要转发给它），
-/// 没开会顺带用默认参数（回环 + 随机端口）开一个。
+/// 保证本机远程网关按 `write` 开着（隧道启动前要先有可转发的网关）。
+///
+/// - 未开 → 用回环 + 随机端口 + `write` 开一个
+/// - 已开且 `write` 一致 → 复用（不换 token）
+/// - 已开但 `write` 不同 → 先停再开（权限烤进 router，不能热切换；旧链接随之失效）
+///
+/// 这是 `start_tunnel` 的入口，不能直接调幂等的 `start_remote_gateway`：后者在已开时
+/// **忽略**传入的 `write`，会把「隧道要可写」静默落成只读（Phase 6 修过的坑）。
+fn ensure_remote_gateway_with_write(
+    state: &RemoteState,
+    write: bool,
+) -> Result<(String, std::net::SocketAddr, bool), String> {
+    {
+        let guard = state.lock().unwrap();
+        if let Some(g) = guard.as_ref() {
+            if g.write == write {
+                return Ok((g.token.clone(), g.addr, g.write));
+            }
+        }
+    }
+    stop_remote_gateway(state);
+    start_remote_gateway(state, "127.0.0.1", 0, write)
+}
+
+#[cfg(test)]
+mod ensure_remote_gateway_write_tests {
+    use super::*;
+
+    #[test]
+    fn starts_with_requested_write_when_down() {
+        let state: RemoteState = Arc::new(Mutex::new(None));
+        let (token, _addr, write) = ensure_remote_gateway_with_write(&state, true).expect("start");
+        assert!(write, "应烤进 write=true");
+        assert!(!token.is_empty());
+        // 现状一致：再要一次可写必须复用同一 token，不能偷偷再起一个
+        let (token2, _, write2) = ensure_remote_gateway_with_write(&state, true).expect("reuse");
+        assert_eq!(token, token2);
+        assert!(write2);
+        stop_remote_gateway(&state);
+    }
+
+    #[test]
+    fn restarts_and_rotates_token_when_write_changes() {
+        let state: RemoteState = Arc::new(Mutex::new(None));
+        let (token_ro, _, write_ro) =
+            ensure_remote_gateway_with_write(&state, false).expect("start ro");
+        assert!(!write_ro);
+
+        // 关键回归：幂等的 start_remote_gateway 在已开时会忽略传入 write=true，
+        // ensure 必须先停再开，否则隧道路径会静默保持只读。
+        let (token_rw, _, write_rw) =
+            ensure_remote_gateway_with_write(&state, true).expect("upgrade to rw");
+        assert!(write_rw, "write 切换后必须变成可写");
+        assert_ne!(token_ro, token_rw, "写权限变了必须换新 token，旧链接失效");
+
+        let (token_ro2, _, write_ro2) =
+            ensure_remote_gateway_with_write(&state, false).expect("downgrade to ro");
+        assert!(!write_ro2);
+        assert_ne!(token_rw, token_ro2);
+        stop_remote_gateway(&state);
+    }
+
+    #[test]
+    fn plain_start_remote_gateway_is_still_idempotent_on_write() {
+        // 对照：裸 start_remote_gateway 的旧语义还在——已开时忽略 write 参数。
+        // ensure 才是"按 write 对齐"的入口；别把两个行为搞混。
+        let state: RemoteState = Arc::new(Mutex::new(None));
+        let (t1, _, w1) = start_remote_gateway(&state, "127.0.0.1", 0, false).expect("ro");
+        assert!(!w1);
+        let (t2, _, w2) = start_remote_gateway(&state, "127.0.0.1", 0, true).expect("idempotent");
+        assert_eq!(t1, t2);
+        assert!(!w2, "幂等路径必须继续忽略传入的 write=true");
+        stop_remote_gateway(&state);
+    }
+}
+
+/// 幂等：已经开着直接回现有 URL。会先确保本机远程网关已经按 `write` 开着（隧道
+/// 要转发给它），没开或写权限对不上会顺带用默认参数（回环 + 随机端口）开/重开一个。
 ///
 /// 强制 `--protocol http2`：quick tunnel 默认先试 QUIC，网络挡 UDP/QUIC 时（不少
 /// 企业网/部分云环境如此）要退化重试好几轮才会换协议，直接指定 http2 跳过这段
@@ -536,14 +646,14 @@ fn start_tunnel(
     {
         let guard = tunnel_state.lock().unwrap();
         if let Some(t) = guard.as_ref() {
-            // 幂等分支：跟 start_remote_gateway 一样，已经开着就如实回现状的
-            // write（可能跟这次调用传入的值不同），不悄悄改成新值。
+            // 幂等分支：隧道已开就不重启 cloudflared。write 以**网关现状**为准
+            // （隧道只是转发层）；想改写权限必须先 tunnel_stop + remote_stop 再开。
             let effective_write = remote_state.lock().unwrap().as_ref().map(|g| g.write).unwrap_or(write);
             return Ok((t.url.clone(), effective_write));
         }
-    } // 提前放锁：下面 start_remote_gateway 可能涉及绑端口，不需要一直攥着这把锁
+    } // 提前放锁：下面 ensure 可能涉及绑端口，不需要一直攥着这把锁
 
-    let (_, addr, effective_write) = start_remote_gateway(remote_state, "127.0.0.1", 0, write)?;
+    let (_, addr, effective_write) = ensure_remote_gateway_with_write(remote_state, write)?;
 
     use std::process::{Command, Stdio};
     let mut child = Command::new("cloudflared")
@@ -933,6 +1043,16 @@ mod state_listener_tests {
     }
 }
 
+/// `input` op 的载荷解析：取 `data` 字段的 UTF-8 字节。空串 / 缺字段 → `None`。
+/// 不在这里做 phase 门闩——那是 `action` 的事。
+fn input_payload(v: &serde_json::Value) -> Option<Vec<u8>> {
+    let s = v["data"].as_str()?;
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.as_bytes().to_vec())
+}
+
 /// `action` op 的 kind → PTY 字节映射。`text` 只有 `reply` 用得上。返回 `None`
 /// 表示不认识的 kind——调用方应该报错，不是当成某种默认行为。
 fn action_payload(kind: Option<&str>, text: Option<&str>) -> Option<Vec<u8>> {
@@ -981,6 +1101,31 @@ mod action_tests {
     fn unknown_kind_returns_none() {
         assert_eq!(action_payload(Some("do_a_barrel_roll"), None), None);
         assert_eq!(action_payload(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod input_payload_tests {
+    use super::*;
+
+    #[test]
+    fn data_string_becomes_utf8_bytes() {
+        let v = serde_json::json!({ "data": "hello" });
+        assert_eq!(input_payload(&v), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn control_chars_in_json_string_work() {
+        // Ctrl+C = \u0003；xterm onData + JSON.stringify 就是这条路
+        let v = serde_json::json!({ "data": "" });
+        assert_eq!(input_payload(&v), Some(vec![0x03]));
+    }
+
+    #[test]
+    fn empty_or_missing_data_is_none() {
+        assert_eq!(input_payload(&serde_json::json!({ "data": "" })), None);
+        assert_eq!(input_payload(&serde_json::json!({})), None);
+        assert_eq!(input_payload(&serde_json::json!({ "data": null })), None);
     }
 }
 
@@ -1086,6 +1231,107 @@ mod action_integration_tests {
     fn action_on_unknown_session_is_rejected() {
         let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
         let resp = call_action(&sessions, "does-not-exist", "approve");
+        assert_eq!(resp["ok"], false);
+    }
+}
+
+/// `input` 端到端：无 phase 门闩——agent 忙也能写（跟 action 最关键的差异）；
+/// 这是「远程 = 工作延续」的契约，回归测试必须盯死。
+#[cfg(test)]
+mod input_integration_tests {
+    use super::*;
+
+    fn make_pipe_session(rows: u16, cols: u16, phase: Phase) -> (Arc<Session>, std::fs::File) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() 失败");
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let master = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        drop(child);
+        let state = Arc::new(Mutex::new(SessionState { phase, ..Default::default() }));
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        let listener = StateListener { state: Arc::clone(&state), subscribers };
+        let sess = Arc::new(Session {
+            ctl: Mutex::new(Ctl { master, pid, jolt: false, cols, rows, cwd: None }),
+            out: Mutex::new(Out { buf: Vec::new(), client: None, watchers: Vec::new() }),
+            term: Mutex::new(new_daemon_term(rows, cols, listener)),
+            state,
+        });
+        (sess, read_end)
+    }
+
+    fn call_input(sessions: &Sessions, id: &str, data: &str) -> serde_json::Value {
+        let (server, client) = UnixStream::pair().unwrap();
+        let remote_state: RemoteState = Arc::new(Mutex::new(None));
+        let tunnel_state: TunnelState = Arc::new(Mutex::new(None));
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        let mut client = client;
+        writeln!(
+            client,
+            "{}",
+            serde_json::json!({ "op": "input", "id": id, "data": data })
+        )
+        .unwrap();
+        handle_conn(server, Arc::clone(sessions), 0, -1, remote_state, tunnel_state, subscribers);
+        let mut resp = String::new();
+        BufReader::new(client).read_line(&mut resp).unwrap();
+        serde_json::from_str(&resp).unwrap()
+    }
+
+    #[test]
+    fn input_writes_even_when_agent_is_thinking() {
+        let (sess, mut read_end) = make_pipe_session(24, 80, Phase::Thinking);
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().unwrap().insert("busy".to_string(), sess);
+
+        // Ctrl+C（0x03）：json! 直接嵌 char，serde 编进 JSON 字符串
+        let ctrl_c = "\u{0003}";
+        let resp = call_input(&sessions, "busy", ctrl_c);
+        assert_eq!(resp["ok"], true, "resp={resp}");
+
+        let mut buf = [0u8; 8];
+        let n = read_end.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x03");
+    }
+
+    #[test]
+    fn input_writes_text_while_idle() {
+        let (sess, mut read_end) = make_pipe_session(24, 80, Phase::Idle);
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().unwrap().insert("idle".to_string(), sess);
+
+        let resp = call_input(&sessions, "idle", "ls -la\r");
+        assert_eq!(resp["ok"], true, "resp={resp}");
+
+        let mut buf = [0u8; 64];
+        let n = read_end.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"ls -la\r");
+    }
+
+    #[test]
+    fn empty_input_is_rejected() {
+        let (sess, mut read_end) = make_pipe_session(24, 80, Phase::Idle);
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().unwrap().insert("e".to_string(), sess);
+
+        let resp = call_input(&sessions, "e", "");
+        assert_eq!(resp["ok"], false);
+        assert!(resp["err"].as_str().unwrap().contains("data"), "resp={resp}");
+
+        use std::os::fd::AsRawFd;
+        unsafe {
+            let flags = libc::fcntl(read_end.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(read_end.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let mut buf = [0u8; 8];
+        assert!(read_end.read(&mut buf).is_err(), "空 input 不该写字节");
+    }
+
+    #[test]
+    fn input_on_unknown_session_is_rejected() {
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let resp = call_input(&sessions, "nope", "x");
         assert_eq!(resp["ok"], false);
     }
 }
@@ -1281,6 +1527,68 @@ fn handle_conn(
                 }
             }
         }
+        Some("input") => {
+            // 原始输入：工作延续，无 phase 门闩。权限在网关 write_enabled，这里只做
+            // 「会话在不在 + 载荷非空 + 写进 master」。
+            let id = v["id"].as_str().unwrap_or_default();
+            let mut c = conn;
+            let Some(sess) = sessions.lock().unwrap().get(id).cloned() else {
+                let _ = writeln!(c, "{}", serde_json::json!({ "ok": false, "err": "会话不存在" }));
+                return;
+            };
+
+            let Some(payload) = input_payload(&v) else {
+                let _ = writeln!(
+                    c,
+                    "{}",
+                    serde_json::json!({ "ok": false, "err": "需要非空 data" })
+                );
+                return;
+            };
+
+            let write_result = {
+                let ctl = sess.ctl.lock().unwrap();
+                (&ctl.master).write_all(&payload)
+            };
+            match write_result {
+                Ok(()) => {
+                    let _ = writeln!(c, "{}", serde_json::json!({ "ok": true }));
+                }
+                Err(e) => {
+                    let _ = writeln!(c, "{}", serde_json::json!({ "ok": false, "err": e.to_string() }));
+                }
+            }
+        }
+        Some("resize") => {
+            // 手机端按视口改 PTY 尺寸，让 Claude 等 TUI SIGWINCH 重排，
+            // 避免「镜像桌面大窗口 → 底部空一大截」。
+            let id = v["id"].as_str().unwrap_or_default();
+            let cols = v["cols"].as_u64().unwrap_or(0) as u16;
+            let rows = v["rows"].as_u64().unwrap_or(0) as u16;
+            let cell_w = v["cell_w"].as_u64().unwrap_or(0) as u16;
+            let cell_h = v["cell_h"].as_u64().unwrap_or(0) as u16;
+            let mut c = conn;
+            if cols == 0 || rows == 0 {
+                let _ = writeln!(
+                    c,
+                    "{}",
+                    serde_json::json!({ "ok": false, "err": "cols/rows 必须 > 0" })
+                );
+                return;
+            }
+            let Some(sess) = sessions.lock().unwrap().get(id).cloned() else {
+                let _ = writeln!(c, "{}", serde_json::json!({ "ok": false, "err": "会话不存在" }));
+                return;
+            };
+            // jolt：确保即使尺寸碰巧与当前相同也发出 SIGWINCH，逼 TUI 全量重绘
+            sess.ctl.lock().unwrap().jolt = true;
+            resize_session(&sess, cols, rows, cell_w, cell_h);
+            let _ = writeln!(
+                c,
+                "{}",
+                serde_json::json!({ "ok": true, "cols": cols, "rows": rows })
+            );
+        }
         _ => {}
     }
 }
@@ -1400,25 +1708,7 @@ fn handle_open(
                 } else {
                     (0, 0)
                 };
-                let xpixel = cols.saturating_mul(cell_w);
-                let ypixel = rows.saturating_mul(cell_h);
-                let mut ctl = sess.ctl.lock().unwrap();
-                let fd = ctl.master.as_raw_fd();
-                if ctl.jolt {
-                    ctl.jolt = false;
-                    resize_fd(fd, rows.saturating_add(1), cols, xpixel, ypixel);
-                }
-                resize_fd(fd, rows, cols, xpixel, ypixel);
-                ctl.cols = cols;
-                ctl.rows = rows;
-                drop(ctl);
-                // 常驻 Term 与 PTY 同步行列，否则快照宽高和真实壳不一致。
-                if let Ok(mut term) = sess.term.lock() {
-                    term.resize(DaemonTermSize {
-                        rows: rows.max(1) as usize,
-                        cols: cols.max(1) as usize,
-                    });
-                }
+                resize_session(&sess, cols, rows, cell_w, cell_h);
             }
             _ => break,
         }

@@ -1,0 +1,77 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+
+@theme {
+  --color-bg: #0a0a0c;
+  --color-panel: #101014;
+  --color-card: #161618;
+  --color-border: #2a2a2e;
+  --color-ink: #ececef;
+  --color-muted: #8b8b93;
+  --color-accent: #5b9fd4;
+  --color-ok: #3dba7a;
+  --color-warn: #e0a84a;
+  --color-danger: #e85d5d;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+}
+
+/*
+ * xterm 几何：外层 host 定高，内部 screen 由 JS resize(cols,rows)+fontSize
+ * 刚好铺满，禁止再出现「screen 很矮、host 很高」的黑边。
+ */
+.xterm-host {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  /* 触摸由 JS 处理；禁止浏览器把竖滑当成页面手势抢走 */
+  touch-action: none;
+  position: relative;
+}
+/* 镜像模式：.xterm 实际尺寸 = PTY 行列 × cell，再由 JS transform scale 装进宿主 */
+.xterm-host .xterm {
+  padding: 0;
+  overflow: hidden !important;
+  /* width/height/transform 由 XtermSurface layoutMirror 设置 */
+}
+.xterm-host .xterm-viewport {
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+
+/* 带色历史：第二个 xterm，叠在实时层上 */
+.xterm-hist-host {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: #08080a;
+}
+.xterm-live-btn {
+  position: absolute;
+  z-index: 3;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  border: 1px solid #3a5570;
+  border-radius: 999px;
+  background: #151a24ee;
+  color: #7ec8f0;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  box-shadow: 0 2px 12px #0008;
+  backdrop-filter: blur(6px);
+}
+.xterm-live-btn:active {
+  transform: translateX(-50%) scale(0.97);
+}

@@ -2,44 +2,135 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>smelt 观战席（只读）</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>smelt 终端</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 <style>
-  html, body { margin: 0; height: 100%; background: #111; }
-  #term { height: 100%; padding: 4px; box-sizing: border-box; }
-  #status {
-    position: fixed; top: 4px; right: 8px; font: 12px monospace; color: #888;
-    background: rgba(0,0,0,.6); padding: 2px 8px; border-radius: 4px;
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; overflow: hidden; }
+  #bar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 2;
+    display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+    padding: 4px 8px; background: rgba(0,0,0,.75); font: 12px/1.4 monospace;
   }
-  #back {
-    position: fixed; top: 4px; left: 8px; font: 12px monospace; color: #6cf;
-    background: rgba(0,0,0,.6); padding: 2px 8px; border-radius: 4px; text-decoration: none;
+  #bar a { color: #6cf; text-decoration: none; }
+  #status { color: #888; margin-left: auto; }
+  #term {
+    position: absolute; top: 28px; left: 0; right: 0; bottom: 0;
+    padding: 4px; box-sizing: border-box;
   }
+  body.has-toolbar #term { bottom: 44px; }
+  #toolbar {
+    display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 2;
+    gap: 4px; padding: 6px 8px; background: #1a1a1a; border-top: 1px solid #333;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  body.has-toolbar #toolbar { display: flex; }
+  #toolbar button {
+    flex: 0 0 auto; border: 1px solid #444; background: #222; color: #ddd;
+    border-radius: 6px; padding: 8px 10px; font: 13px monospace; min-width: 2.4rem;
+  }
+  #toolbar button:active { background: #333; }
 </style>
 </head>
 <body>
-<a id="back" href="#">← 会话列表</a>
-<div id="status">连接中…</div>
+<div id="bar">
+  <a id="back" href="#">← 列表</a>
+  <a id="console" href="#">操作台</a>
+  <span id="status">连接中…</span>
+</div>
 <div id="term"></div>
+<div id="toolbar" aria-label="终端快捷键">
+  <button type="button" data-key="esc">Esc</button>
+  <button type="button" data-key="tab">Tab</button>
+  <button type="button" data-key="ctrlc">^C</button>
+  <button type="button" data-key="ctrld">^D</button>
+  <button type="button" data-key="up">↑</button>
+  <button type="button" data-key="down">↓</button>
+  <button type="button" data-key="left">←</button>
+  <button type="button" data-key="right">→</button>
+  <button type="button" data-key="enter">↵</button>
+</div>
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
 <script>
-  // ID/TOKEN 由网关渲染页面时服务端替换进来：JSON 转义后，尖括号还会被转成
-  // Unicode 转义序列，防止 session id/token 里带闭合 script 标签的字符提前
-  // 把这段脚本切断，造成反射型 XSS。
+  // ID/TOKEN 由网关渲染时替换（js_string_literal）；WRITE_ENABLED 是布尔字面量。
   const ID = __ID_JSON__;
   const TOKEN = __TOKEN_JSON__;
+  const WRITE_ENABLED = __WRITE_ENABLED__;
+
   const statusEl = document.getElementById('status');
   document.getElementById('back').href = `/?token=${encodeURIComponent(TOKEN)}`;
+  document.getElementById('console').href =
+    `/s/${encodeURIComponent(ID)}/console?token=${encodeURIComponent(TOKEN)}`;
 
-  const term = new Terminal({ convertEol: true, disableStdin: true, cursorBlink: false });
+  if (WRITE_ENABLED) document.body.classList.add('has-toolbar');
+
+  const term = new Terminal({
+    convertEol: true,
+    disableStdin: !WRITE_ENABLED,
+    cursorBlink: WRITE_ENABLED,
+    fontSize: 13,
+    theme: { background: '#111' },
+  });
   term.open(document.getElementById('term'));
+
+  // 可写时：xterm onData → POST /input。stream WS 只搬画面，不混输入，避免和
+  // 只读旁观语义缠在一起。发送失败不阻塞后续按键；状态栏短暂提示。
+  let sendBusy = 0;
+  async function sendInput(data) {
+    if (!WRITE_ENABLED || !data) return;
+    sendBusy++;
+    try {
+      const resp = await fetch(
+        `/s/${encodeURIComponent(ID)}/input?token=${encodeURIComponent(TOKEN)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data }),
+        }
+      );
+      if (!resp.ok) {
+        const t = await resp.text();
+        statusEl.textContent = `写入失败：${t || resp.status}`;
+        return;
+      }
+      const body = await resp.json().catch(() => ({}));
+      if (body.ok === false) {
+        statusEl.textContent = `写入失败：${body.err || '未知'}`;
+      }
+    } catch (e) {
+      statusEl.textContent = '写入失败（网络）';
+    } finally {
+      sendBusy--;
+    }
+  }
+
+  const KEY_SEQ = {
+    esc: '\x1b',
+    tab: '\t',
+    ctrlc: '\x03',
+    ctrld: '\x04',
+    up: '\x1b[A',
+    down: '\x1b[B',
+    left: '\x1b[D',
+    right: '\x1b[C',
+    enter: '\r',
+  };
+
+  if (WRITE_ENABLED) {
+    term.onData((data) => { sendInput(data); });
+    document.querySelectorAll('#toolbar button').forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        const seq = KEY_SEQ[btn.getAttribute('data-key')];
+        if (seq) sendInput(seq);
+        term.focus();
+      });
+    });
+  }
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsUrl = `${proto}://${location.host}/s/${encodeURIComponent(ID)}/stream?token=${encodeURIComponent(TOKEN)}`;
 
-  // 断线重连：指数退避（1s→2s→4s→8s 封顶），连上一次就把退避重置回 1s。
-  // 每次重连拿到的是全新的 ANSI 整屏快照，先 term.reset() 清掉旧画面再写，
-  // 不然重连后的快照会跟断线前残留的内容叠在一起。
   let retryDelay = 1000;
   const MAX_RETRY_DELAY = 8000;
 
@@ -49,8 +140,9 @@
 
     ws.onopen = () => {
       term.reset();
-      statusEl.textContent = '只读观战';
+      statusEl.textContent = WRITE_ENABLED ? '可写 · 实时' : '只读观战';
       retryDelay = 1000;
+      if (WRITE_ENABLED) term.focus();
     };
     ws.onclose = () => {
       const s = Math.round(retryDelay / 1000);
@@ -58,10 +150,9 @@
       setTimeout(connect, retryDelay);
       retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
     };
-    ws.onerror = () => { ws.close(); }; // 统一走 onclose 的重连路径，不重复写逻辑
+    ws.onerror = () => { ws.close(); };
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
-        // 首帧：{"cols":..,"rows":..} —— 落地尺寸后再写快照，否则历史行宽会错位。
         const meta = JSON.parse(ev.data);
         if (meta.cols && meta.rows) term.resize(meta.cols, meta.rows);
         return;

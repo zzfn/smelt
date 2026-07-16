@@ -285,31 +285,101 @@ pub struct RemoteRuntimeState {
 
 impl Global for RemoteRuntimeState {}
 
-/// 开关"远程访问"：调 terminal::remote_start/remote_stop 同步守护实际状态，
-/// 再存盘持久化这个开关本身。暂不开放自定义绑定地址——默认回环，见
-/// collaboration.md 的安全底线；真要跨机器访问是 P2P/信令服务器那条路，另计。
+fn set_remote_from_start_result(result: Result<terminal::RemoteStatus, String>, cx: &mut App) {
+    match result {
+        Ok(s) => cx.set_global(RemoteRuntimeState {
+            token: s.token,
+            addr: s.addr,
+            write: s.write,
+            error: None,
+        }),
+        Err(e) => cx.set_global(RemoteRuntimeState {
+            token: None,
+            addr: None,
+            write: false,
+            error: Some(e),
+        }),
+    }
+}
+
+/// 异步拉起 / 刷新 Cloudflare 隧道，并在结束后用守护现状回填远程 token。
+/// 失败时写进 TunnelRuntimeState.error，**不**要求用户记「先关后开」步骤——
+/// 设置页会给一键「重试」。
+fn spawn_tunnel_start(write: bool, cx: &mut App) {
+    cx.set_global(TunnelRuntimeState {
+        connecting: true,
+        url: None,
+        error: None,
+        write: false,
+    });
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move { terminal::tunnel_start(write) })
+            .await;
+        let _ = cx.update(|cx| {
+            let remote = terminal::remote_status();
+            let has_token = remote.token.as_ref().is_some_and(|t| !t.is_empty());
+            cx.set_global(RemoteRuntimeState {
+                token: remote.token.clone(),
+                addr: remote.addr,
+                write: remote.write,
+                error: None,
+            });
+            let rt = match result {
+                Ok(status) if has_token => TunnelRuntimeState {
+                    connecting: false,
+                    url: status.url,
+                    error: None,
+                    write: status.write,
+                },
+                Ok(_) => TunnelRuntimeState {
+                    connecting: false,
+                    url: None,
+                    error: Some("外网通道建好了，但分享密钥还没就绪，点下方重试即可".into()),
+                    write: false,
+                },
+                Err(e) => TunnelRuntimeState {
+                    connecting: false,
+                    url: None,
+                    error: Some(e),
+                    write: false,
+                },
+            };
+            cx.set_global(rt);
+        });
+    })
+    .detach();
+}
+
+/// 总开关：开启远程。关掉时自动拆掉隧道，用户不必先关外网再关远程。
 pub fn apply_remote_toggle(enabled: bool, cx: &mut App) {
     if enabled {
-        let write = cx.global::<RemoteConfig>().write_enabled;
-        match terminal::remote_start("127.0.0.1", write) {
-            Ok(status) => cx.set_global(RemoteRuntimeState {
-                token: status.token,
-                addr: status.addr,
-                write: status.write,
-                error: None,
-            }),
-            Err(e) => {
-                cx.set_global(RemoteRuntimeState { token: None, addr: None, write: false, error: Some(e) })
-            }
+        let c = cx.global::<RemoteConfig>().clone();
+        let write = c.write_enabled;
+        let want_tunnel = c.tunnel_enabled;
+        set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
+        let mut c = cx.global::<RemoteConfig>().clone();
+        c.enabled = true;
+        save_remote_config(&c);
+        cx.set_global(c);
+        // 若用户是点「手机/外网」间接打开的，want_tunnel 已是 true，这里补上隧道。
+        if want_tunnel {
+            spawn_tunnel_start(write, cx);
         }
     } else {
+        terminal::tunnel_stop();
         terminal::remote_stop();
+        cx.set_global(TunnelRuntimeState::default());
         cx.set_global(RemoteRuntimeState::default());
+        let mut c = cx.global::<RemoteConfig>().clone();
+        c.enabled = false;
+        // 总开关关掉 = 停止分享。外网开关一并熄灭，避免「远程关了但手机访问还亮着」
+        // 的误解；写入偏好保留，下次再开远程仍按原权限。
+        c.tunnel_enabled = false;
+        save_remote_config(&c);
+        cx.set_global(c);
     }
-    let mut c = cx.global::<RemoteConfig>().clone();
-    c.enabled = enabled;
-    save_remote_config(&c);
-    cx.set_global(c);
 }
 
 /// Cloudflare Tunnel 运行时状态（不落盘）：`connecting` 是"cloudflared 起来了但
@@ -326,14 +396,8 @@ pub struct TunnelRuntimeState {
 
 impl Global for TunnelRuntimeState {}
 
-/// 开关"跨网络访问（Cloudflare Tunnel）"：跟 [`apply_remote_toggle`] 不同，
-/// `tunnel_start` 可能耗时数秒到 ~30s（spawn cloudflared + 等它连上 Cloudflare
-/// 边缘），**必须扔进后台任务**，同步调用会冻住 UI 线程。
-///
-/// 开启隧道隐含把本机远程访问也打开（隧道就是转发给它的，见 smeltd.rs 的
-/// `start_tunnel`），这里把 `enabled` 也同步成 true，避免"远程访问"那个开关
-/// 显示关闭、但隧道其实活着"这种不一致。关闭隧道不反过来关本机访问——用户
-/// 可能就是想留着局域网可访问，只是不想再对公网暴露。
+/// 开关「手机 / 外网可访问」。开 = 自动确保远程已开 + 拉隧道；关 = 只拆隧道，本机链接保留。
+/// 用户不必知道「必须先开远程」——依赖由这里消化。
 pub fn apply_tunnel_toggle(enabled: bool, cx: &mut App) {
     let mut c = cx.global::<RemoteConfig>().clone();
     c.tunnel_enabled = enabled;
@@ -349,50 +413,68 @@ pub fn apply_tunnel_toggle(enabled: bool, cx: &mut App) {
         return;
     }
 
-    cx.set_global(TunnelRuntimeState { connecting: true, url: None, error: None, write: false });
     let write = c.write_enabled;
-    cx.spawn(async move |cx| {
-        let result = cx.background_executor().spawn(async move { terminal::tunnel_start(write) }).await;
-        let _ = cx.update(|cx| {
-            let rt = match result {
-                Ok(status) => {
-                    TunnelRuntimeState { connecting: false, url: status.url, error: None, write: status.write }
-                }
-                Err(e) => TunnelRuntimeState { connecting: false, url: None, error: Some(e), write: false },
-            };
-            cx.set_global(rt);
-            // tunnel_start 内部顺带开了本机网关，回填一下运行时状态，让"远程访问"
-            // 那个开关下面的链接展示也跟着刷新。
-            let remote = terminal::remote_status();
-            cx.set_global(RemoteRuntimeState {
-                token: remote.token,
-                addr: remote.addr,
-                write: remote.write,
-                error: None,
-            });
-        });
-    })
-    .detach();
+    // 先保证本机网关有 token（同步，通常很快），再异步建隧道。
+    if !cx
+        .global::<RemoteRuntimeState>()
+        .token
+        .as_ref()
+        .is_some_and(|t| !t.is_empty())
+    {
+        set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
+    }
+    spawn_tunnel_start(write, cx);
 }
 
-/// 开关"允许写入"（approve/deny/reply，见 smeltd.rs「远程操控」）。这个 write
-/// 位是在网关/隧道启动时烤进 token 里的，不能对一条活链接热切换——切换后如果
-/// 网关/隧道正跑着，得停了用新的 write 值重开，换一条新链接（旧链接因此失效，
-/// 这是故意的：权限变化必须体现在新链接上，不能让旧链接的人静默获得新权限）。
+/// 开关「允许写入」。只改偏好时不打扰；远程已开则在后台按新权限换新链接，
+/// 状态卡会显示「正在更新…」，用户不用手动关开关。
 pub fn apply_write_toggle(enabled: bool, cx: &mut App) {
     let mut c = cx.global::<RemoteConfig>().clone();
     c.write_enabled = enabled;
     save_remote_config(&c);
     cx.set_global(c.clone());
 
+    if !c.enabled {
+        // 远程没开：只记偏好，下次打开总开关时自动带上。
+        return;
+    }
+
     if c.tunnel_enabled {
         terminal::tunnel_stop();
-        cx.set_global(TunnelRuntimeState::default());
-        apply_tunnel_toggle(true, cx);
-    } else if c.enabled {
         terminal::remote_stop();
-        cx.set_global(RemoteRuntimeState::default());
-        apply_remote_toggle(true, cx);
+        cx.set_global(RemoteRuntimeState {
+            token: None,
+            addr: None,
+            write: false,
+            error: None,
+        });
+        // connecting 态让分享卡片显示「正在按新权限更新链接…」
+        spawn_tunnel_start(enabled, cx);
+    } else {
+        terminal::remote_stop();
+        set_remote_from_start_result(terminal::remote_start("127.0.0.1", enabled), cx);
+    }
+}
+
+/// 分享卡片上的「重试」：按当前配置把网关 / 隧道重新拉齐，不要求用户记步骤。
+pub fn retry_remote_setup(cx: &mut App) {
+    let c = cx.global::<RemoteConfig>().clone();
+    if !c.enabled && !c.tunnel_enabled {
+        return;
+    }
+    let write = c.write_enabled;
+    if c.tunnel_enabled {
+        let mut cfg = c;
+        cfg.enabled = true;
+        cfg.tunnel_enabled = true;
+        save_remote_config(&cfg);
+        cx.set_global(cfg);
+        terminal::tunnel_stop();
+        terminal::remote_stop();
+        set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
+        spawn_tunnel_start(write, cx);
+    } else if c.enabled {
+        set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
     }
 }
 
@@ -1409,126 +1491,197 @@ impl Workspace {
                 })),
         );
 
-        // —— 远程操作网关 ——
+        // —— 远程：总开关 + 选项自动联动 + 一张分享卡片 ——
+        // 用户不需要知道「先开远程再开隧道」；依赖和重试都在逻辑里消化。
         let remote_page = SettingPage::new("远程").group(
             SettingGroup::new().items(vec![
                 SettingItem::new(
-                    "开启远程访问",
+                    "开启远程",
                     SettingField::switch(
                         |cx: &App| cx.global::<RemoteConfig>().enabled,
                         |v: bool, cx: &mut App| apply_remote_toggle(v, cx),
                     ),
                 )
                 .description(
-                    "开启后，知道分享链接的人能在浏览器里查看这台机器上的全部终端会话\
-                     （默认只绑本机回环地址，跨机器访问需要你自己的网：Tailscale / SSH 隧道）。",
-                ),
-                SettingItem::render(move |_, _, cx: &mut App| {
-                    let enabled = cx.global::<RemoteConfig>().enabled;
-                    let rt = cx.global::<RemoteRuntimeState>().clone();
-                    if !enabled {
-                        return div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("关闭时不生成分享链接。");
-                    }
-                    if let Some(err) = &rt.error {
-                        let danger = cx.theme().danger;
-                        return div().text_xs().text_color(danger).child(format!("启动失败：{err}"));
-                    }
-                    let (Some(token), Some(addr)) = (rt.token.clone(), rt.addr.clone()) else {
-                        return div().text_xs().text_color(muted).child("启动中…");
-                    };
-                    let link = format!("http://{addr}/?token={token}");
-                    let link_for_copy = link.clone();
-                    let write_hint = if rt.write { "可写：approve/deny/reply" } else { "只读观战" };
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .max_w(px(280.))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis_middle()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(link),
-                        )
-                        .child(btn("copy-remote-link", "复制链接".into()).flex_shrink_0().on_mouse_down(
-                            MouseButton::Left,
-                            move |_, _window, cx: &mut App| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(link_for_copy.clone()));
-                            },
-                        ))
-                        .child(div().text_xs().text_color(muted).child(format!("（{write_hint}）")))
-                }),
-                SettingItem::new(
-                    "允许写入（approve/deny/reply）",
-                    SettingField::switch(
-                        |cx: &App| cx.global::<RemoteConfig>().write_enabled,
-                        |v: bool, cx: &mut App| apply_write_toggle(v, cx),
-                    ),
-                )
-                .description(
-                    "开启后，分享出去的链接不仅能看，还能替你批准/拒绝 Claude Code 的权限确认、\
-                     直接回复它的提问——链接分享出去这件事本身就是授权，没有额外的\"当面确认\"。\
-                     这个权限是烤进链接里的，切换后如果远程访问/隧道已经开着，会用新权限重新生成\
-                     一条链接（旧链接失效）。",
+                    "打开后生成分享链接，浏览器即可查看本机 agent 会话。关掉会停止分享\
+                     （若开着手机访问也会一起停）。",
                 ),
                 SettingItem::new(
-                    "跨网络访问（Cloudflare Tunnel）",
+                    "手机 / 外网也能打开",
                     SettingField::switch(
                         |cx: &App| cx.global::<RemoteConfig>().tunnel_enabled,
                         |v: bool, cx: &mut App| apply_tunnel_toggle(v, cx),
                     ),
                 )
                 .description(
-                    "手机切到蜂窝网络、不在同一个局域网时也能连回这台电脑——原理是通过 \
-                     Cloudflare 中转（不是真正点对点），需要本机装了 cloudflared \
-                     （brew install cloudflared）。开启会连带打开上面的远程访问。",
+                    "用 Cloudflare 生成公网链接，离开 Wi‑Fi 也能连。需要本机已安装 \
+                     cloudflared（brew install cloudflared）。打开时会自动开启上方「远程」。",
                 ),
+                SettingItem::new(
+                    "允许远程写入",
+                    SettingField::switch(
+                        |cx: &App| cx.global::<RemoteConfig>().write_enabled,
+                        |v: bool, cx: &mut App| apply_write_toggle(v, cx),
+                    ),
+                )
+                .description(
+                    "链接持有者可在手机上输入、批准/拒绝权限。分享即授权。\
+                     切换后会自动换一条新链接（旧链接失效），无需手动重开。",
+                ),
+                // 统一分享卡片：优先公网链接，否则本机链接；异常时给重试，不写「请先…再…」
                 SettingItem::render(move |_, _, cx: &mut App| {
-                    let tunnel_enabled = cx.global::<RemoteConfig>().tunnel_enabled;
-                    let rt = cx.global::<TunnelRuntimeState>().clone();
-                    if !tunnel_enabled {
-                        return div().text_xs().text_color(muted).child("关闭时不建立公网隧道。");
+                    let cfg = cx.global::<RemoteConfig>().clone();
+                    let remote = cx.global::<RemoteRuntimeState>().clone();
+                    let tunnel = cx.global::<TunnelRuntimeState>().clone();
+                    let danger = cx.theme().danger;
+
+                    if !cfg.enabled && !cfg.tunnel_enabled {
+                        return div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("打开「开启远程」后，这里会出现可复制的分享链接。");
                     }
-                    if let Some(err) = &rt.error {
-                        let danger = cx.theme().danger;
-                        return div().text_xs().text_color(danger).child(format!("启动失败：{err}"));
+
+                    // 准备中：隧道 connecting，或远程已开但还没有 token
+                    let preparing = tunnel.connecting
+                        || (cfg.enabled
+                            && remote.error.is_none()
+                            && !remote.token.as_ref().is_some_and(|t| !t.is_empty()));
+
+                    if preparing {
+                        let msg = if tunnel.connecting {
+                            "正在准备分享链接…（外网通道最多约 30 秒）"
+                        } else {
+                            "正在准备分享链接…"
+                        };
+                        return div().text_xs().text_color(muted).child(msg);
                     }
-                    if rt.connecting {
-                        return div().text_xs().text_color(muted).child("连接中…（cloudflared 建隧道，最多约 30s）");
+
+                    if let Some(err) = remote.error.as_ref().or(tunnel.error.as_ref()) {
+                        return v_flex()
+                            .gap_2()
+                            .child(div().text_xs().text_color(danger).child(format!("出了点问题：{err}")))
+                            .child(
+                                btn("retry-remote", "重试".into()).on_mouse_down(
+                                    MouseButton::Left,
+                                    |_, _window, cx: &mut App| retry_remote_setup(cx),
+                                ),
+                            );
                     }
-                    let Some(url) = rt.url.clone() else {
-                        return div().text_xs().text_color(muted).child("启动中…");
+
+                    let token = remote.token.clone().filter(|t| !t.is_empty());
+                    let Some(token) = token else {
+                        return v_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("还没有可用的分享链接。"),
+                            )
+                            .child(
+                                btn("retry-remote-empty", "重试".into()).on_mouse_down(
+                                    MouseButton::Left,
+                                    |_, _window, cx: &mut App| retry_remote_setup(cx),
+                                ),
+                            );
                     };
-                    // 公网链接同样得带上远程访问那把 token，从同一个全局状态读。
-                    let token = cx.global::<RemoteRuntimeState>().token.clone().unwrap_or_default();
-                    let link = format!("{url}/?token={token}");
-                    let link_for_copy = link.clone();
-                    let write_hint = if rt.write { "可写：approve/deny/reply" } else { "只读观战" };
-                    h_flex()
-                        .items_center()
-                        .gap_2()
+
+                    // 主链接：有公网用公网（手机场景），否则本机
+                    let public = tunnel
+                        .url
+                        .as_ref()
+                        .filter(|_| cfg.tunnel_enabled)
+                        .map(|u| format!("{u}/?token={token}"));
+                    let local = remote
+                        .addr
+                        .as_ref()
+                        .map(|a| format!("http://{a}/?token={token}"));
+                    let primary = public.clone().or_else(|| local.clone());
+                    let Some(primary) = primary else {
+                        return div().text_xs().text_color(muted).child("正在准备分享链接…");
+                    };
+
+                    let write_on = if public.is_some() {
+                        tunnel.write
+                    } else {
+                        remote.write
+                    };
+                    let mode = if write_on {
+                        "可写入（终端 + 批准/拒绝）"
+                    } else {
+                        "只读观战"
+                    };
+                    let scope = if public.is_some() {
+                        "手机 / 外网可用"
+                    } else {
+                        "仅本机或同一局域网（可用 Tailscale）"
+                    };
+
+                    let primary_copy = primary.clone();
+                    let mut card = v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .max_w(px(320.))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis_middle()
+                                        .text_xs()
+                                        .text_color(fg)
+                                        .child(primary),
+                                )
+                                .child(
+                                    btn("copy-share-link", "复制链接".into())
+                                        .flex_shrink_0()
+                                        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                primary_copy.clone(),
+                                            ));
+                                        }),
+                                ),
+                        )
                         .child(
                             div()
-                                .max_w(px(280.))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis_middle()
                                 .text_xs()
                                 .text_color(muted)
-                                .child(link),
-                        )
-                        .child(btn("copy-tunnel-link", "复制链接".into()).flex_shrink_0().on_mouse_down(
-                            MouseButton::Left,
-                            move |_, _window, cx: &mut App| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(link_for_copy.clone()));
-                            },
-                        ))
-                        .child(div().text_xs().text_color(muted).child(format!("（{write_hint}）")))
+                                .child(format!("{scope} · {mode}")),
+                        );
+
+                    // 同时有公网时，附带本机链接作次要信息（不抢主按钮）
+                    if let (Some(_), Some(local_link)) = (public, local) {
+                        let local_copy = local_link.clone();
+                        card = card.child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .max_w(px(280.))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis_middle()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(format!("本机：{local_link}")),
+                                )
+                                .child(
+                                    btn("copy-local-link", "复制本机".into())
+                                        .flex_shrink_0()
+                                        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                local_copy.clone(),
+                                            ));
+                                        }),
+                                ),
+                        );
+                    }
+
+                    card
                 }),
             ]),
         );

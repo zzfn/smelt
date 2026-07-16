@@ -8,8 +8,8 @@
 //!   gateway [--bind 127.0.0.1] [--port 0] [--write]
 //! 默认绑回环地址，不监听 `0.0.0.0`；跨机器访问交给用户自己的网
 //! （Tailscale/SSH 隧道），网关自己不做中继、不做公网暴露。`--write` 开启后
-//! 这条链接也能 approve/deny/reply（见 remote_gateway.rs「远程操控」，
-//! 链接本身就是授权，不再额外要求当面确认）。
+//! 这条链接能 `input`（原始键盘）+ approve/deny/reply（见 smeltd「远程操控」），
+//! 链接本身就是授权，不再额外要求当面确认。
 
 #[path = "../remote_gateway.rs"]
 mod remote_gateway;
@@ -61,7 +61,10 @@ async fn main() {
     };
     let addr = listener.local_addr().unwrap();
 
-    println!("smelt 远程操作网关（{}）", if write { "可写：approve/deny/reply" } else { "只读观战" });
+    println!(
+        "smelt 远程操作网关（{}）",
+        if write { "可写：input + approve/deny/reply" } else { "只读观战" }
+    );
     println!("绑定：{addr}（默认只回环，不监听 0.0.0.0；跨机器访问用你自己的网：Tailscale / SSH 隧道）");
     println!("分享链接（会话列表）：http://{addr}/?token={token}");
 

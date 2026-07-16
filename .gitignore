@@ -14,3 +14,8 @@ dist/
 
 # macOS 目录元数据
 .DS_Store
+
+# remote H5
+remote-web/node_modules/
+remote-web/dist/
+

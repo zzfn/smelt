@@ -2,183 +2,519 @@
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>smelt 操作台</title>
 <style>
-  html, body { margin: 0; min-height: 100%; background: #111; color: #ddd; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-    padding: 1.2rem; max-width: 480px; margin: 0 auto;
+  :root {
+    --bg: #0a0a0c;
+    --panel: #101014;
+    --border: #26262c;
+    --text: #e8e8ec;
+    --muted: #7e7e88;
+    --accent: #5b9fd4;
+    --ok: #3dba7a;
+    --warn: #e0a84a;
+    --danger: #e85d5d;
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
   }
-  #back { color: #6cf; text-decoration: none; font-size: .85rem; }
-  h1 {
-    font-size: .85rem; color: #888; margin: 1.2rem 0 .3rem; word-break: break-all;
-    font-family: monospace; font-weight: normal;
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    max-width: 520px; margin: 0 auto;
+    display: flex; flex-direction: column;
+    min-height: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  /* —— 顶栏 —— */
+  .top {
+    flex-shrink: 0;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: .5rem;
+    padding: .55rem .7rem;
+    background: rgba(12,12,16,.96);
+    border-bottom: 1px solid var(--border);
+    z-index: 5;
+  }
+  #back {
+    color: var(--accent); text-decoration: none; font-size: .85rem;
+    padding: .35rem .25rem; white-space: nowrap;
+  }
+  .title-mid { min-width: 0; text-align: center; }
+  #name {
+    font-size: .95rem; font-weight: 650; margin: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #subtitle {
+    margin: .1rem 0 0; font-size: .7rem; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .top-right {
+    display: flex; align-items: center; gap: .4rem;
   }
   #badge {
-    display: inline-block; padding: .5rem 1rem; border-radius: 8px; font-size: 1.1rem;
-    font-weight: 600; margin: .8rem 0; color: #fff; background: #333;
+    padding: .22rem .55rem; border-radius: 999px;
+    font-size: .68rem; font-weight: 600; color: #fff; background: #333;
+    max-width: 4.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* 完整终端：仅图标 */
+  #term-icon {
+    display: flex; align-items: center; justify-content: center;
+    width: 2.15rem; height: 2.15rem; border-radius: 9px;
+    background: transparent; border: 1px solid var(--border);
+    color: var(--muted); text-decoration: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #term-icon:active { background: #1a1a20; color: var(--text); }
+  #term-icon svg { width: 1.15rem; height: 1.15rem; display: block; }
+
+  /* —— CLI 面板主体 —— */
+  .cli {
+    flex: 1; min-height: 0;
+    display: flex; flex-direction: column;
+    margin: 0; background: var(--panel);
+  }
+
+  #readonly-banner {
+    display: none; flex-shrink: 0;
+    margin: .55rem .7rem 0; padding: .55rem .7rem;
+    background: #151a24; border: 1px solid #243044; border-radius: 10px;
+    font-size: .8rem; color: #9aa8bc; line-height: 1.4;
+  }
+  #readonly-banner.visible { display: block; }
+
+  #question-card {
+    display: none; flex-shrink: 0;
+    margin: .55rem .7rem 0; padding: .65rem .75rem;
+    background: #16161c; border: 1px solid var(--border); border-radius: 10px;
+  }
+  #question-card.visible { display: block; }
+  #question-card .label {
+    font-size: .65rem; color: var(--muted); margin-bottom: .25rem; letter-spacing: .03em;
   }
   #question {
-    font-size: 1rem; line-height: 1.6; margin: 1rem 0; white-space: pre-wrap;
-    word-break: break-word;
+    font-size: .9rem; line-height: 1.45; white-space: pre-wrap; word-break: break-word; margin: 0;
   }
-  #actions { display: none; gap: .6rem; margin: 1rem 0; }
-  #actions.visible { display: flex; flex-wrap: wrap; }
+
+  #actions {
+    display: none; flex-shrink: 0; gap: .45rem;
+    margin: .5rem .7rem 0;
+  }
+  #actions.visible { display: flex; }
   .btn {
-    border: none; border-radius: 8px; padding: .7rem 1.2rem; font-size: 1rem;
-    font-weight: 600; cursor: pointer; color: #fff;
+    border: none; border-radius: 10px; padding: .65rem 1rem; font-size: .9rem;
+    font-weight: 600; cursor: pointer; color: #fff; -webkit-tap-highlight-color: transparent;
   }
-  #approve-btn { background: #22c55e; }
-  #deny-btn { background: #ef4444; }
-  #reply-row { display: none; gap: .5rem; margin: .8rem 0; }
-  #reply-row.visible { display: flex; }
-  #reply-input {
-    flex: 1; background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
-    padding: .6rem .8rem; color: #ddd; font-size: 1rem;
+  .btn:active { transform: scale(.98); }
+  .btn:disabled { opacity: .45; cursor: default; transform: none; }
+  #approve-btn { background: var(--ok); flex: 1; }
+  #deny-btn { background: var(--danger); flex: 1; }
+  #send-btn { background: var(--accent); padding: .65rem .95rem; flex-shrink: 0; }
+
+  #action-status {
+    flex-shrink: 0; font-size: .75rem; min-height: 1rem;
+    margin: .35rem .85rem 0; color: var(--muted);
   }
-  #reply-btn { background: #4a9eff; }
-  .btn:disabled { opacity: .5; cursor: default; }
-  #action-status { font-size: .85rem; color: #888; min-height: 1.2rem; margin-top: .3rem; }
-  #meta { color: #888; font-size: .8rem; margin-top: 2rem; }
-  #term-link {
-    display: inline-block; margin-top: 1.5rem; color: #6cf; text-decoration: none;
-    font-size: .95rem;
+  #action-status.ok { color: var(--ok); }
+  #action-status.err { color: var(--danger); }
+
+  /* 输出 = CLI 主舞台 */
+  .output-wrap {
+    flex: 1; min-height: 0;
+    display: flex; flex-direction: column;
+    margin: .45rem .55rem 0;
+    border: 1px solid var(--border); border-radius: 12px 12px 0 0;
+    border-bottom: none;
+    background: #08080a; overflow: hidden;
   }
-  #term-link:hover { text-decoration: underline; }
+  .output-head {
+    flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+    padding: .3rem .65rem; border-bottom: 1px solid var(--border);
+    font-size: .68rem; color: var(--muted);
+  }
+  #out-live { font-size: .65rem; color: #3a9; }
+  #out-live.off { color: #555; }
+  #output {
+    flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: .55rem .7rem .75rem; margin: 0;
+    font: 12.5px/1.45 ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-word; color: #c4c4cc;
+    /* 内容少时从顶部排，不把空白撑在中间 */
+  }
+  #output:empty::before {
+    content: "等待输出…";
+    color: #444;
+  }
+
+  /* 输入条：贴在输出区下方，组成同一块 CLI 面板 */
+  #composer {
+    display: none; flex-shrink: 0;
+    margin: 0 .55rem calc(.45rem + var(--safe-bottom));
+    border: 1px solid var(--border); border-radius: 0 0 12px 12px;
+    background: #0e0e12;
+    padding: .45rem .5rem .4rem;
+  }
+  #composer.visible { display: block; }
+  #composer-inner { display: flex; gap: .4rem; align-items: flex-end; }
+  #prompt {
+    flex-shrink: 0; align-self: center;
+    font: 600 13px/1 ui-monospace, Menlo, monospace;
+    color: var(--accent); padding: 0 .15rem 0 .25rem; user-select: none;
+  }
+  #composer-input {
+    flex: 1; background: #08080a; border: 1px solid var(--border); border-radius: 10px;
+    padding: .55rem .7rem; color: var(--text); font-size: .95rem; resize: none;
+    min-height: 2.3rem; max-height: 6rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    line-height: 1.35;
+  }
+  #composer-input:focus { outline: none; border-color: #3a5570; }
+  #composer-meta {
+    font-size: .65rem; color: #4a4a52; margin-top: .28rem; padding-left: 1.4rem;
+  }
 </style>
 </head>
 <body>
-<a id="back" href="#">← 会话列表</a>
-<h1 id="session-id"></h1>
-<div id="badge">连接中…</div>
-<div id="question"></div>
-<div id="actions">
-  <button class="btn" id="approve-btn">批准</button>
-  <button class="btn" id="deny-btn">拒绝</button>
+<header class="top">
+  <a id="back" href="#">←</a>
+  <div class="title-mid">
+    <h1 id="name">…</h1>
+    <p id="subtitle"></p>
+  </div>
+  <div class="top-right">
+    <div id="badge">…</div>
+    <a id="term-icon" href="#" title="完整终端" aria-label="打开完整终端">
+      <!-- terminal / console glyph -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4" width="18" height="16" rx="2.5"/>
+        <path d="M7 9l3 2.5L7 14"/>
+        <path d="M12 14h5"/>
+      </svg>
+    </a>
+  </div>
+</header>
+
+<div class="cli">
+  <div id="readonly-banner">只读观战：不能写入。需要输入时请在 Mac 打开「允许远程写入」并用新链接。</div>
+
+  <div id="question-card">
+    <div class="label">正在问你</div>
+    <p id="question"></p>
+  </div>
+
+  <div id="actions">
+    <button class="btn" id="approve-btn" type="button">批准</button>
+    <button class="btn" id="deny-btn" type="button">拒绝</button>
+  </div>
+
+  <div id="action-status"></div>
+
+  <div class="output-wrap">
+    <div class="output-head">
+      <span>输出</span>
+      <span id="out-live" class="off">未连接</span>
+    </div>
+    <pre id="output" aria-live="polite"></pre>
+  </div>
+
+  <div id="composer">
+    <div id="composer-inner">
+      <span id="prompt">›</span>
+      <textarea id="composer-input" rows="1" placeholder="输入命令或回复…" enterkeyhint="send" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+      <button class="btn" id="send-btn" type="button">发送</button>
+    </div>
+    <div id="composer-meta">回车发送 · Shift+回车换行</div>
+  </div>
 </div>
-<div id="reply-row">
-  <input id="reply-input" type="text" placeholder="回复 agent…">
-  <button class="btn" id="reply-btn">发送</button>
-</div>
-<div id="action-status"></div>
-<div id="meta"></div>
-<a id="term-link" href="#">查看完整终端 →</a>
+
 <script>
-  // ID/TOKEN 由网关渲染页面时服务端替换进来，转义方式见 gateway_page.html 的注释
-  // （同一套 js_string_literal，防反射型 XSS）。WRITE_ENABLED 是纯布尔值，
-  // 不经过用户输入，不需要转义。
   const ID = __ID_JSON__;
   const TOKEN = __TOKEN_JSON__;
+  const NAME = __NAME_JSON__;
+  const SUBTITLE = __SUBTITLE_JSON__;
   const WRITE_ENABLED = __WRITE_ENABLED__;
 
-  document.getElementById('session-id').textContent = ID;
+  document.getElementById('name').textContent = NAME || ID;
+  document.getElementById('subtitle').textContent = SUBTITLE || '';
+  document.title = (NAME || 'CLI') + ' · smelt';
   document.getElementById('back').href = `/?token=${encodeURIComponent(TOKEN)}`;
-  document.getElementById('term-link').href =
+  document.getElementById('term-icon').href =
     `/s/${encodeURIComponent(ID)}?token=${encodeURIComponent(TOKEN)}`;
 
-  // 跟 remote_gateway.rs 里的 phase_label() 手动保持一致——服务端渲染列表页
-  // 用一份，这里操作台实时刷新用另一份，Rust/JS 没法共用同一份代码。
   const PHASE_LABEL = {
-    thinking: ['思考中…', '#4a9eff'],
-    executing_tool: ['执行工具中…', '#4a9eff'],
-    awaiting_approval: ['等你批准', '#ef4444'],
-    waiting_for_user: ['等你说话', '#f59e0b'],
-    idle: ['空闲', '#666'],
-    dead: ['已结束', '#666'],
+    thinking: ['思考中', '#3b82f6'],
+    executing_tool: ['执行中', '#3b82f6'],
+    awaiting_approval: ['等批准', '#ef4444'],
+    waiting_for_user: ['等回复', '#f59e0b'],
+    idle: ['空闲', '#52525b'],
+    dead: ['结束', '#52525b'],
   };
-  // 跟 smeltd.rs 的门闩条件一致：只有这两种 phase 才允许发 action。
   const ACTIONABLE = new Set(['awaiting_approval', 'waiting_for_user']);
 
   const badge = document.getElementById('badge');
+  const questionCard = document.getElementById('question-card');
   const questionEl = document.getElementById('question');
-  const metaEl = document.getElementById('meta');
   const actionsEl = document.getElementById('actions');
-  const replyRowEl = document.getElementById('reply-row');
   const actionStatusEl = document.getElementById('action-status');
   const approveBtn = document.getElementById('approve-btn');
   const denyBtn = document.getElementById('deny-btn');
-  const replyBtn = document.getElementById('reply-btn');
-  const replyInput = document.getElementById('reply-input');
+  const composer = document.getElementById('composer');
+  const composerInput = document.getElementById('composer-input');
+  const sendBtn = document.getElementById('send-btn');
+  const readonlyBanner = document.getElementById('readonly-banner');
+  const outputEl = document.getElementById('output');
+  const outLive = document.getElementById('out-live');
 
-  let currentPhase = null;
-
-  function render(state) {
-    currentPhase = state.phase;
-    const [label, color] = PHASE_LABEL[state.phase] || [state.phase || '未知', '#666'];
-    badge.textContent = label;
-    badge.style.background = color;
-    questionEl.textContent = state.pending_question || '';
-    metaEl.textContent = state.phase_since
-      ? `状态更新于 ${new Date(state.phase_since * 1000).toLocaleTimeString()}`
-      : '';
-
-    const actionable = WRITE_ENABLED && ACTIONABLE.has(state.phase);
-    actionsEl.classList.toggle('visible', actionable);
-    replyRowEl.classList.toggle('visible', actionable);
-    if (actionable) actionStatusEl.textContent = '';
+  if (WRITE_ENABLED) {
+    composer.classList.add('visible');
+  } else {
+    readonlyBanner.classList.add('visible');
   }
 
-  async function sendAction(kind, text) {
-    [approveBtn, denyBtn, replyBtn].forEach((b) => (b.disabled = true));
-    actionStatusEl.textContent = '发送中…';
-    try {
-      const resp = await fetch(
-        `/s/${encodeURIComponent(ID)}/action?token=${encodeURIComponent(TOKEN)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ kind, text }),
-        }
-      );
-      const data = await resp.json();
-      actionStatusEl.textContent = data.ok ? '已发送' : `失败：${data.err || resp.status}`;
-    } catch (e) {
-      actionStatusEl.textContent = '发送失败（网络问题）';
-    } finally {
-      [approveBtn, denyBtn, replyBtn].forEach((b) => (b.disabled = false));
+  function setStatus(text, kind) {
+    actionStatusEl.textContent = text || '';
+    actionStatusEl.classList.remove('ok', 'err');
+    if (kind) actionStatusEl.classList.add(kind);
+  }
+
+  function render(state) {
+    const [label, color] = PHASE_LABEL[state.phase] || [state.phase || '未知', '#52525b'];
+    badge.textContent = label;
+    badge.style.background = color;
+
+    const q = (state.pending_question || '').trim();
+    questionEl.textContent = q;
+    questionCard.classList.toggle('visible', !!q);
+
+    actionsEl.classList.toggle('visible', WRITE_ENABLED && ACTIONABLE.has(state.phase));
+  }
+
+  // 终端 attach 会推「整屏网格」快照：大量空行。直接显示会「历史在上、中间一大块黑」。
+  // 这里压空白、去尾空行，让 CLI 面板像聊天/日志而不是 80x24 空格子。
+  const MAX_CHARS = 20000;
+  const MAX_LINES = 400;
+  let outBuf = '';
+  let stickBottom = true;
+  let pending = '';
+  let flushTimer = null;
+
+  outputEl.addEventListener('scroll', () => {
+    const gap = outputEl.scrollHeight - outputEl.scrollTop - outputEl.clientHeight;
+    stickBottom = gap < 48;
+  });
+
+  function stripAnsi(s) {
+    return s
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+      .replace(/\x1b[PX^_][^\x1b]*\x1b\\/g, '')
+      .replace(/\x1b./g, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      // 退格：粗暴丢掉前一字符（够用）
+      .replace(/.\x08/g, '');
+  }
+
+  /** 压空白：连续空行最多保留 1 行；去掉行尾空格；去掉首尾空行 */
+  function compactText(s) {
+    const lines = s.split('\n').map((l) => l.replace(/[ \t]+$/g, ''));
+    const out = [];
+    let blankRun = 0;
+    for (const line of lines) {
+      if (line.length === 0) {
+        blankRun += 1;
+        if (blankRun <= 1) out.push('');
+      } else {
+        blankRun = 0;
+        out.push(line);
+      }
+    }
+    while (out.length && out[0] === '') out.shift();
+    while (out.length && out[out.length - 1] === '') out.pop();
+    return out.join('\n');
+  }
+
+  function paint() {
+    let text = compactText(outBuf);
+    // 只保留末尾 N 行，避免整屏历史把有用内容顶飞
+    const lines = text.split('\n');
+    if (lines.length > MAX_LINES) {
+      text = lines.slice(lines.length - MAX_LINES).join('\n');
+      outBuf = text;
+    }
+    if (text.length > MAX_CHARS) {
+      text = text.slice(text.length - MAX_CHARS);
+      const cut = text.indexOf('\n');
+      if (cut > 0 && cut < 200) text = text.slice(cut + 1);
+      outBuf = text;
+    }
+    outputEl.textContent = text;
+    if (stickBottom) {
+      // 双 rAF：等布局完成再滚到底，避免「贴底却仍看到中间空白」
+      requestAnimationFrame(() => {
+        outputEl.scrollTop = outputEl.scrollHeight;
+      });
     }
   }
 
-  approveBtn.addEventListener('click', () => sendAction('approve'));
-  denyBtn.addEventListener('click', () => sendAction('deny'));
-  replyBtn.addEventListener('click', () => {
-    const text = replyInput.value.trim();
-    if (!text) return;
-    sendAction('reply', text);
-    replyInput.value = '';
-  });
-  replyInput.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Enter') replyBtn.click();
-  });
+  function appendOutput(chunk) {
+    if (!chunk) return;
+    pending += chunk;
+    if (flushTimer) return;
+    // 合并一帧内的多次 binary，减少闪烁
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      outBuf += pending;
+      pending = '';
+      paint();
+    }, 32);
+  }
 
-  let retryDelay = 1000;
-  const MAX_RETRY_DELAY = 8000;
-
-  function connect() {
+  function connectOutput() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}/s/${encodeURIComponent(ID)}/state-stream?token=${encodeURIComponent(TOKEN)}`;
+    const url = `${proto}://${location.host}/s/${encodeURIComponent(ID)}/stream?token=${encodeURIComponent(TOKEN)}`;
     const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    let retry = 1000;
+    const dec = new TextDecoder('utf-8', { fatal: false });
+    let isFirstBinary = true;
 
-    ws.onopen = () => { retryDelay = 1000; };
+    ws.onopen = () => {
+      retry = 1000;
+      outLive.textContent = '实时';
+      outLive.classList.remove('off');
+      outBuf = '';
+      pending = '';
+      outputEl.textContent = '';
+      stickBottom = true;
+      isFirstBinary = true;
+    };
     ws.onmessage = (ev) => {
-      try {
-        render(JSON.parse(ev.data));
-      } catch (e) {
-        // 忽略解析失败的行，不让一条坏消息炸掉整个页面
+      if (typeof ev.data === 'string') return; // 尺寸 JSON
+      let text = stripAnsi(dec.decode(new Uint8Array(ev.data), { stream: true }));
+      // 首包通常是整屏快照：直接 compact，丢掉网格空行
+      if (isFirstBinary) {
+        isFirstBinary = false;
+        text = compactText(text);
+        // 首屏只留尾部有内容的一段，避免上半屏历史 + 下半屏空白
+        const lines = text.split('\n');
+        if (lines.length > 80) {
+          text = lines.slice(-80).join('\n');
+        }
+        outBuf = text ? text + '\n' : '';
+        paint();
+        return;
       }
+      appendOutput(text);
     };
     ws.onclose = () => {
-      const s = Math.round(retryDelay / 1000);
-      badge.textContent = `连接断开，${s}s 后重连…`;
-      badge.style.background = '#333';
-      setTimeout(connect, retryDelay);
-      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
+      outLive.textContent = '重连…';
+      outLive.classList.add('off');
+      setTimeout(connectOutput, retry);
+      retry = Math.min(retry * 2, 8000);
     };
     ws.onerror = () => { ws.close(); };
   }
 
-  connect();
+  async function postJson(path, body) {
+    const resp = await fetch(
+      `/s/${encodeURIComponent(ID)}${path}?token=${encodeURIComponent(TOKEN)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }
+    );
+    const text = await resp.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!resp.ok) throw new Error((data && data.err) || text || `HTTP ${resp.status}`);
+    if (!data) throw new Error('服务器返回空响应');
+    return data;
+  }
+
+  async function sendAction(kind) {
+    [approveBtn, denyBtn, sendBtn].forEach((b) => (b.disabled = true));
+    setStatus('发送中…');
+    try {
+      const data = await postJson('/action', { kind });
+      setStatus(data.ok ? '已发送' : (data.err || '失败'), data.ok ? 'ok' : 'err');
+      if (data.ok) { stickBottom = true; outputEl.scrollTop = outputEl.scrollHeight; }
+    } catch (e) {
+      setStatus(e.message || '网络问题', 'err');
+    } finally {
+      [approveBtn, denyBtn, sendBtn].forEach((b) => (b.disabled = false));
+    }
+  }
+
+  async function sendComposer() {
+    if (!WRITE_ENABLED) return;
+    const text = composerInput.value;
+    if (!text.trim()) return;
+    const data = text.endsWith('\n') || text.endsWith('\r') ? text : text + '\r';
+    [approveBtn, denyBtn, sendBtn].forEach((b) => (b.disabled = true));
+    setStatus('发送中…');
+    try {
+      const result = await postJson('/input', { data });
+      if (result.ok) {
+        setStatus('已发送', 'ok');
+        composerInput.value = '';
+        autoResize();
+        stickBottom = true;
+        outputEl.scrollTop = outputEl.scrollHeight;
+      } else {
+        setStatus(result.err || '失败', 'err');
+      }
+    } catch (e) {
+      setStatus(e.message || '网络问题', 'err');
+    } finally {
+      [approveBtn, denyBtn, sendBtn].forEach((b) => (b.disabled = false));
+      composerInput.focus();
+    }
+  }
+
+  function autoResize() {
+    const el = composerInput;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 96) + 'px';
+  }
+
+  approveBtn.addEventListener('click', () => sendAction('approve'));
+  denyBtn.addEventListener('click', () => sendAction('deny'));
+  sendBtn.addEventListener('click', () => sendComposer());
+  composerInput.addEventListener('input', autoResize);
+  composerInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && !ev.shiftKey) {
+      ev.preventDefault();
+      sendComposer();
+    }
+  });
+
+  let stateRetry = 1000;
+  function connectState() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const url = `${proto}://${location.host}/s/${encodeURIComponent(ID)}/state-stream?token=${encodeURIComponent(TOKEN)}`;
+    const ws = new WebSocket(url);
+    ws.onopen = () => { stateRetry = 1000; };
+    ws.onmessage = (ev) => {
+      try { render(JSON.parse(ev.data)); } catch (e) {}
+    };
+    ws.onclose = () => {
+      badge.textContent = '…';
+      badge.style.background = '#333';
+      setTimeout(connectState, stateRetry);
+      stateRetry = Math.min(stateRetry * 2, 8000);
+    };
+    ws.onerror = () => { ws.close(); };
+  }
+
+  connectState();
+  connectOutput();
+  if (WRITE_ENABLED) composerInput.focus();
 </script>
 </body>
 </html>
