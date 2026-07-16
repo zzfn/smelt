@@ -986,6 +986,10 @@ pub struct Terminal {
 /// 百毫秒到 1 秒量级，这个预算（5 次 × 300ms ≈ 1.2s，含首次尝试共 5 次）足够盖过去。
 const HANDSHAKE_RETRIES: u32 = 5;
 const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(300);
+/// 握手回执的读超时。正常守护毫秒级就回；僵死/半退出的守护可能接受连接却永不回话，
+/// 而握手在 GUI 主线程同步跑——没有这个超时就是无限 beachball（真实发生过：启动
+/// 恢复会话时主线程卡死，强杀重开又 abort）。取值对齐 probe_daemon 的 5s。
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// reattach 快照整段灌进客户端 Term 之后：贴底 + 补鼠标模式位。
 ///
@@ -1030,7 +1034,13 @@ impl Terminal {
                 if attempt > 0 {
                     thread::sleep(HANDSHAKE_RETRY_DELAY);
                 }
-                match Self::handshake(rows, cols, cwd, id, launch) {
+                // connect 失败（自动拉起守护 5s 都没就绪）是不可恢复的环境问题，
+                // 立即失败——重试只会把「守护起不来」放大成每会话 ~26s 的主线程
+                // 阻塞（重试 × 每次再拉一遍守护），启动恢复 8 个会话就是 3 分钟
+                // beachball。重试只留给握手层：连上了但读到 EOF/坏行，那才是
+                // upgrade 交接的百毫秒抖动，重连一次就好。
+                let writer = connect_daemon()?;
+                match Self::handshake_on(writer, rows, cols, cwd, id, launch) {
                     Ok(x) => {
                         result = Some(x);
                         break;
@@ -1163,17 +1173,21 @@ impl Terminal {
         self.redraw_rx.clone()
     }
 
-    /// 一次性握手：连守护 + 声明会话 + 读首行尺寸 + 重放字节数，不重试（重试策略在
-    /// `spawn` 里）。replay_len 是 reattach 时守护即将吐给我们的历史字节数（新建
-    /// 会话是 0），供 spawn() 的读线程划一条"重放 / 实时"边界，见那边的用法。
-    fn handshake(
+    /// 一次性握手：在已连上的 stream 上声明会话 + 读首行尺寸 + 重放字节数，不重试
+    /// （连接与重试策略都在 `spawn` 里）。replay_len 是 reattach 时守护即将吐给我们
+    /// 的历史字节数（新建会话是 0），供 spawn() 的读线程划一条"重放 / 实时"边界，
+    /// 见那边的用法。拆成独立函数是为了测试能注入假守护。
+    fn handshake_on(
+        mut writer: UnixStream,
         rows: usize,
         cols: usize,
         cwd: Option<&str>,
         id: &str,
         launch: Option<&str>,
     ) -> anyhow::Result<(BufReader<UnixStream>, TermSize, usize)> {
-        let mut writer = connect_daemon()?;
+        // 只在等回执这一段设读超时；同文件 probe/remote/subscribe 都设了，唯独
+        // 这条最要命的主线程路径曾经漏掉。
+        writer.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))?;
         writeln!(
             writer,
             "{}",
@@ -1188,6 +1202,10 @@ impl Terminal {
             cols: v["cols"].as_u64().unwrap_or(cols as u64) as usize,
         };
         let replay_len = v["replay_len"].as_u64().unwrap_or(0) as usize;
+        // 握手完必须清掉超时：这条 stream 接下来交给读线程长期读 PTY 输出（见
+        // spawn 里 `let mut reader = buffered`），空闲终端半天没输出是常态，读循环
+        // 对任何 Err 一律 break 当 EOF——超时留着就等于给每个安静的终端定时断线。
+        buffered.get_ref().set_read_timeout(None)?;
         Ok((buffered, size, replay_len))
     }
 
@@ -2054,6 +2072,31 @@ mod damage_gate_tests {
 /// 验证 EventProxy 会把 PtyWrite / ColorRequest 这类「终端该怎么回应」的事件真的
 /// 写回去，不用起真实 shell/PTY——直接喂原始转义序列给 alacritty 的 Processor，
 /// 用 UnixStream::pair() 在另一头当"假守护"读回应帧即可，快且不 flaky。
+#[cfg(test)]
+mod handshake_timeout_tests {
+    use super::*;
+
+    /// 复现启动卡死/崩溃链的第一环：守护接受了连接但一字不回（僵死、半退出、
+    /// upgrade 交接卡住都会这样）。握手在 GUI 主线程同步跑，read_line 没有超时
+    /// 就是永久 beachball。修复后应在 HANDSHAKE_READ_TIMEOUT 内返回 Err。
+    /// 用 UnixStream::pair 当假守护：对端只收不回，且保持存活（drop 会变成 EOF，
+    /// 测的就不是"不回话"了）。
+    #[test]
+    fn handshake_times_out_against_mute_daemon() {
+        let (ours, theirs) = UnixStream::pair().expect("pair 失败");
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let r = Terminal::handshake_on(ours, 24, 80, None, "mute-daemon-test", None);
+            let _ = tx.send(r.is_err());
+        });
+        match rx.recv_timeout(HANDSHAKE_READ_TIMEOUT + Duration::from_secs(2)) {
+            Ok(is_err) => assert!(is_err, "不回话的守护应让握手失败，而不是握手成功"),
+            Err(_) => panic!("握手对不回话的守护没有在超时窗口内返回——主线程会被永久卡死"),
+        }
+        drop(theirs); // 撑到断言之后才放，确保对端全程存活
+    }
+}
+
 #[cfg(test)]
 mod event_proxy_answers_tests {
     use super::*;

@@ -739,8 +739,9 @@ fn pane_to_state(pane: &Pane, cx: &App) -> PaneState {
 fn rebuild_pane(
     ps: &PaneState,
     tabs: &mut Vec<Entity<TerminalView>>,
+    daemon_ok: &mut bool,
     cx: &mut Context<Workspace>,
-) -> Pane {
+) -> Option<Pane> {
     match ps {
         PaneState::Leaf {
             cwd,
@@ -748,23 +749,62 @@ fn rebuild_pane(
             custom_title,
             launch_label,
         } => {
+            // 守护已探明不可达：别再逐叶子重付「拉起守护 + 等 5s」的代价（启动在
+            // 主线程同步跑，多个会话串行累加就是分钟级 beachball）。
+            if !*daemon_ok {
+                return None;
+            }
             // 有存档 id → reattach 守护里还活着的会话；旧存档无 id → 开新会话。
             // reattach 不再带 launch 命令（shell 已在跑），只恢复显示名与自定义名。
+            //
+            // spawn 可失败（守护起不来/握手超时），失败就剪掉这个叶子——绝不 panic：
+            // 这里在 did_finish_launching 的 FFI 回调栈上，panic 不能 unwind，等于
+            // abort 整个 app（「重启就崩」的根因，terminal_view.rs 的 expect 曾在此引爆）。
             let sid = id.clone().unwrap_or_else(new_sid);
             let label = launch_label.clone();
+            let terminal = match terminal::Terminal::spawn(24, 80, cwd.as_deref(), &sid, None) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[workspace] 恢复会话 {sid}（{cwd:?}）失败，跳过：{e:#}");
+                    // "smeltd 未就绪" = connect_daemon 拉起守护都失败了，环境级
+                    // 问题，后续叶子必然同样失败，全部短路。
+                    if e.to_string().contains("smeltd 未就绪") {
+                        *daemon_ok = false;
+                    }
+                    return None;
+                }
+            };
             let v = cx.new(|cx| {
-                let mut view = TerminalView::new(cx, cwd.clone(), sid, None, label.as_deref());
+                let mut view = TerminalView::from_terminal(
+                    cx,
+                    terminal,
+                    cwd.clone(),
+                    sid,
+                    None,
+                    label.as_deref(),
+                );
                 // 自定义名跟着同一条 Leaf 存取，reattach 后灌回来，否则重开就丢。
                 view.set_custom_title(custom_title.clone());
                 view
             });
             tabs.push(v.clone());
-            Pane::Leaf(v)
+            Some(Pane::Leaf(v))
         }
         PaneState::Split { axis, children } => {
-            let state = cx.new(|_| ResizableState::default());
-            let children = children.iter().map(|c| rebuild_pane(c, tabs, cx)).collect();
-            Pane::Split { axis: (*axis).into(), state, children }
+            let mut kept: Vec<Pane> = children
+                .iter()
+                .filter_map(|c| rebuild_pane(c, tabs, daemon_ok, cx))
+                .collect();
+            match kept.len() {
+                0 => None,
+                // 只剩一个孩子：解包成它本身，不留单孩子 Split。
+                1 => Some(kept.remove(0)),
+                _ => Some(Pane::Split {
+                    axis: (*axis).into(),
+                    state: cx.new(|_| ResizableState::default()),
+                    children: kept,
+                }),
+            }
         }
     }
 }
@@ -1057,10 +1097,17 @@ impl Workspace {
         let mut sessions: Vec<Session> = Vec::new();
         let mut active_session = 0;
         if let Some(s) = saved.as_ref() {
+            // 守护不可达标记：第一个会话探明后，其余全部短路（见 rebuild_pane）。
+            let mut daemon_ok = true;
             if !s.sessions.is_empty() {
+                // 单个会话恢复失败（守护挂了/超时）只丢它自己，其余照常——启动
+                // 在 FFI 回调栈上，任何 panic 都是整个 app abort。
                 for ss in &s.sessions {
                     let mut leaves = Vec::new();
-                    let layout = rebuild_pane(&ss.layout, &mut leaves, cx);
+                    let Some(layout) = rebuild_pane(&ss.layout, &mut leaves, &mut daemon_ok, cx)
+                    else {
+                        continue;
+                    };
                     if let Some(active) = leaves.get(ss.active).or_else(|| leaves.first()).cloned() {
                         sessions.push(Session { layout, active, custom_title: ss.custom_title.clone() });
                     }
@@ -1069,14 +1116,31 @@ impl Workspace {
             } else if let Some(ps) = &s.layout {
                 // 旧格式：单棵树 → 一个会话。
                 let mut leaves = Vec::new();
-                let layout = rebuild_pane(ps, &mut leaves, cx);
-                if let Some(active) = leaves.get(s.active).or_else(|| leaves.first()).cloned() {
-                    sessions.push(Session { layout, active, custom_title: None });
+                if let Some(layout) = rebuild_pane(ps, &mut leaves, &mut daemon_ok, cx) {
+                    if let Some(active) = leaves.get(s.active).or_else(|| leaves.first()).cloned() {
+                        sessions.push(Session { layout, active, custom_title: None });
+                    }
                 }
             } else {
-                // 更旧格式：cwd 列表 → 每个 cwd 一个独立会话。
+                // 更旧格式：cwd 列表 → 每个 cwd 一个独立会话。失败同样只跳过。
                 for cwd in s.tabs.clone() {
-                    let v = cx.new(|cx| TerminalView::new(cx, cwd, new_sid(), None, None));
+                    if !daemon_ok {
+                        break;
+                    }
+                    let sid = new_sid();
+                    let terminal =
+                        match terminal::Terminal::spawn(24, 80, cwd.as_deref(), &sid, None) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                if e.to_string().contains("smeltd 未就绪") {
+                                    daemon_ok = false;
+                                }
+                                continue;
+                            }
+                        };
+                    let v = cx.new(|cx| {
+                        TerminalView::from_terminal(cx, terminal, cwd, sid, None, None)
+                    });
                     sessions.push(Session::single(v));
                 }
                 active_session = s.active;
