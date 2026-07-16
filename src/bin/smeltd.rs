@@ -797,23 +797,31 @@ mod menubar {
 
     /// 注册（仅一次）点击靶子类：AppKit 菜单项只认 target-action，不认 Rust 闭包，
     /// 得声明一个最小的 `NSObject` 子类当靶子（同 status_item.rs 的做法）。
-    fn target_class() -> &'static Class {
+    fn target_class() -> Result<&'static Class, String> {
         static CLASS: OnceLock<&'static Class> = OnceLock::new();
-        *CLASS.get_or_init(|| {
-            let mut decl = ClassDecl::new("SmeltdMenubarTarget", class!(NSObject))
-                .expect("SmeltdMenubarTarget 类重复注册");
-            unsafe {
-                decl.add_method(
-                    sel!(smeltdOpen:),
-                    on_open as extern "C" fn(&Object, Sel, *mut Object),
-                );
-                decl.add_method(
-                    sel!(smeltdQuit:),
-                    on_quit as extern "C" fn(&Object, Sel, *mut Object),
-                );
-            }
-            decl.register()
-        })
+        if let Some(c) = CLASS.get() {
+            return Ok(*c);
+        }
+        // 已注册过则直接取，避免 ClassDecl::new 返回 None 再 expect 崩掉守护。
+        if let Some(existing) = Class::get("SmeltdMenubarTarget") {
+            let _ = CLASS.set(existing);
+            return Ok(existing);
+        }
+        let mut decl = ClassDecl::new("SmeltdMenubarTarget", class!(NSObject))
+            .ok_or_else(|| "无法声明 SmeltdMenubarTarget".to_string())?;
+        unsafe {
+            decl.add_method(
+                sel!(smeltdOpen:),
+                on_open as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(smeltdQuit:),
+                on_quit as extern "C" fn(&Object, Sel, *mut Object),
+            );
+        }
+        let cls = decl.register();
+        let _ = CLASS.set(cls);
+        Ok(cls)
     }
 
     /// `&str` → 临时 `NSString*`（autorelease，仅供本次调用当参数用）。
@@ -824,7 +832,15 @@ mod menubar {
 
     /// 建菜单栏图标 + 静态菜单，然后跑 AppKit runloop（阻塞到进程退出）。
     /// **必须在主线程调用。** 图标、菜单、靶子实例都常驻到进程退出，故意不释放。
-    pub fn run_event_loop() {
+    ///
+    /// AppKit 类拿不到时（cargo 直接跑 / 无 GUI 会话 / 框架未加载）返回 Err——
+    /// **绝不能 panic**：accept 在别的线程上，主线程 panic 会把整个守护带走，
+    /// 留下僵尸 sock，GUI 所有新建会话全失败（表现为「加项目没反应」）。
+    pub fn run_event_loop() -> Result<(), String> {
+        // class! 宏在类不存在时直接 panic；先用 Class::get 探测。
+        if Class::get("NSApplication").is_none() {
+            return Err("NSApplication 不可用（AppKit 未加载）".into());
+        }
         unsafe {
             let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
             // accessory：不占 Dock、不进 ⌘Tab，只在菜单栏留一枚图标。
@@ -852,7 +868,8 @@ mod menubar {
                 let _: () = msg_send![button, setTitle: nsstring("smelt")];
             }
 
-            let target: *mut Object = msg_send![target_class(), new]; // +1，永不 release
+            let target_cls = target_class()?;
+            let target: *mut Object = msg_send![target_cls, new]; // +1，永不 release
             let menu: *mut Object = msg_send![class!(NSMenu), new]; // +1，永不 release
 
             let open_item: *mut Object = msg_send![class!(NSMenuItem), alloc];
@@ -881,6 +898,7 @@ mod menubar {
             // 阻塞跑 runloop：菜单点击的 target-action 全靠它派发。
             let _: () = msg_send![app, run];
         }
+        Ok(())
     }
 }
 
@@ -974,11 +992,23 @@ fn main() {
     // 只有被 GUI 拉起时（SMELT_MENUBAR=1，说明继承了登录会话、连得上 WindowServer）
     // 才在顶部状态栏挂图标；命令行 / 无 GUI 会话下老老实实 headless 跑，绝不让「图标」
     // 这个锦上添花的东西把守护本身拖垮。
+    //
+    // 菜单栏失败时必须继续 accept：历史上 SMELT_MENUBAR 路径在 NSApplication 缺失时
+    // panic，整个守护带走、只剩僵尸 sock → GUI 所有「打开项目 / 拖入 / +」全失败。
     #[cfg(target_os = "macos")]
     if std::env::var_os("SMELT_MENUBAR").is_some() {
         let daemon = thread::spawn(accept_loop);
-        menubar::run_event_loop(); // 阻塞：跑到用户从菜单选「退出」为止
-        let _ = daemon.join(); // 兜底：runloop 万一提前返回，也别让守护跟着没
+        match menubar::run_event_loop() {
+            Ok(()) => {
+                // runloop 正常结束（菜单「退出」走 process::exit，一般到不了这里）
+                let _ = daemon.join();
+            }
+            Err(e) => {
+                dlog(&format!("menubar 不可用，守护继续 headless：{e}"));
+                // accept 在后台线程，主线程 join 撑住进程，效果等同 headless accept_loop
+                let _ = daemon.join();
+            }
+        }
         return;
     }
 
