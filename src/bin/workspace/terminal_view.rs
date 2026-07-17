@@ -349,13 +349,30 @@ fn classify_option_label(label: &str) -> PermissionOptionKind {
 }
 
 /// 尝试把一行解析成 `1. label` / `1) label` / `[1] label`。
+/// TUI 画边框用的竖线：选项行常常长成 `│ ❯ 1. Yes`，边框不剥掉就认不出选项。
+const BORDER_CHARS: [char; 6] = ['│', '|', '┃', '║', ' ', '\t'];
+
+/// 高亮指针字符集——真实 TUI 里远不止 `❯`。这份清单与手机端
+/// `remote-web/src/lib/parseChoiceMenu.ts` 的 OPTION_RE 对齐：那边踩过
+/// 「旧正则只认 `>`，高亮的第 1 项被漏掉、跑到标题槽位里」的线上问题并修好了，
+/// 这边一直没拿到那个补丁，于是同一个菜单手机认得出、桌面认不出。
+///
+/// 认不出的代价不是少个按钮，而是误操作：扫不到菜单 → 界面落回硬编码兜底
+/// （批准=打 1 / 拒绝=打 3）→ 盲发，而真实菜单未必是这个顺序。
+const POINTER_CHARS: [char; 15] = [
+    '❯', '>', '›', '▶', '►', '→', '➜', '•', '●', '◆', '*', '✦', '➢', '➤', ' ',
+];
+
 fn parse_numbered_option_line(raw: &str) -> Option<(String, String)> {
     let line = raw.trim();
     if line.is_empty() {
         return None;
     }
+    // 先剥边框，再剥高亮指针（顺序不能反：指针画在边框里侧）。
     let line = line
-        .trim_start_matches(['❯', '>', '*', '•', '●', '◆', ' '])
+        .trim_start_matches(BORDER_CHARS)
+        .trim_start()
+        .trim_start_matches(POINTER_CHARS)
         .trim_start();
 
     if let Some(rest) = line.strip_prefix('[') {
@@ -379,16 +396,14 @@ fn parse_numbered_option_line(raw: &str) -> Option<(String, String)> {
         return None;
     }
     let rest = line[digits.len()..].trim_start();
-    // 必须有分隔符，避免把 `1foo` 当选项
-    let rest = if let Some(r) = rest.strip_prefix('.') {
-        r
-    } else if let Some(r) = rest.strip_prefix(')') {
-        r
-    } else if let Some(r) = rest.strip_prefix(':') {
-        r
-    } else {
-        return None;
-    };
+    // 必须有分隔符，避免把 `1foo` 当选项。含中文 TUI 常用的顿号与全角句点
+    // （与手机端 OPTION_RE 的 [\.．、:)\]] 对齐）。
+    let rest = rest
+        .strip_prefix('.')
+        .or_else(|| rest.strip_prefix('．'))
+        .or_else(|| rest.strip_prefix('、'))
+        .or_else(|| rest.strip_prefix(')'))
+        .or_else(|| rest.strip_prefix(':'))?;
     let label = rest.trim();
     if label.is_empty() || label.starts_with('/') || label.starts_with("http") {
         return None;
@@ -460,10 +475,9 @@ pub fn parse_permission_prompt(lines: &[String]) -> Option<PermissionPrompt> {
         Some(truncate_chars(t, 120))
     });
 
-    if options.len() > 4 {
-        options.truncate(4);
-    }
-
+    // 不截断：被截掉的选项在界面上永远够不着，而 Claude Code 的权限菜单确实会有
+    // 5 项（Yes / Yes 别再问 / 仅此一次 / 先编辑命令 / No）。上游 parse 已经用
+    // 「2~12 项 + 序号连续」把误报挡住了，这里再砍一刀只会让真菜单缺项。
     Some(PermissionPrompt { summary, options })
 }
 
@@ -3056,5 +3070,84 @@ mod permission_prompt_tests {
         .expect("prompt");
         assert_eq!(p.options[0].kind, PermissionOptionKind::Allow);
         assert_eq!(p.options[1].kind, PermissionOptionKind::Deny);
+    }
+
+    // 以下几组是手机端（remote-web/src/lib/parseChoiceMenu.ts）已经认、而这边一直
+    // 认不出的真实 TUI 形态。两份解析器同日诞生后各自演化，手机那份陆续吃过线上
+    // 补丁（它注释里记着「高亮项常用 ❯ / › / ▶ 等，旧正则只认 `>`，会把第 1 项漏掉」），
+    // 这边从没拿到。
+    //
+    // 认不出的代价不是「少个按钮」而是**误操作**：扫不到菜单 → has_opts=false →
+    // 界面落回硬编码兜底（main.rs 的「批准=打 1 / 拒绝=打 3」）→ 盲发 1/3，
+    // 而真实菜单未必是这个顺序。
+
+    /// TUI 常用 `│` 画边框，选项行前缀是边框而非空白。
+    #[test]
+    fn accepts_options_behind_box_drawing_border() {
+        let p = parse_permission_prompt(&lines(
+            "Do you want to proceed?\n\
+             │ ❯ 1. Yes\n\
+             │   2. No, tell Claude what to do differently",
+        ))
+        .expect("边框前缀的菜单也该认出来");
+        assert_eq!(p.options.len(), 2);
+        assert_eq!(p.options[0].key, "1");
+        assert_eq!(p.options[0].kind, PermissionOptionKind::Allow);
+        assert_eq!(p.options[1].kind, PermissionOptionKind::Deny);
+    }
+
+    /// 高亮指针不止 `❯`：`›`/`▶`/`→` 等都在真实 TUI 里出现过。
+    #[test]
+    fn accepts_alternate_highlight_pointers() {
+        for ptr in ["›", "▶", "►", "→", "➜", "✦", "➢", "➤"] {
+            let src = format!(
+                "Do you want to proceed?\n{ptr} 1. Yes\n  2. No, cancel"
+            );
+            let p = parse_permission_prompt(&lines(&src))
+                .unwrap_or_else(|| panic!("指针 {ptr} 开头的菜单该认出来"));
+            assert_eq!(p.options.len(), 2, "指针 {ptr}");
+            assert_eq!(p.options[0].key, "1", "指针 {ptr}");
+        }
+    }
+
+    /// 中文 TUI 常用顿号或全角句点做分隔符。
+    #[test]
+    fn accepts_cjk_separators() {
+        for sep in ["、", "．"] {
+            let src = format!("是否继续执行？\n❯ 1{sep}允许\n  2{sep}拒绝");
+            let p = parse_permission_prompt(&lines(&src))
+                .unwrap_or_else(|| panic!("分隔符 {sep} 的菜单该认出来"));
+            assert_eq!(p.options.len(), 2, "分隔符 {sep}");
+            assert_eq!(p.options[0].kind, PermissionOptionKind::Allow, "分隔符 {sep}");
+            assert_eq!(p.options[1].kind, PermissionOptionKind::Deny, "分隔符 {sep}");
+        }
+    }
+
+    /// 超过 4 项不得静默截断——被截掉的选项在界面上永远够不着。
+    #[test]
+    fn keeps_all_options_beyond_four() {
+        let p = parse_permission_prompt(&lines(
+            "Do you want to proceed?\n\
+             ❯ 1. Yes\n\
+               2. Yes, and don't ask again\n\
+               3. Yes, but only this once\n\
+               4. Edit the command first\n\
+               5. No, tell Claude what to do differently",
+        ))
+        .expect("prompt");
+        assert_eq!(p.options.len(), 5, "5 项菜单不该被截断成 4 项");
+        assert_eq!(p.options[4].key, "5");
+        assert_eq!(p.options[4].kind, PermissionOptionKind::Deny);
+    }
+
+    /// 补齐字符集不能把语义闸门一起放开：纯编号列表仍须拒绝。
+    /// （手机那份没有闸门，会把这种误判成权限菜单——收敛时别把这个 bug 一起吸收。）
+    #[test]
+    fn still_rejects_plain_lists_with_new_separators_and_pointers() {
+        assert!(
+            parse_permission_prompt(&lines("› 1、install deps\n  2、run tests\n  3、deploy"))
+                .is_none(),
+            "换了指针和顿号，纯待办列表仍然不是权限菜单"
+        );
     }
 }
