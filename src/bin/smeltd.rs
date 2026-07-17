@@ -329,8 +329,13 @@ impl EventListener for StateListener {
                     if title_spinner::title_starts_with_spinner(t.trim_start())
                         && matches!(st.phase, Phase::Idle | Phase::Thinking)
                     {
-                        st.phase = Phase::Thinking;
-                        st.phase_since = now_unix();
+                        // 只在「进入」Thinking 那一刻记起点。agent 思考时 spinner 每秒
+                        // 换一帧（⠋→⠙→⠹…），帧帧都是一次 Title 事件；已经在 Thinking
+                        // 里还刷起点的话，「已思考 N 秒」会永远在 0~1 之间跳。
+                        if st.phase != Phase::Thinking {
+                            st.phase = Phase::Thinking;
+                            st.phase_since = now_unix();
+                        }
                     }
                     st.title = Some(t);
                     st.updated_at = now_unix();
@@ -1500,6 +1505,26 @@ mod state_listener_tests {
         assert_eq!(st.phase, Phase::AwaitingApproval, "spinner 不得覆盖 AwaitingApproval");
         assert_eq!(st.phase_since, 1, "phase_since 也不该被 spinner 刷新");
         assert_eq!(st.title.as_deref(), Some("⠋ waiting for permission"));
+    }
+
+    /// 已在 Thinking 中时，spinner 换帧不得重置 phase_since。agent 思考时 spinner
+    /// 每秒换一帧（⠋→⠙→⠹…），帧帧都是一次 Title 事件；若每帧都把起点推到 now，
+    /// 「已思考 N 秒」就永远在 0~1 之间跳——上面那条 AwaitingApproval 用例覆盖不到
+    /// 这条路径（它压根进不了 Idle|Thinking 分支）。
+    #[test]
+    fn spinner_frame_does_not_refresh_phase_since_while_thinking() {
+        let state = Arc::new(Mutex::new(SessionState {
+            phase: Phase::Thinking,
+            phase_since: 1,
+            ..Default::default()
+        }));
+        let listener = StateListener { state: Arc::clone(&state), subscribers: no_subscribers() };
+        listener.send_event(Event::Title("⠙ still thinking".to_string()));
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.phase, Phase::Thinking);
+        assert_eq!(st.phase_since, 1, "spinner 换帧不该把思考计时起点推到 now");
+        assert_eq!(st.title.as_deref(), Some("⠙ still thinking"));
     }
 
     #[test]

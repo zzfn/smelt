@@ -60,10 +60,12 @@ fn map_hook_event(hook: &serde_json::Value) -> Option<(&'static str, Option<Stri
                 // 尽量带一点路径/命令摘要
                 let input = &hook["tool_input"];
                 if let Some(cmd) = input["command"].as_str() {
-                    let short = if cmd.len() > 48 {
-                        format!("{}…", &cmd[..48])
-                    } else {
-                        cmd.to_string()
+                    // 按字符截断，别按字节：cmd.len() 是字节数，&cmd[..48] 也是按字节
+                    // 切片——第 48 字节一旦落在中文/emoji 的多字节编码中间就会 panic
+                    // （byte index is not a char boundary），把整个 hook 打挂。
+                    let short = match cmd.char_indices().nth(48) {
+                        Some((end, _)) => format!("{}…", &cmd[..end]),
+                        None => cmd.to_string(),
                     };
                     format!("Bash: {short}")
                 } else if let Some(p) = input["file_path"]
@@ -117,6 +119,54 @@ mod tests {
     fn pre_tool_use_carries_tool_name_as_question() {
         let hook = json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash" });
         assert_eq!(map_hook_event(&hook), Some(("executing_tool", Some("Bash".to_string()))));
+    }
+
+    /// 命令摘要按**字符**截断，不能按字节切：`&cmd[..48]` 遇到第 48 字节落在多字节
+    /// 字符中间会直接 panic（"byte index is not a char boundary"），把整个 hook 打挂
+    /// ——中文命令一跑就中招，实际见过。
+    #[test]
+    fn long_cjk_command_does_not_panic_on_char_boundary() {
+        // 第 48 字节落在「图」的三字节编码中间
+        let cmd = "echo \"=== 卷内容（应见中文软链 + 卷图标）===\"; ls -la /tmp/x; echo done";
+        assert!(!cmd.is_char_boundary(48), "用例前提：第 48 字节须落在字符中间");
+        assert!(cmd.chars().count() > 48, "用例前提：字符数须超过截断阈值");
+
+        let hook = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": cmd },
+        });
+        let (phase, q) = map_hook_event(&hook).unwrap();
+        assert_eq!(phase, "executing_tool");
+        let q = q.expect("应带命令摘要");
+        assert!(q.starts_with("Bash: echo"), "摘要应保留命令开头：{q}");
+        assert!(q.ends_with('…'), "超长应截断并加省略号：{q}");
+        assert_eq!(
+            q.chars().count(),
+            "Bash: ".chars().count() + 48 + 1,
+            "截断按字符算：前缀 + 48 字符 + 省略号"
+        );
+    }
+
+    /// 阈值按字符算而非字节：中文命令字节数很容易翻三倍越过阈值，但字符数并不多。
+    /// 旧的 `cmd.len() > 48`（字节）会把这种并不长的命令误判成超长、砍掉尾巴。
+    #[test]
+    fn cjk_command_within_char_limit_is_not_truncated() {
+        let cmd = "echo \"=== 卷内容（应见中文软链 + 卷图标）===\"; ls -la /tmp/x";
+        assert!(cmd.len() > 48, "用例前提：字节数须超阈值");
+        assert!(cmd.chars().count() <= 48, "用例前提：字符数须未超阈值");
+
+        let hook = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": cmd },
+        });
+        let (_, q) = map_hook_event(&hook).unwrap();
+        assert_eq!(
+            q.expect("应带命令摘要"),
+            format!("Bash: {cmd}"),
+            "字符数没超阈值就不该截断"
+        );
     }
 
     #[test]

@@ -1377,7 +1377,11 @@ impl Workspace {
         active_session: usize,
         cx: &mut Context<Self>,
     ) {
-        let (tx, rx) = smol::channel::bounded(1);
+        // 逐个交货，别攒成一整包：会话之间互不依赖，攒一包等于让窗口空等最慢的那次
+        // attach——表现为「冷启动后一个会话都不显示，过一会才全部冒出来」。改成恢复好
+        // 一个就发一个，第一个会话立刻上屏，其余陆续补齐。unbounded 保证后台线程不会
+        // 因为 UI 还没来得及收而卡住。
+        let (tx, rx) = smol::channel::unbounded();
         std::thread::Builder::new()
             .name("smelt-restore-sessions".into())
             .spawn(move || {
@@ -1385,71 +1389,68 @@ impl Workspace {
                 let _ = terminal::ensure_managed_daemon_current();
                 terminal::ensure_daemon_running();
                 let mut daemon_ok = true;
-                let mut outcomes: Vec<(SessionState, Result<Vec<SpawnedLeaf>, String>)> =
-                    Vec::with_capacity(pending.len());
                 for ss in pending {
-                    if !daemon_ok {
-                        outcomes.push((
-                            ss,
-                            Err("smeltd 未就绪（先前会话已失败）".into()),
-                        ));
-                        continue;
-                    }
-                    match spawn_layout_leaves(&ss.layout) {
-                        Ok(leaves) => outcomes.push((ss, Ok(leaves))),
-                        Err(e) => {
-                            if e.contains("smeltd 未就绪") {
-                                daemon_ok = false;
+                    let outcome = if daemon_ok {
+                        match spawn_layout_leaves(&ss.layout) {
+                            Ok(leaves) => Ok(leaves),
+                            Err(e) => {
+                                if e.contains("smeltd 未就绪") {
+                                    daemon_ok = false;
+                                }
+                                Err(e)
                             }
-                            outcomes.push((ss, Err(e)));
                         }
+                    } else {
+                        Err("smeltd 未就绪（先前会话已失败）".to_string())
+                    };
+                    // 接收端没了（窗口已关）就别再白跑剩下的
+                    if tx.send_blocking((ss, outcome)).is_err() {
+                        return;
                     }
                 }
-                let _ = tx.send_blocking(outcomes);
             })
             .expect("spawn smelt-restore-sessions 线程");
 
         cx.spawn(async move |this, cx| {
-            let outcomes = match rx.recv().await {
-                Ok(o) => o,
-                Err(_) => {
-                    eprintln!("[workspace] 会话恢复通道断开");
-                    return;
-                }
-            };
-            let _ = this.update(cx, |this, cx| {
-                let mut failed: Vec<SessionState> = Vec::new();
-                let mut restored = 0usize;
-                for (ss, result) in outcomes {
-                    match result {
-                        Ok(leaves) => {
-                            let mut leaf_iter = leaves.into_iter();
-                            let mut tabs = Vec::new();
-                            let Some(layout) =
-                                rebuild_pane_ready(&ss.layout, &mut leaf_iter, &mut tabs, cx)
-                            else {
-                                failed.push(ss);
-                                continue;
-                            };
-                            if let Some(active) =
-                                tabs.get(ss.active).or_else(|| tabs.first()).cloned()
-                            {
-                                this.sessions.push(Session {
-                                    layout,
-                                    active,
-                                    custom_title: ss.custom_title,
-                                });
-                                restored += 1;
-                            } else {
-                                failed.push(ss);
-                            }
-                        }
+            let mut failed: Vec<SessionState> = Vec::new();
+            let mut restored = 0usize;
+
+            // 收一个渲染一个。后台线程跑完会 drop sender，recv 报错即代表全部处理完。
+            while let Ok((ss, result)) = rx.recv().await {
+                let outcome = this.update(cx, |this, cx| {
+                    let leaves = match result {
+                        Ok(leaves) => leaves,
                         Err(e) => {
                             eprintln!("[workspace] 会话恢复失败，保留 orphan：{e}");
-                            failed.push(ss);
+                            return Some(ss);
                         }
-                    }
+                    };
+                    let mut leaf_iter = leaves.into_iter();
+                    let mut tabs = Vec::new();
+                    let Some(layout) = rebuild_pane_ready(&ss.layout, &mut leaf_iter, &mut tabs, cx)
+                    else {
+                        return Some(ss);
+                    };
+                    let Some(active) = tabs.get(ss.active).or_else(|| tabs.first()).cloned() else {
+                        return Some(ss);
+                    };
+                    this.sessions.push(Session {
+                        layout,
+                        active,
+                        custom_title: ss.custom_title,
+                    });
+                    // 让这一个立刻上屏，不等其余的
+                    cx.notify();
+                    None
+                });
+                match outcome {
+                    Ok(Some(ss)) => failed.push(ss),
+                    Ok(None) => restored += 1,
+                    Err(_) => return, // 窗口已关，收摊
                 }
+            }
+
+            let _ = this.update(cx, |this, cx| {
                 this.restore_orphans = failed;
                 this.active_session = active_session.min(this.sessions.len().saturating_sub(1));
                 this.save_state(cx);
