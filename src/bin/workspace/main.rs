@@ -15,6 +15,10 @@ mod json_store;
 mod mem_usage;
 #[path = "../../osc.rs"]
 mod osc;
+// 权限菜单解析：唯一真源，与 smeltd 共用同一份（smeltd 解析后随 SessionState 下发给
+// 手机端）。曾经 Rust/TS 各一份并已实测漂移，别再在别处另写一版。
+#[path = "../../permission_menu.rs"]
+mod permission_menu;
 mod pet;
 mod session_history;
 mod settings;
@@ -382,7 +386,7 @@ impl Session {
     }
 
     /// 会话内扫到的权限菜单（优先含审批/菜单的 pane）。
-    fn permission_prompt(&self, cx: &App) -> Option<terminal_view::PermissionPrompt> {
+    fn permission_prompt(&self, cx: &App) -> Option<permission_menu::PermissionPrompt> {
         let mut v = Vec::new();
         collect_leaves(&self.layout, &mut v);
         if let Some(t) = v.iter().find(|t| t.read(cx).is_awaiting_approval()) {
@@ -3888,11 +3892,11 @@ impl Workspace {
                                 let key = opt.key.clone();
                                 let label = opt.button_label();
                                 let (btn_bg, btn_fg) = match opt.kind {
-                                    terminal_view::PermissionOptionKind::Allow => {
+                                    permission_menu::PermissionOptionKind::Allow => {
                                         (green_tint, c_green)
                                     }
-                                    terminal_view::PermissionOptionKind::Deny => (red_tint, c_red),
-                                    terminal_view::PermissionOptionKind::Other => (soft, fg),
+                                    permission_menu::PermissionOptionKind::Deny => (red_tint, c_red),
+                                    permission_menu::PermissionOptionKind::Other => (soft, fg),
                                 };
                                 div()
                                     .id(SharedString::from(format!(
