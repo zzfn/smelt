@@ -1,10 +1,11 @@
 import { useEffect, useState } from "preact/hooks";
-import type { ChoiceMenu } from "../lib/parseChoiceMenu";
+import type { PermissionMenu } from "../api";
 
 type Props = {
-  menu: ChoiceMenu;
+  menu: PermissionMenu;
   busy?: boolean;
-  onSelect: (index: number) => void;
+  /** 传选项自带的按键（"1"/"2"/…），由调用方打进 PTY */
+  onSelect: (key: string) => void;
   onCancel: () => void;
   onCustom?: (text: string) => void;
 };
@@ -30,7 +31,7 @@ export function ChoiceSheet({ menu, busy, onSelect, onCancel, onCustom }: Props)
       class="fixed inset-0 z-50 flex flex-col justify-end bg-black/55 backdrop-blur-[2px]"
       role="dialog"
       aria-modal="true"
-      aria-label={menu.title || "请选择"}
+      aria-label={menu.summary || "请选择"}
       onClick={(e) => {
         if (e.target === e.currentTarget && !busy) onCancel();
       }}
@@ -38,14 +39,14 @@ export function ChoiceSheet({ menu, busy, onSelect, onCancel, onCustom }: Props)
       <div class="mx-auto flex max-h-[min(78vh,640px)] w-full max-w-lg flex-col rounded-t-2xl border border-border bg-panel shadow-2xl">
         <div class="flex shrink-0 items-start justify-between gap-3 border-b border-border px-4 pb-3 pt-3.5">
           <div class="min-w-0">
-            {menu.title ? (
-              <h2 class="text-base font-semibold leading-snug text-ink">{menu.title}</h2>
+            {/* summary = 选项上方紧邻的那行提示（如 "Do you want to proceed?"）。
+                旧的 TS 解析器把上方文本拆成 title + prompt 两行，Rust 这份只取最近的
+                一行——权限菜单实际就只有一行提问，两行是为通用编号菜单准备的。 */}
+            {menu.summary ? (
+              <h2 class="text-base font-semibold leading-snug text-ink">{menu.summary}</h2>
             ) : (
               <h2 class="text-base font-semibold text-ink">请选择</h2>
             )}
-            {menu.prompt ? (
-              <p class="mt-1 text-sm leading-snug text-muted">{menu.prompt}</p>
-            ) : null}
           </div>
           <button
             type="button"
@@ -60,9 +61,9 @@ export function ChoiceSheet({ menu, busy, onSelect, onCancel, onCustom }: Props)
         <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-2">
           <ul class="space-y-2">
             {menu.options.map((opt) => {
-              const active = menu.activeIndex === opt.index;
+              const active = opt.active;
               return (
-                <li key={opt.index}>
+                <li key={opt.key}>
                   <button
                     type="button"
                     disabled={busy}
@@ -71,7 +72,7 @@ export function ChoiceSheet({ menu, busy, onSelect, onCancel, onCustom }: Props)
                         ? "border-accent bg-accent/15"
                         : "border-border bg-card active:bg-[#1c1c22]"
                     }`}
-                    onClick={() => onSelect(opt.index)}
+                    onClick={() => onSelect(opt.key)}
                   >
                     <span class="flex w-full items-center gap-2">
                       <span
@@ -79,7 +80,7 @@ export function ChoiceSheet({ menu, busy, onSelect, onCancel, onCustom }: Props)
                           active ? "bg-accent text-white" : "bg-bg text-muted"
                         }`}
                       >
-                        {opt.index}
+                        {opt.key}
                       </span>
                       <span class="text-[16px] font-semibold leading-snug text-ink">
                         {opt.label}

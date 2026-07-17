@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
-import { postAction, postInput, SessionState, wsUrl } from "../api";
 import {
-  choiceKeySequence,
-  parseChoiceMenu,
-  type ChoiceMenu,
-} from "../lib/parseChoiceMenu";
+  fetchMenu,
+  postAction,
+  postInput,
+  SessionState,
+  wsUrl,
+  type PermissionMenu,
+} from "../api";
 import { ChoiceSheet } from "./ChoiceSheet";
 import { Composer } from "./Composer";
 import { StatusBadge } from "./StatusBadge";
@@ -60,18 +62,29 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
     };
   }, [sessionId]);
 
-  const menuFromTerm = useMemo(() => parseChoiceMenu(bufferText), [bufferText]);
-  const menuFromQuestion = useMemo(() => {
-    const q = state.pending_question?.trim();
-    if (!q) return null;
-    return parseChoiceMenu(q);
-  }, [state.pending_question]);
+  // 菜单不在前端解析——解析器只有 Rust 那一份（src/permission_menu.rs，GUI 与 smeltd
+  // 共用），这里拉守护现场解析的结果。画面何时变只有本端最清楚（它在渲染 xterm），
+  // 所以由本端 debounce 后拉一次；服务端因此不必在 PTY 泵那条每字节都过的热路径上
+  // 挂解析，也不受「state 广播只由 hook 驱动、没接 hook 的 agent 永不广播」所限。
+  const [menu, setMenu] = useState<PermissionMenu | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const timer = window.setTimeout(() => {
+      void fetchMenu(sessionId).then((m) => {
+        if (alive) setMenu(m);
+      });
+    }, 250);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+    // bufferText/phase 一变就重排这个 timer：画面还在刷时不断推迟，稳定 250ms 才拉。
+  }, [sessionId, bufferText, state.phase]);
 
-  const menu: ChoiceMenu | null = menuFromTerm || menuFromQuestion;
   // 菜单身份：标题+选项标签，变了才自动再弹出
   const menuKey = useMemo(() => {
     if (!menu) return "";
-    return `${menu.title || ""}|${menu.prompt || ""}|${menu.options.map((o) => o.label).join(";")}`;
+    return `${menu.summary || ""}|${menu.options.map((o) => o.label).join(";")}`;
   }, [menu]);
 
   useEffect(() => {
@@ -84,10 +97,10 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
     !!menu &&
     menu.options.length >= 2 &&
     // 思考中一般不是选菜单；等用户时更可信；终端已画出菜单也可弹
+    // menu 非空即代表守护此刻在屏幕上真扫到了菜单，本身就是最强证据
     (state.phase === "waiting_for_user" ||
       state.phase === "awaiting_approval" ||
-      state.phase === "idle" ||
-      !!menuFromTerm);
+      state.phase === "idle");
 
   const sendRaw = useCallback(
     async (data: string, okMsg: string) => {
@@ -126,14 +139,13 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
   );
 
   const onPick = useCallback(
-    async (index: number) => {
-      if (!menu) return;
-      // 方向键导航到目标项 + Enter（用最大序号，避免有缺口时 options.length 算错）
-      const maxIdx = Math.max(...menu.options.map((o) => o.index), index);
-      const seq = choiceKeySequence(index, maxIdx);
-      await sendRaw(seq, `已选 ${index}`);
+    async (key: string) => {
+      // 直接打选项自带的数字键 + Enter，与桌面端同一种选中方式。
+      // 旧实现是「↑ 顶到头 ×8 再 ↓ n-1 次」模拟导航——那依赖「多按几次总能顶到头」
+      // 的假设，菜单一旦有滚动或分页就会错位，且与桌面端行为不一致。
+      await sendRaw(`${key}\r`, `已选 ${key}`);
     },
-    [menu, sendRaw],
+    [sendRaw],
   );
 
   const actionable =

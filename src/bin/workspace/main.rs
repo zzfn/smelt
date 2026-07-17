@@ -19,6 +19,9 @@ mod osc;
 // 手机端）。曾经 Rust/TS 各一份并已实测漂移，别再在别处另写一版。
 #[path = "../../permission_menu.rs"]
 mod permission_menu;
+// 网格 → 文本行：同样与 smeltd 共用，避免两端各写一遍逐格拼行的宽字符/零宽处理。
+#[path = "../../term_text.rs"]
+mod term_text;
 mod pet;
 mod session_history;
 mod settings;

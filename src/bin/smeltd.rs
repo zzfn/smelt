@@ -146,6 +146,12 @@ mod remote_gateway;
 // 只需要 spinner 判定；OSC 扫描整包留给 workspace（见 src/osc.rs / title_spinner.rs）。
 #[path = "../title_spinner.rs"]
 mod title_spinner;
+// 权限菜单解析与网格取文本：与 GUI 共用同一份。手机端不再自己解析——它拉 `menu` op
+// 拿这里的结果。两份实现（Rust/TS）曾实测漂移过，别再走回头路。
+#[path = "../permission_menu.rs"]
+mod permission_menu;
+#[path = "../term_text.rs"]
+mod term_text;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -1891,6 +1897,23 @@ fn handle_conn(
         Some("open") => handle_open(conn, reader, &v, sessions, Arc::clone(&subscribers)),
         Some("watch") => handle_watch(conn, reader, &v, sessions),
         Some("subscribe") => handle_subscribe(conn, &sessions, &subscribers),
+        // 扫当前可视区里的权限菜单，解析结果原样回给调用方（网关 → 手机端）。
+        // 只读、无副作用，所以不要写权限：看得见菜单 ≠ 能点它，点是走 input/action。
+        //
+        // 为什么是「拉」而不是随 state 广播：state 广播由 hook 驱动（phase 变化），
+        // 没接 hook 的 agent 永远不广播，菜单就永远到不了手机。而画面变化只有客户端
+        // 最清楚——它在渲染 xterm，debounce 之后拉一次即可，服务端不必在 PTY 泵那条
+        // 每字节都过的热路径上挂解析。
+        Some("menu") => {
+            let id = v["id"].as_str().unwrap_or_default();
+            let sess = sessions.lock().unwrap().get(id).cloned();
+            let menu = sess.and_then(|s| {
+                let term = s.term.lock().ok()?;
+                permission_menu::parse_permission_prompt(&term_text::last_lines(&term, 28))
+            });
+            let mut c = conn;
+            let _ = writeln!(c, "{}", serde_json::json!({ "ok": true, "menu": menu }));
+        }
         Some("list") => {
             let (ids, states): (Vec<String>, Vec<SessionState>) = sessions
                 .lock()

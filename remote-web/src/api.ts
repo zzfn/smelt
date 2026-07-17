@@ -56,6 +56,42 @@ export async function fetchSessions(): Promise<SessionInfo[]> {
   return data.sessions ?? [];
 }
 
+/**
+ * 权限菜单 —— 与 src/permission_menu.rs 的 PermissionPrompt / PermissionOption 一一对应。
+ *
+ * 这里**只有类型、没有解析**：解析器是 Rust 那一份（GUI 与 smeltd 共用），前端拉现成
+ * 结果来渲染。曾经这边自己写过一份 TS 解析器（lib/parseChoiceMenu.ts），与 Rust 那份
+ * 同日诞生后各自演化、实测已漂移到对同一段文本给出相反结论，故删除。别再加回来。
+ */
+export type PermissionOptionKind = "allow" | "deny" | "other";
+
+export type PermissionOption = {
+  /** 注入 PTY 的键，通常是 "1" / "2" / "3" —— 选中就是打它 */
+  key: string;
+  label: string;
+  kind: PermissionOptionKind;
+  /** 选项下方的副文案 */
+  description?: string;
+  /** TUI 当前高亮在这一项（仅视觉提示；选中一律靠打 key，不依赖高亮位置） */
+  active: boolean;
+};
+
+export type PermissionMenu = {
+  summary?: string | null;
+  options: PermissionOption[];
+};
+
+/**
+ * 拉当前可视区里的权限菜单（守护现场解析）。没菜单返回 null。
+ * 只读，不需要写权限——只读链接也该看得见 agent 在问什么。
+ */
+export async function fetchMenu(id: string): Promise<PermissionMenu | null> {
+  const resp = await fetch(withToken(`/s/${encodeURIComponent(id)}/menu`));
+  if (!resp.ok) return null;
+  const body = await resp.json().catch(() => null);
+  return body?.menu ?? null;
+}
+
 export async function postAction(
   id: string,
   kind: "approve" | "deny" | "reply",

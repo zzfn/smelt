@@ -1999,30 +1999,12 @@ impl Terminal {
     /// clone 几千个 Cell 太亏。零宽字符（变体选择器 / 音标）要带上，否则预览里 emoji 掉成
     /// 黑白、带声调的字掉音标。
     pub fn text_lines(&self) -> Vec<String> {
+        // 逐格拼行的实现在 src/term_text.rs（与 smeltd 共用）——宽字符占位、零宽字符、
+        // 行尾裁剪这几处细节只该写对一次。
         let Ok(term) = self.term.lock() else {
             return Vec::new();
         };
-        let cols = self.size.cols;
-        let mut lines = Vec::with_capacity(self.size.rows);
-        let mut cur = String::new();
-        let mut count = 0usize;
-        for indexed in term.renderable_content().display_iter {
-            let cell = indexed.cell;
-            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                cur.push(cell.c);
-                if let Some(zw) = cell.zerowidth() {
-                    cur.extend(zw);
-                }
-            }
-            count += 1;
-            if count % cols == 0 {
-                lines.push(std::mem::take(&mut cur).trim_end().to_string());
-            }
-        }
-        if !cur.is_empty() {
-            lines.push(cur.trim_end().to_string());
-        }
-        lines
+        crate::term_text::text_lines(&term)
     }
 
     /// 焦点变化上报（DEC 1004，`CSI ?1004h` 打开）：应用开了这个模式时，终端在获得 / 失去

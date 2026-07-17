@@ -149,7 +149,8 @@ pub fn build_router(token: String, write_enabled: bool) -> Router {
         .route("/s/{id}/state-stream", get(state_stream_handler))
         .route("/s/{id}/action", axum::routing::post(action_handler))
         .route("/s/{id}/input", axum::routing::post(input_handler))
-        .route("/s/{id}/resize", axum::routing::post(resize_handler));
+        .route("/s/{id}/resize", axum::routing::post(resize_handler))
+        .route("/s/{id}/menu", get(menu_handler));
 
     if spa_ready() {
         // SPA：/ 与 /s/:id 都回 index.html（注入 write meta）；静态资源 /assets/*
@@ -809,6 +810,22 @@ fn subscribe_and_forward(id: &str, tx: tokio::sync::mpsc::Sender<serde_json::Val
 /// 这个 token 有没有写权限，跟 phase 门闩是两件独立的事：没写权限直接 403，
 /// 不去问 smeltd；有写权限但 phase 不对，由 smeltd 用 `{"ok":false,"err":..}`
 /// 正常回复，原样透传给客户端。
+/// 只读：拿到菜单不等于能点它（点走 input/action，那两条才查 write_enabled）。
+/// 所以这里只校验 token，不要求写权限——只读链接也该看得见 agent 在问什么。
+async fn menu_handler(
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if q.token != *state.token {
+        return (StatusCode::FORBIDDEN, "token 不对").into_response();
+    }
+    let result = tokio::task::spawn_blocking(move || send_menu(&id))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "ok": false, "err": "内部错误" }));
+    Json(result).into_response()
+}
+
 async fn action_handler(
     Path(id): Path<String>,
     Query(q): Query<AuthQuery>,
@@ -850,6 +867,19 @@ fn read_smeltd_reply(conn: UnixStream) -> serde_json::Value {
     serde_json::from_str(line).unwrap_or_else(|_| {
         serde_json::json!({ "ok": false, "err": format!("守护响应无法解析：{}", &line[..line.len().min(80)]) })
     })
+}
+
+/// 拉当前可视区里的权限菜单（守护现场解析）。手机端不再自己解析终端文本——
+/// 解析器只有一份，在 src/permission_menu.rs，GUI / smeltd 共用。
+fn send_menu(id: &str) -> serde_json::Value {
+    let Ok(mut conn) = UnixStream::connect(sock_path()) else {
+        return serde_json::json!({ "ok": false, "err": "连不上守护" });
+    };
+    let req = serde_json::json!({ "op": "menu", "id": id });
+    if writeln!(conn, "{req}").is_err() {
+        return serde_json::json!({ "ok": false, "err": "发送失败" });
+    }
+    read_smeltd_reply(conn)
 }
 
 fn send_action(id: &str, kind: &str, text: Option<&str>) -> serde_json::Value {

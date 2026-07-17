@@ -21,6 +21,12 @@ pub struct PermissionOption {
     /// 选项原文。
     pub label: String,
     pub kind: PermissionOptionKind,
+    /// 选项下方的副文案（选项行之间的说明文字），没有则 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 这一项当前是否被 TUI 高亮（行首有 ❯ / › / ▶ 之类的指针）。
+    /// 只是给界面做视觉提示——选中一律靠打 key，不依赖高亮位置。
+    pub active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -134,17 +140,30 @@ const POINTER_CHARS: [char; 15] = [
     '❯', '>', '›', '▶', '►', '→', '➜', '•', '●', '◆', '*', '✦', '➢', '➤', ' ',
 ];
 
-fn parse_numbered_option_line(raw: &str) -> Option<(String, String)> {
+/// TUI 菜单底部的操作提示行（`Enter to select` / `↑↓` / `esc to cancel` …）——
+/// 它不是选项、也不是某个选项的副文案，扫描时遇到即停。
+fn is_footer_line(t: &str) -> bool {
+    let l = t.to_ascii_lowercase();
+    l.contains("enter to select")
+        || l.contains("esc to cancel")
+        || l.contains("esc to interrupt")
+        || l.contains("jump to bottom")
+        || l.contains("type a number")
+        || t.contains('↑')
+        || t.contains('↓')
+}
+
+/// 返回 `(key, label, highlighted)`；highlighted = 行首带高亮指针。
+fn parse_numbered_option_line(raw: &str) -> Option<(String, String, bool)> {
     let line = raw.trim();
     if line.is_empty() {
         return None;
     }
     // 先剥边框，再剥高亮指针（顺序不能反：指针画在边框里侧）。
-    let line = line
-        .trim_start_matches(BORDER_CHARS)
-        .trim_start()
-        .trim_start_matches(POINTER_CHARS)
-        .trim_start();
+    let no_border = line.trim_start_matches(BORDER_CHARS).trim_start();
+    let line = no_border.trim_start_matches(POINTER_CHARS).trim_start();
+    // 剥掉指针后变短 = 行首确实有指针 → 这一项是当前高亮项
+    let highlighted = line.len() != no_border.len();
 
     if let Some(rest) = line.strip_prefix('[') {
         let (n, after) = rest.split_once(']')?;
@@ -159,7 +178,7 @@ fn parse_numbered_option_line(raw: &str) -> Option<(String, String)> {
         if label.is_empty() {
             return None;
         }
-        return Some((n.to_string(), label.to_string()));
+        return Some((n.to_string(), label.to_string(), highlighted));
     }
 
     let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -179,7 +198,7 @@ fn parse_numbered_option_line(raw: &str) -> Option<(String, String)> {
     if label.is_empty() || label.starts_with('/') || label.starts_with("http") {
         return None;
     }
-    Some((digits, label.to_string()))
+    Some((digits, label.to_string(), highlighted))
 }
 
 /// 从终端末尾行解析权限数字菜单（Claude Code 等）。
@@ -196,13 +215,15 @@ pub fn parse_permission_prompt(lines: &[String]) -> Option<PermissionPrompt> {
     let mut option_line_idxs: Vec<usize> = Vec::new();
 
     for (i, raw) in lines.iter().enumerate() {
-        let Some((key, label)) = parse_numbered_option_line(raw) else {
+        let Some((key, label, highlighted)) = parse_numbered_option_line(raw) else {
             continue;
         };
         options.push(PermissionOption {
             key,
             label: label.clone(),
             kind: classify_option_label(&label),
+            description: None, // 下面按「选项行之间的非选项行」补
+            active: highlighted,
         });
         option_line_idxs.push(i);
     }
@@ -236,6 +257,37 @@ pub fn parse_permission_prompt(lines: &[String]) -> Option<PermissionPrompt> {
     });
     if !has_perm_word && !context_hint {
         return None;
+    }
+
+    // 副文案：某个选项行之后、下一个选项行之前的普通文本行（TUI 常把选项的说明
+    // 缩进写在下一行）。碰到下一个选项行或页脚提示（Enter to select / ↑↓ / esc）就停。
+    for (oi, &line_idx) in option_line_idxs.iter().enumerate() {
+        let stop = option_line_idxs
+            .get(oi + 1)
+            .copied()
+            .unwrap_or_else(|| lines.len().min(line_idx + 4));
+        let mut desc: Vec<String> = Vec::new();
+        for l in lines.iter().take(stop).skip(line_idx + 1) {
+            let t = l.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if is_footer_line(t) || parse_numbered_option_line(t).is_some() {
+                break;
+            }
+            let cleaned = t
+                .trim_start_matches(BORDER_CHARS)
+                .trim_start()
+                .trim_start_matches(POINTER_CHARS)
+                .trim();
+            if cleaned.is_empty() {
+                continue;
+            }
+            desc.push(cleaned.to_string());
+        }
+        if !desc.is_empty() {
+            options[oi].description = Some(truncate_chars(&desc.join(" "), 120));
+        }
     }
 
     let summary = lines[..first].iter().rev().find_map(|l| {
@@ -377,6 +429,34 @@ mod permission_prompt_tests {
                 .is_none(),
             "换了指针和顿号，纯待办列表仍然不是权限菜单"
         );
+    }
+
+    /// 高亮项要标出来：手机端靠它显示「当前停在哪一项」。
+    /// 注意这只是视觉提示——选中一律靠打 key，不依赖高亮位置。
+    #[test]
+    fn marks_highlighted_option_as_active() {
+        let p = parse_permission_prompt(&lines(
+            "Do you want to proceed?\n  1. Yes\n❯ 2. No, cancel",
+        ))
+        .expect("prompt");
+        assert!(!p.options[0].active, "没有指针的项不该是 active");
+        assert!(p.options[1].active, "带 ❯ 的项应标记为 active");
+    }
+
+    /// 选项的副文案（缩进写在下一行）要跟着选项走，别丢——手机端会渲染它。
+    #[test]
+    fn collects_option_description_lines() {
+        let p = parse_permission_prompt(&lines(
+            "Do you want to proceed?\n\
+             ❯ 1. Yes\n\
+                 runs the command once\n\
+               2. No, tell Claude what to do differently\n\
+             Enter to select · esc to cancel",
+        ))
+        .expect("prompt");
+        assert_eq!(p.options[0].description.as_deref(), Some("runs the command once"));
+        // 页脚提示不是副文案，不能被吸进最后一个选项
+        assert_eq!(p.options[1].description, None, "页脚行不该被当成副文案");
     }
 }
 
