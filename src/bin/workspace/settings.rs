@@ -8,11 +8,14 @@
 //! 这里**——那是应用级生命周期状态，不属于任何一个面板，仍留在 main.rs；这里的
 //! 「更新」SettingPage 只是读它、展示它、提供按钮触发它。
 
+use std::time::{Duration, Instant};
+
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 use gpui::InteractiveElement;
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::Input;
+use gpui_component::notification::Notification;
 use gpui_component::progress::Progress;
 use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::setting::{
@@ -611,6 +614,63 @@ pub struct TunnelRuntimeState {
 }
 
 impl Global for TunnelRuntimeState {}
+
+/// 复制按钮的短暂「已复制 ✓」状态（设置页读它改按钮文案）。
+#[derive(Clone, Default)]
+struct CopyFlash {
+    id: String,
+    until: Option<Instant>,
+}
+
+impl Global for CopyFlash {}
+
+fn copy_btn_label(id: &str, idle: &str, cx: &App) -> String {
+    if let Some(f) = cx.try_global::<CopyFlash>() {
+        if f.id == id {
+            if let Some(until) = f.until {
+                if Instant::now() < until {
+                    return "已复制 ✓".into();
+                }
+            }
+        }
+    }
+    idle.into()
+}
+
+/// 写入剪贴板 + 成功 toast + 按钮文案闪「已复制 ✓」约 2 秒。
+fn copy_with_feedback(
+    text: String,
+    btn_id: &'static str,
+    toast: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+    cx.set_global(CopyFlash {
+        id: btn_id.into(),
+        until: Some(Instant::now() + Duration::from_millis(2000)),
+    });
+    window.push_notification(Notification::success(toast), cx);
+    cx.refresh_windows();
+
+    let clear_id = btn_id.to_string();
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(2000))
+            .await;
+        let _ = cx.update(|cx| {
+            let same = cx
+                .try_global::<CopyFlash>()
+                .map(|f| f.id == clear_id)
+                .unwrap_or(false);
+            if same {
+                cx.set_global(CopyFlash::default());
+                cx.refresh_windows();
+            }
+        });
+    })
+    .detach();
+}
 
 /// 开关「手机 / 外网可访问」。开 = 自动确保远程已开 + 拉隧道；关 = 只拆隧道，本机链接保留。
 /// 用户不必知道「必须先开远程」——依赖由这里消化。
@@ -1965,11 +2025,12 @@ impl Workspace {
                     "用 Cloudflare 生成公网链接，离开 Wi‑Fi 也能连。需要本机已安装 \
                      cloudflared。打开时会自动开启上方「远程」。安装命令见下方（可一键复制）。",
                 ),
-                // GPUI 描述文案通常不可选中，单独给 brew 命令 + 复制按钮
+                // GPUI 描述文案通常不可选中，单独给 brew 命令 + 复制按钮（成功有 toast + 文案闪变）
                 SettingItem::render(move |_, _, cx: &mut App| {
                     let muted = cx.theme().muted_foreground;
                     let fg = cx.theme().foreground;
                     let cmd = "brew install cloudflared";
+                    let label = copy_btn_label("copy-brew-cloudflared", "复制", cx);
                     h_flex()
                         .items_center()
                         .gap_2()
@@ -1991,12 +2052,16 @@ impl Workspace {
                                 .child(cmd),
                         )
                         .child(
-                            btn("copy-brew-cloudflared", "复制".into())
+                            btn("copy-brew-cloudflared", label)
                                 .flex_shrink_0()
-                                .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx: &mut App| {
+                                    copy_with_feedback(
                                         "brew install cloudflared".into(),
-                                    ));
+                                        "copy-brew-cloudflared",
+                                        "已复制安装命令",
+                                        window,
+                                        cx,
+                                    );
                                 }),
                         )
                 }),
@@ -2053,6 +2118,8 @@ impl Workspace {
                                 ),
                             );
                         if need_cloudflared {
+                            let err_label =
+                                copy_btn_label("copy-brew-on-err", "复制安装命令", cx);
                             box_ = box_.child(
                                 h_flex()
                                     .items_center()
@@ -2069,14 +2136,18 @@ impl Workspace {
                                             .child("brew install cloudflared"),
                                     )
                                     .child(
-                                        btn("copy-brew-on-err", "复制安装命令".into())
+                                        btn("copy-brew-on-err", err_label)
                                             .flex_shrink_0()
                                             .on_mouse_down(
                                                 MouseButton::Left,
-                                                move |_, _window, cx: &mut App| {
-                                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                                move |_, window, cx: &mut App| {
+                                                    copy_with_feedback(
                                                         "brew install cloudflared".into(),
-                                                    ));
+                                                        "copy-brew-on-err",
+                                                        "已复制安装命令",
+                                                        window,
+                                                        cx,
+                                                    );
                                                 },
                                             ),
                                     ),
@@ -2152,13 +2223,20 @@ impl Workspace {
                                         .child(primary),
                                 )
                                 .child(
-                                    btn("copy-share-link", "复制链接".into())
-                                        .flex_shrink_0()
-                                        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                primary_copy.clone(),
-                                            ));
-                                        }),
+                                    btn(
+                                        "copy-share-link",
+                                        copy_btn_label("copy-share-link", "复制链接", cx),
+                                    )
+                                    .flex_shrink_0()
+                                    .on_mouse_down(MouseButton::Left, move |_, window, cx: &mut App| {
+                                        copy_with_feedback(
+                                            primary_copy.clone(),
+                                            "copy-share-link",
+                                            "已复制分享链接",
+                                            window,
+                                            cx,
+                                        );
+                                    }),
                                 ),
                         )
                         .child(
@@ -2186,13 +2264,20 @@ impl Workspace {
                                         .child(format!("本机：{local_link}")),
                                 )
                                 .child(
-                                    btn("copy-local-link", "复制本机".into())
-                                        .flex_shrink_0()
-                                        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                local_copy.clone(),
-                                            ));
-                                        }),
+                                    btn(
+                                        "copy-local-link",
+                                        copy_btn_label("copy-local-link", "复制本机", cx),
+                                    )
+                                    .flex_shrink_0()
+                                    .on_mouse_down(MouseButton::Left, move |_, window, cx: &mut App| {
+                                        copy_with_feedback(
+                                            local_copy.clone(),
+                                            "copy-local-link",
+                                            "已复制本机链接",
+                                            window,
+                                            cx,
+                                        );
+                                    }),
                                 ),
                         );
                     }
