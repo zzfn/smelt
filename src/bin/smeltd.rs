@@ -1371,6 +1371,261 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     (0..b.len()).step_by(2).map(|i| Some((nibble(b[i])? << 4) | nibble(b[i + 1])?)).collect()
 }
 
+/// `resume_handoff` 的行为——这是「无缝升级」的落地点，也是全文件最该被守住的一段：
+/// 它一旦出错，用户正在跑的 agent 会话会在升级瞬间集体消失，且没有任何补救。
+/// 此前这里**一个测试都没有**，几条要命的不变量全靠注释。
+#[cfg(test)]
+mod resume_handoff_tests {
+    use super::*;
+
+    fn no_subs() -> Subscribers {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    /// 每个用例一个独立文件名：测试是多线程并行跑的，共用路径会互相踩。
+    fn tmp_handoff(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("smelt-test-handoff-{name}-{}.json", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn missing_file_returns_none() {
+        let p = tmp_handoff("missing");
+        let _ = std::fs::remove_file(&p);
+        assert!(resume_handoff(&p, &no_subs()).is_none());
+    }
+
+    #[test]
+    fn malformed_json_returns_none() {
+        let p = tmp_handoff("malformed");
+        std::fs::write(&p, "{ this is not json").unwrap();
+        assert!(
+            resume_handoff(&p, &no_subs()).is_none(),
+            "解析失败必须走全新启动，而不是 panic 把守护带走"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 读到手就删：文件残留下来会被下次启动误认成「有交接要恢复」，
+    /// 那时里面的 fd 早已属于别的东西。失败路径也必须删。
+    #[test]
+    fn consumes_handoff_file_even_when_parse_fails() {
+        let p = tmp_handoff("consume");
+        std::fs::write(&p, "{ not json").unwrap();
+        let _ = resume_handoff(&p, &no_subs());
+        assert!(
+            !std::path::Path::new(&p).exists(),
+            "handoff 文件读完必须删掉，无论恢复成功与否"
+        );
+    }
+
+    #[test]
+    fn missing_listen_fd_returns_none() {
+        let p = tmp_handoff("no-listen-fd");
+        std::fs::write(&p, r#"{"sessions":[]}"#).unwrap();
+        assert!(resume_handoff(&p, &no_subs()).is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// exec 前忘了清 CLOEXEC 的话，这里拿到的就是无效 fd——必须识别出来走全新启动，
+    /// 而不是把一个野 fd 当监听 socket 用。
+    /// 一个绝不会被分配到的 fd 号：远超 ulimit -n，fcntl 必然 EBADF。
+    ///
+    /// 不能用「open 一个再 close，拿它的号当无效 fd」——测试是多线程并行跑的，
+    /// 号一释放就会被别的用例的 pipe() 拿去，于是「无效 fd」其实是别人的活 fd，
+    /// resume_handoff 接管后 close 掉，对面就 double close：
+    /// `IO Safety violation: owned file descriptor already closed`。这里踩过。
+    const NEVER_VALID_FD: RawFd = 1_000_000;
+
+    /// exec 前忘了清 CLOEXEC 的话，这里拿到的就是无效 fd——必须识别出来走全新启动，
+    /// 而不是把一个野 fd 当监听 socket 用。
+    #[test]
+    fn invalid_listen_fd_returns_none() {
+        let p = tmp_handoff("bad-listen-fd");
+        std::fs::write(
+            &p,
+            format!(r#"{{"listen_fd":{NEVER_VALID_FD},"sessions":[]}}"#),
+        )
+        .unwrap();
+        assert!(resume_handoff(&p, &no_subs()).is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 造一个能被 resume_handoff 认领的监听 fd。
+    fn make_listen_fd(name: &str) -> RawFd {
+        let sock = std::env::temp_dir()
+            .join(format!("smelt-test-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let l = UnixListener::bind(&sock).unwrap();
+        let _ = std::fs::remove_file(&sock); // 已 bind，文件可以立刻删
+        std::os::unix::io::IntoRawFd::into_raw_fd(l)
+    }
+
+    /// 造一个「PTY master」替身：用管道写端即可——resume_handoff 只是接管 fd、
+    /// try_clone 给泵线程，测试不需要真的跑一个 shell。
+    /// 返回 (master_fd, 读端保管者, pid)。
+    fn make_fake_pty() -> (RawFd, std::fs::File, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() 失败");
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // 用一个真实存在过的 pid：让泵线程结束时的 waitpid 有合法目标，不借用 -1
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        drop(child); // 留成 zombie，交给泵收尸
+        (fds[1], read_end, pid)
+    }
+
+    fn term_text_of(sess: &Arc<Session>) -> String {
+        let term = sess.term.lock().unwrap();
+        term_text::text_lines(&term).join("\n")
+    }
+
+    /// **永不 feed ring**——本文件头号不变量，此前只有注释在守。
+    ///
+    /// 旧版 handoff 文件会带 `"buf"`（每会话的环形原始字节）。环形缓冲是按容量截断的，
+    /// 截断点可能正落在一条 CSI 序列中间，feed 进去必然花屏。所以画面只认从常驻 Term
+    /// 导出的 `grid` keyframe，`buf` 即便存在也必须被忽略。
+    ///
+    /// 这条一旦被「顺手优化」掉（比如有人觉得「没 grid 时用 buf 兜底也行」），
+    /// 症状是升级后终端花屏，且只在带旧交接文件的机器上出现——极难复现。
+    #[test]
+    fn never_feeds_legacy_ring_buffer_even_when_present() {
+        let p = tmp_handoff("no-feed-ring");
+        let listen_fd = make_listen_fd("no-feed-ring");
+        let (master_fd, _read_end, pid) = make_fake_pty();
+
+        let handoff = serde_json::json!({
+            "listen_fd": listen_fd,
+            "sessions": [{
+                "id": "s1",
+                "fd": master_fd,
+                "pid": pid,
+                "cols": 80,
+                "rows": 24,
+                // 旧字段：必须被忽略
+                "buf": hex_encode(b"RINGBUF-MUST-NOT-RENDER"),
+                // 唯一信源
+                "grid": hex_encode(b"GRIDKEYFRAME-OK"),
+            }]
+        });
+        std::fs::write(&p, handoff.to_string()).unwrap();
+
+        let (_listener, sessions) = resume_handoff(&p, &no_subs()).expect("应能恢复");
+        let sess = sessions.lock().unwrap().get("s1").cloned().expect("会话 s1 应存在");
+        let text = term_text_of(&sess);
+
+        assert!(text.contains("GRIDKEYFRAME-OK"), "grid keyframe 应被 feed：{text:?}");
+        assert!(
+            !text.contains("RINGBUF"),
+            "buf（环形原始字节）绝不能被 feed——它可能在 CSI 中间腰斩，feed 必花屏：{text:?}"
+        );
+    }
+
+    /// **没有 grid、只有 buf 时，仍然不许 feed buf**——这才是「永不 feed ring」真正
+    /// 会被破坏的地方：老版交接文件就是只有 buf 没有 grid，一旦有人觉得
+    /// 「没 grid 时拿 buf 兜一下也行」，花屏就回来了。
+    ///
+    /// 上面那条 `never_feeds_legacy_ring_buffer_even_when_present` 挡不住这种改法
+    /// （它的用例里 grid 存在，走不到兜底分支）——变异测试实测漏过。两条都要有。
+    #[test]
+    fn ignores_buf_when_grid_absent() {
+        let p = tmp_handoff("buf-no-grid");
+        let listen_fd = make_listen_fd("buf-no-grid");
+        let (master_fd, _read_end, pid) = make_fake_pty();
+
+        let handoff = serde_json::json!({
+            "listen_fd": listen_fd,
+            "sessions": [{
+                "id": "s1", "fd": master_fd, "pid": pid, "cols": 80, "rows": 24,
+                // 老版交接文件的形态：只有 buf，没有 grid
+                "buf": hex_encode(b"LEGACYRING-MUST-NOT-RENDER"),
+            }]
+        });
+        std::fs::write(&p, handoff.to_string()).unwrap();
+
+        let (_l, sessions) = resume_handoff(&p, &no_subs()).expect("应能恢复");
+        let sess = sessions.lock().unwrap().get("s1").cloned().unwrap();
+        let text = term_text_of(&sess);
+        assert!(
+            !text.contains("LEGACYRING"),
+            "没有 grid 时也不能拿 buf 兜底——环形字节可能在 CSI 中间腰斩，feed 必花屏。\
+             宁可空屏 + jolt 让进程自绘：{text:?}"
+        );
+    }
+
+    /// fd 已失效的会话只跳过它自己，不能拖垮整次恢复——其余会话必须照常回来。
+    #[test]
+    fn skips_session_with_dead_fd_but_keeps_the_rest() {
+        let p = tmp_handoff("dead-fd");
+        let listen_fd = make_listen_fd("dead-fd");
+        let (good_fd, _read_end, pid) = make_fake_pty();
+
+        let handoff = serde_json::json!({
+            "listen_fd": listen_fd,
+            "sessions": [
+                { "id": "dead", "fd": NEVER_VALID_FD, "pid": pid, "cols": 80, "rows": 24 },
+                { "id": "good", "fd": good_fd, "pid": pid, "cols": 80, "rows": 24,
+                  "grid": hex_encode(b"ALIVE") },
+            ]
+        });
+        std::fs::write(&p, handoff.to_string()).unwrap();
+
+        let (_l, sessions) = resume_handoff(&p, &no_subs()).expect("应能恢复");
+        let map = sessions.lock().unwrap();
+        assert!(!map.contains_key("dead"), "fd 失效的会话应被跳过");
+        assert!(map.contains_key("good"), "其余会话必须照常恢复，不能被坏的那个拖垮");
+    }
+
+    /// 无 grid、且交接前在备用屏：注 1049h 让 TUI 自己重画，
+    /// 而不是把它留在主屏上（那样 agent 的界面会叠在 shell 历史上）。
+    #[test]
+    fn without_grid_alt_screen_flag_enters_alt_mode() {
+        let p = tmp_handoff("alt-no-grid");
+        let listen_fd = make_listen_fd("alt-no-grid");
+        let (master_fd, _read_end, pid) = make_fake_pty();
+
+        let handoff = serde_json::json!({
+            "listen_fd": listen_fd,
+            "sessions": [{
+                "id": "s1", "fd": master_fd, "pid": pid, "cols": 80, "rows": 24,
+                "alt_screen": true,
+            }]
+        });
+        std::fs::write(&p, handoff.to_string()).unwrap();
+
+        let (_l, sessions) = resume_handoff(&p, &no_subs()).expect("应能恢复");
+        let sess = sessions.lock().unwrap().get("s1").cloned().unwrap();
+        let term = sess.term.lock().unwrap();
+        assert!(
+            term.mode().contains(TermMode::ALT_SCREEN),
+            "交接前在备用屏、又没有 grid 时，应只注 1049h 把 Term 切回备用屏"
+        );
+    }
+
+    /// 恢复的会话一律挂 jolt：有 grid 时用于对齐真实 cell 尺寸，无 grid 时逼进程自绘。
+    #[test]
+    fn restored_session_is_marked_for_jolt() {
+        let p = tmp_handoff("jolt");
+        let listen_fd = make_listen_fd("jolt");
+        let (master_fd, _read_end, pid) = make_fake_pty();
+
+        let handoff = serde_json::json!({
+            "listen_fd": listen_fd,
+            "sessions": [{
+                "id": "s1", "fd": master_fd, "pid": pid, "cols": 80, "rows": 24,
+                "grid": hex_encode(b"X"),
+            }]
+        });
+        std::fs::write(&p, handoff.to_string()).unwrap();
+
+        let (_l, sessions) = resume_handoff(&p, &no_subs()).expect("应能恢复");
+        let sess = sessions.lock().unwrap().get("s1").cloned().unwrap();
+        assert!(sess.ctl.lock().unwrap().jolt, "恢复的会话必须挂 jolt");
+    }
+}
+
 #[cfg(test)]
 mod handoff_tests {
     use super::*;
