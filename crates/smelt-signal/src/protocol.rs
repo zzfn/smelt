@@ -70,6 +70,10 @@ pub enum ServerMsg {
     PeerJoined {
         role: Role,
     },
+    /// 对端离开房间（WS 断开）；host 应拆掉旧 RTC，等下次 peer_joined 再建
+    PeerLeft {
+        role: Role,
+    },
     Signal {
         from: Role,
         payload: Value,

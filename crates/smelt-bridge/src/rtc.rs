@@ -1,4 +1,5 @@
 //! webrtc-rs host：收 offer、回 answer、收 DataChannel。
+//! 每次新 offer / 对端重连都新建 PeerConnection（不可复用已协商的 PC）。
 
 use std::sync::Arc;
 
@@ -28,6 +29,8 @@ pub struct HostPeer {
     out_tx: mpsc::UnboundedSender<String>,
     remote_set: bool,
     pending_ice: Vec<RTCIceCandidateInit>,
+    /// 已完成过一轮 offer/answer，再来 offer 必须新建 PC
+    negotiated: bool,
 }
 
 impl HostPeer {
@@ -137,7 +140,17 @@ impl HostPeer {
             out_tx,
             remote_set: false,
             pending_ice: Vec::new(),
+            negotiated: false,
         })
+    }
+
+    pub fn needs_fresh_pc_for_offer(&self) -> bool {
+        self.negotiated || self.remote_set
+    }
+
+    pub async fn close(self) {
+        info!("closing host peer connection");
+        let _ = self.pc.close().await;
     }
 
     pub async fn handle_signal(&mut self, payload: Value) -> Result<()> {
@@ -147,6 +160,10 @@ impl HostPeer {
             .unwrap_or("");
         match kind {
             "offer" => {
+                if self.needs_fresh_pc_for_offer() {
+                    // 调用方应先 close 再建新 PC；这里仅防御
+                    bail_offer_reuse()?;
+                }
                 let sdp = payload
                     .get("sdp")
                     .and_then(|s| s.as_str())
@@ -186,6 +203,7 @@ impl HostPeer {
                     }
                 });
                 let _ = self.out_tx.send(msg.to_string());
+                self.negotiated = true;
                 info!("sent answer");
             }
             "answer" => {
@@ -237,6 +255,10 @@ impl HostPeer {
         }
         Ok(())
     }
+}
+
+fn bail_offer_reuse() -> Result<()> {
+    Err(anyhow::anyhow!("peer already negotiated; need new HostPeer"))
 }
 
 fn wire_dc(cfg: Arc<Config>, d: Arc<RTCDataChannel>) {

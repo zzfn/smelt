@@ -26,6 +26,7 @@ export type SignalingMessage =
   | SignalingHello
   | { op: "hello_ok"; ice_servers: IceServerConfig[] }
   | { op: "peer_joined"; role: "client" | "host" }
+  | { op: "peer_left"; role: "client" | "host" }
   | { op: "signal"; from: "client" | "host"; payload: SignalPayload }
   | { op: "err"; msg: string }
   | { op: "ping" }

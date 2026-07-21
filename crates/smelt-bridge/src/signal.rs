@@ -62,6 +62,9 @@ enum WireIn {
     PeerJoined {
         role: String,
     },
+    PeerLeft {
+        role: String,
+    },
     Signal {
         from: String,
         payload: Value,
@@ -123,19 +126,47 @@ pub async fn run_host(cfg: Arc<Config>, room: String, secret: String) -> Result<
             }
             WireIn::PeerJoined { role } => {
                 info!(%role, "peer_joined");
-                if role == "client" && peer.is_none() {
-                    peer = Some(
-                        rtc::HostPeer::new(cfg.clone(), ice_servers.clone(), out_tx.clone())
-                            .await
-                            .context("create host peer")?,
-                    );
+                if role == "client" {
+                    // 手机重连：必须新 PC，不能复用上一轮
+                    peer = recreate_peer(
+                        peer,
+                        cfg.clone(),
+                        ice_servers.clone(),
+                        out_tx.clone(),
+                        "peer_joined",
+                    )
+                    .await?;
+                }
+            }
+            WireIn::PeerLeft { role } => {
+                info!(%role, "peer_left");
+                if role == "client" {
+                    if let Some(old) = peer.take() {
+                        old.close().await;
+                    }
+                    info!("cleared host peer after client left");
                 }
             }
             WireIn::Signal { from, payload } => {
                 if from != "client" {
                     continue;
                 }
-                if peer.is_none() {
+                let kind = payload
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // 新 offer：永远新建 PeerConnection（WebRTC 单轮协商）
+                if kind == "offer" {
+                    peer = recreate_peer(
+                        peer,
+                        cfg.clone(),
+                        ice_servers.clone(),
+                        out_tx.clone(),
+                        "offer",
+                    )
+                    .await?;
+                } else if peer.is_none() {
                     peer = Some(
                         rtc::HostPeer::new(cfg.clone(), ice_servers.clone(), out_tx.clone())
                             .await
@@ -145,11 +176,21 @@ pub async fn run_host(cfg: Arc<Config>, room: String, secret: String) -> Result<
                 if let Some(p) = peer.as_mut() {
                     if let Err(e) = p.handle_signal(payload).await {
                         warn!(%e, "handle signal");
+                        // offer 失败则丢弃 PC，等下次
+                        if kind == "offer" {
+                            if let Some(old) = peer.take() {
+                                old.close().await;
+                            }
+                        }
                     }
                 }
             }
             WireIn::Err { msg } => {
                 warn!(%msg, "signal err");
+                // replaced 等可忽略
+                if msg.contains("replaced") {
+                    continue;
+                }
                 bail!("signaling error: {msg}");
             }
             WireIn::Ping => {
@@ -159,8 +200,29 @@ pub async fn run_host(cfg: Arc<Config>, room: String, secret: String) -> Result<
         }
     }
 
+    if let Some(old) = peer.take() {
+        old.close().await;
+    }
     drop(out_tx);
     let _ = writer.await;
     info!("signaling closed");
     Ok(())
+}
+
+async fn recreate_peer(
+    old: Option<rtc::HostPeer>,
+    cfg: Arc<Config>,
+    ice: Vec<IceServerJson>,
+    out_tx: mpsc::UnboundedSender<String>,
+    reason: &str,
+) -> Result<Option<rtc::HostPeer>> {
+    if let Some(p) = old {
+        info!(%reason, "closing previous host peer for reconnect");
+        p.close().await;
+    }
+    let p = rtc::HostPeer::new(cfg, ice, out_tx)
+        .await
+        .with_context(|| format!("create host peer ({reason})"))?;
+    info!(%reason, "new host peer ready");
+    Ok(Some(p))
 }

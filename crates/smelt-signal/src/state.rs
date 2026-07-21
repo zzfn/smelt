@@ -96,8 +96,12 @@ impl AppState {
             Role::Host => &mut entry.host,
             Role::Client => &mut entry.client,
         };
-        if slot.is_some() {
-            return Err(JoinErr::RoleTaken);
+        // 同角色重复连（手机杀进程/二次打开）：踢掉旧连接，避免 RoleTaken 卡死
+        if let Some(old) = slot.take() {
+            let _ = old
+                .tx
+                .send(crate::protocol::ServerMsg::err("replaced by new connection").to_json());
+            info!(room = %room_id, role = role.as_str(), "replaced stale peer for role");
         }
         *slot = Some(PeerSlot { tx });
 
@@ -125,21 +129,28 @@ impl AppState {
     }
 
     pub fn leave(&self, room_id: &str, role: Role) {
-        let Some(mut entry) = self.rooms.get_mut(room_id) else {
-            return;
+        let other_tx = {
+            let Some(mut entry) = self.rooms.get_mut(room_id) else {
+                return;
+            };
+            let slot = match role {
+                Role::Host => &mut entry.host,
+                Role::Client => &mut entry.client,
+            };
+            *slot = None;
+            // 通知对端拆 RTC
+            let other = match role.other() {
+                Role::Host => entry.host.as_ref(),
+                Role::Client => entry.client.as_ref(),
+            };
+            other.map(|p| p.tx.clone())
         };
-        match role {
-            Role::Host => entry.host = None,
-            Role::Client => entry.client = None,
-        };
-        let empty = entry.host.is_none() && entry.client.is_none();
-        drop(entry);
-        if empty {
-            // 房间保留到 TTL，便于断线重连；不立刻删
-            debug!(room = %room_id, role = role.as_str(), "peer left (room kept until ttl)");
-        } else {
-            debug!(room = %room_id, role = role.as_str(), "peer left");
+        if let Some(tx) = other_tx {
+            let _ = tx.send(
+                crate::protocol::ServerMsg::PeerLeft { role }.to_json(),
+            );
         }
+        debug!(room = %room_id, role = role.as_str(), "peer left");
     }
 
     pub fn room_count(&self) -> usize {
@@ -175,7 +186,6 @@ pub enum JoinErr {
     NotFound,
     Expired,
     BadSecret,
-    RoleTaken,
 }
 
 impl JoinErr {
@@ -184,7 +194,6 @@ impl JoinErr {
             JoinErr::NotFound => "room not found",
             JoinErr::Expired => "room expired",
             JoinErr::BadSecret => "invalid secret",
-            JoinErr::RoleTaken => "role already connected",
         }
     }
 }

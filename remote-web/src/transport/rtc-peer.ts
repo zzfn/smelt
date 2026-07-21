@@ -69,9 +69,17 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       }
       case "peer_joined": {
         if (msg.role === "host") {
-          // Bridge 上线：client 发起 offer
+          // Bridge 上线或重连：整页新 PC + 新 offer（避免复用旧 ICE）
+          resetPc();
           ensurePc();
           await createAndSendOffer();
+        }
+        break;
+      }
+      case "peer_left": {
+        if (msg.role === "host") {
+          setPhase("failed", "host left");
+          opts.onClose?.("host left");
         }
         break;
       }
@@ -91,6 +99,23 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       default:
         break;
     }
+  }
+
+  function resetPc() {
+    try {
+      dc?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      pc?.close();
+    } catch {
+      /* ignore */
+    }
+    dc = null;
+    pc = null;
+    remoteDescSet = false;
+    pendingIce.length = 0;
   }
 
   function ensurePc() {
@@ -231,16 +256,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
 
   function close() {
     setPhase("closed");
-    try {
-      dc?.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      pc?.close();
-    } catch {
-      /* ignore */
-    }
+    resetPc();
     signal.close();
   }
 
