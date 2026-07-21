@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { fetchSessions, SessionInfo } from "../api";
 import { StatusBadge } from "../components/StatusBadge";
+import { useTransport } from "../transport/TransportContext";
 
 const WAITING = new Set(["awaiting_approval", "waiting_for_user"]);
 
@@ -13,11 +14,16 @@ export function ListPage({ onOpen }: Props) {
   const [err, setErr] = useState<string | null>(null);
   const [onlyWaiting, setOnlyWaiting] = useState(false);
   const [loading, setLoading] = useState(true);
+  const transport = useTransport();
 
   useEffect(() => {
     let alive = true;
-    const load = () =>
-      fetchSessions()
+    const load = () => {
+      const p =
+        transport.mode === "rtc" && transport.rtc
+          ? transport.rtc.fetchSessions()
+          : fetchSessions();
+      return p
         .then((s) => {
           if (alive) {
             setSessions(s);
@@ -30,13 +36,14 @@ export function ListPage({ onOpen }: Props) {
         .finally(() => {
           if (alive) setLoading(false);
         });
+    };
     load();
     const t = setInterval(load, 4000);
     return () => {
       alive = false;
       clearInterval(t);
     };
-  }, []);
+  }, [transport.mode, transport.rtc]);
 
   const filtered = useMemo(
     () => (onlyWaiting ? sessions.filter((s) => WAITING.has(s.phase)) : sessions),
@@ -72,7 +79,12 @@ export function ListPage({ onOpen }: Props) {
 
   return (
     <div class="mx-auto min-h-full max-w-lg bg-bg px-4 pb-10 pt-5">
-      <h1 class="mb-3 text-lg font-semibold">会话</h1>
+      <h1 class="mb-3 text-lg font-semibold">
+        会话{transport.mode === "rtc" ? " · 跨网" : ""}
+      </h1>
+      {transport.phaseLabel ? (
+        <p class="mb-2 text-xs text-muted">{transport.phaseLabel}</p>
+      ) : null}
       <label class="mb-4 flex cursor-pointer items-center gap-2 text-sm text-muted">
         <input
           type="checkbox"

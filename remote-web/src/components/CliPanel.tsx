@@ -11,6 +11,7 @@ import { ChoiceSheet } from "./ChoiceSheet";
 import { Composer } from "./Composer";
 import { StatusBadge } from "./StatusBadge";
 import { XtermSurface } from "./XtermSurface";
+import { useTransport } from "../transport/TransportContext";
 
 type Props = {
   sessionId: string;
@@ -30,8 +31,15 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
   const [pending, setPending] = useState(false);
   const [bufferText, setBufferText] = useState("");
   const [sheetDismissed, setSheetDismissed] = useState(false);
+  const transport = useTransport();
+  const canWrite =
+    transport.mode === "rtc" && transport.rtc
+      ? transport.rtc.writeEnabled() && writeEnabled
+      : writeEnabled;
 
   useEffect(() => {
+    // RTC 路径暂无独立 state-stream（状态靠列表刷新）；HTTP 仍走 WS
+    if (transport.mode === "rtc") return;
     let retry = 1000;
     let closed = false;
     let ws: WebSocket | null = null;
@@ -60,7 +68,7 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
       closed = true;
       ws?.close();
     };
-  }, [sessionId]);
+  }, [sessionId, transport.mode]);
 
   // 菜单不在前端解析——解析器只有 Rust 那一份（crates/smelt-core/src/permission_menu.rs，GUI 与 smeltd
   // 共用），这里拉守护现场解析的结果。画面何时变只有本端最清楚（它在渲染 xterm），
@@ -92,7 +100,7 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
   }, [menuKey]);
 
   const showChoiceSheet =
-    writeEnabled &&
+    canWrite &&
     !sheetDismissed &&
     !!menu &&
     menu.options.length >= 2 &&
@@ -107,12 +115,18 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
       setPending(true);
       setStatus({ text: "发送中…" });
       try {
-        const r = await postInput(sessionId, data);
-        if (r.ok) {
+        if (transport.mode === "rtc" && transport.rtc) {
+          transport.rtc.postInput(sessionId, data);
           setStatus({ text: okMsg, kind: "ok" });
           setSheetDismissed(true);
         } else {
-          setStatus({ text: r.err || "失败", kind: "err" });
+          const r = await postInput(sessionId, data);
+          if (r.ok) {
+            setStatus({ text: okMsg, kind: "ok" });
+            setSheetDismissed(true);
+          } else {
+            setStatus({ text: r.err || "失败", kind: "err" });
+          }
         }
       } catch (e) {
         setStatus({ text: e instanceof Error ? e.message : "网络问题", kind: "err" });
@@ -120,7 +134,7 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
         setPending(false);
       }
     },
-    [sessionId],
+    [sessionId, transport.mode, transport.rtc],
   );
 
   const sendText = useCallback(
@@ -133,9 +147,13 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
 
   const onTermData = useCallback(
     (data: string) => {
-      void postInput(sessionId, data);
+      if (transport.mode === "rtc" && transport.rtc) {
+        transport.rtc.postInput(sessionId, data);
+      } else {
+        void postInput(sessionId, data);
+      }
     },
-    [sessionId],
+    [sessionId, transport.mode, transport.rtc],
   );
 
   const onPick = useCallback(
@@ -149,7 +167,7 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
   );
 
   const actionable =
-    writeEnabled &&
+    canWrite &&
     !showChoiceSheet &&
     (state.phase === "awaiting_approval" || state.phase === "waiting_for_user");
   const question = (state.pending_question || "").trim();
@@ -175,7 +193,7 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
         <StatusBadge phase={state.phase} />
       </header>
 
-      {!writeEnabled && (
+      {!canWrite && (
         <div class="mx-2 mt-1.5 shrink-0 rounded-lg border border-[#243044] bg-[#151a24] px-2.5 py-1.5 text-[11px] leading-snug text-[#9aa8bc]">
           只读观战。写入请在 Mac 打开「允许远程写入」。
         </div>
@@ -199,10 +217,15 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
             disabled={pending}
             onClick={async () => {
               setPending(true);
-              const r = await postAction(sessionId, "approve");
-              setStatus(
-                r.ok ? { text: "已批准", kind: "ok" } : { text: r.err || "失败", kind: "err" },
-              );
+              if (transport.mode === "rtc" && transport.rtc) {
+                transport.rtc.postAction(sessionId, "approve");
+                setStatus({ text: "已批准", kind: "ok" });
+              } else {
+                const r = await postAction(sessionId, "approve");
+                setStatus(
+                  r.ok ? { text: "已批准", kind: "ok" } : { text: r.err || "失败", kind: "err" },
+                );
+              }
               setPending(false);
             }}
           >
@@ -214,10 +237,15 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
             disabled={pending}
             onClick={async () => {
               setPending(true);
-              const r = await postAction(sessionId, "deny");
-              setStatus(
-                r.ok ? { text: "已拒绝", kind: "ok" } : { text: r.err || "失败", kind: "err" },
-              );
+              if (transport.mode === "rtc" && transport.rtc) {
+                transport.rtc.postAction(sessionId, "deny");
+                setStatus({ text: "已拒绝", kind: "ok" });
+              } else {
+                const r = await postAction(sessionId, "deny");
+                setStatus(
+                  r.ok ? { text: "已拒绝", kind: "ok" } : { text: r.err || "失败", kind: "err" },
+                );
+              }
               setPending(false);
             }}
           >
@@ -226,7 +254,7 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
         </div>
       ) : null}
 
-      {menu && writeEnabled && sheetDismissed ? (
+      {menu && canWrite && sheetDismissed ? (
         <button
           type="button"
           class="mx-2 mt-1.5 shrink-0 rounded-lg border border-accent/40 bg-accent/10 py-2 text-sm font-medium text-accent"
@@ -253,14 +281,14 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
       <div class="relative mx-1.5 mt-1.5 min-h-0 flex-1 overflow-hidden rounded-t-xl border border-b-0 border-border bg-[#08080a]">
         <XtermSurface
           sessionId={sessionId}
-          writeEnabled={writeEnabled}
-          onUserData={writeEnabled ? onTermData : undefined}
+          writeEnabled={canWrite}
+          onUserData={canWrite ? onTermData : undefined}
           onBufferText={setBufferText}
           class="h-full"
         />
       </div>
 
-      {writeEnabled ? (
+      {canWrite ? (
         <div class="mx-1.5 mb-[max(0.35rem,env(safe-area-inset-bottom))] shrink-0 overflow-hidden rounded-b-xl border border-border">
           <Composer
             disabled={showChoiceSheet}

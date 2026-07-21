@@ -8,6 +8,7 @@ members = [
     "crates/smeltd",
     "crates/smelt",
     "crates/smelt-signal",
+    "crates/smelt-bridge",
 ]
 resolver = "3"
 

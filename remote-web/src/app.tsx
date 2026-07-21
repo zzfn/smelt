@@ -2,6 +2,10 @@ import { useEffect, useState } from "preact/hooks";
 import { getToken, SessionInfo } from "./api";
 import { CliPanel } from "./components/CliPanel";
 import { ListPage } from "./pages/ListPage";
+import { parseRtcQuery } from "./transport/rtc-peer";
+import { startRtcBackend, type RtcBackend } from "./transport/rtc-backend";
+import { TransportContext } from "./transport/TransportContext";
+import type { RtcConnPhase } from "./transport/types";
 
 type Route =
   | { page: "list" }
@@ -24,7 +28,6 @@ function parseRoute(): Route {
 }
 
 function writeEnabledFromMeta(): boolean {
-  // 网关注入：<meta name="smelt-write" content="true|false">
   const el = document.querySelector('meta[name="smelt-write"]');
   return el?.getAttribute("content") === "true";
 }
@@ -32,17 +35,58 @@ function writeEnabledFromMeta(): boolean {
 export function App() {
   const [route, setRoute] = useState<Route>(parseRoute);
   const [writeEnabled] = useState(writeEnabledFromMeta);
+  const wantRtc = !!parseRtcQuery();
+  const [rtc, setRtc] = useState<RtcBackend | null>(null);
+  const [rtcPhase, setRtcPhase] = useState<string>(wantRtc ? "signaling…" : "");
+  const [rtcErr, setRtcErr] = useState<string | null>(null);
 
   useEffect(() => {
-    getToken(); // 固化 query token
+    getToken();
     const onPop = () => setRoute(parseRoute());
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
+  useEffect(() => {
+    if (!wantRtc) return;
+    let cancelled = false;
+    let backend: RtcBackend | null = null;
+    void (async () => {
+      try {
+        backend = await startRtcBackend((p: RtcConnPhase, detail?: string) => {
+          if (cancelled) return;
+          setRtcPhase(detail ? `${p}: ${detail}` : p);
+          if (p === "failed") setRtcErr(detail || "连接失败");
+        });
+        if (cancelled) {
+          backend?.close();
+          return;
+        }
+        if (!backend) {
+          setRtcErr("跨网参数不完整（需要 room、k、signal）");
+          return;
+        }
+        setRtc(backend);
+        setRtcPhase("connected");
+      } catch (e) {
+        if (!cancelled) {
+          setRtcErr(e instanceof Error ? e.message : String(e));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      backend?.close();
+    };
+  }, [wantRtc]);
+
   function goList() {
     const t = getToken();
-    const url = t ? `/?token=${encodeURIComponent(t)}` : "/";
+    const q = new URLSearchParams(location.search);
+    // 保留跨网 query
+    if (t) q.set("token", t);
+    const qs = q.toString();
+    const url = qs ? `/?${qs}` : "/";
     history.pushState({}, "", url);
     setRoute({ page: "list" });
   }
@@ -53,7 +97,7 @@ export function App() {
       s.parent_session && s.parent_session !== s.name
         ? `${s.project} · ${s.parent_session}`
         : s.project;
-    const q = new URLSearchParams();
+    const q = new URLSearchParams(location.search);
     if (t) q.set("token", t);
     q.set("name", s.name);
     q.set("sub", sub);
@@ -62,17 +106,45 @@ export function App() {
     setRoute({ page: "session", id: s.id, name: s.name, subtitle: sub });
   }
 
-  if (route.page === "session") {
+  if (wantRtc && !rtc && !rtcErr) {
     return (
-      <CliPanel
-        sessionId={route.id}
-        name={route.name}
-        subtitle={route.subtitle}
-        writeEnabled={writeEnabled}
-        onBack={goList}
-      />
+      <div class="mx-auto max-w-lg px-4 py-16 text-center text-sm text-muted">
+        <p class="mb-2 font-medium text-fg">正在建立跨网连接…</p>
+        <p class="text-xs">{rtcPhase}</p>
+      </div>
     );
   }
 
-  return <ListPage onOpen={openSession} />;
+  if (wantRtc && rtcErr && !rtc) {
+    return (
+      <div class="mx-auto max-w-lg px-4 py-16 text-center text-sm">
+        <p class="mb-2 font-semibold text-danger">跨网连接失败</p>
+        <p class="text-muted">{rtcErr}</p>
+      </div>
+    );
+  }
+
+  const transportValue = {
+    mode: (wantRtc && rtc ? "rtc" : "http") as "rtc" | "http",
+    rtc,
+    phaseLabel: wantRtc ? rtcPhase : undefined,
+  };
+
+  return (
+    <TransportContext.Provider value={transportValue}>
+      {route.page === "session" ? (
+        <CliPanel
+          sessionId={route.id}
+          name={route.name}
+          subtitle={route.subtitle}
+          writeEnabled={
+            wantRtc && rtc ? rtc.writeEnabled() : writeEnabled || wantRtc
+          }
+          onBack={goList}
+        />
+      ) : (
+        <ListPage onOpen={openSession} />
+      )}
+    </TransportContext.Provider>
+  );
 }

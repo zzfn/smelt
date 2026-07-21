@@ -164,6 +164,31 @@ cargo run -p smelt-signal
 CI：`.github/workflows/signal.yml` → 滚动 release 标签 `signal-nightly`  
 下载：`.../releases/download/signal-nightly/smelt-signal-x86_64-unknown-linux-gnu`
 
+### Mac bridge（`crates/smelt-bridge`）
+
+```bash
+# 1) 本机可写网关
+cargo run -p smeltd --bin gateway -- --port 18765 --write
+# 记下打印的 token=...
+
+# 2) 桥：建房 + host 信令 + WebRTC + 转发 gateway
+SMELT_GATEWAY_TOKEN=<token> \
+SMELT_SIGNAL_HTTP=https://signal.zhyqhxb.fun \
+SMELT_SHARE_BASE=http://127.0.0.1:18765/ \
+  cargo run -p smelt-bridge
+```
+
+终端会打印跨网 URL：`?room=&k=&signal=wss://…/ws&token=`。  
+手机打开该 URL（需能加载 SPA：gateway 已嵌入 remote-web，或用局域网/隧道访问 gateway）。
+
+| 环境变量 | 默认 |
+|----------|------|
+| `SMELT_SIGNAL_HTTP` | `https://signal.zhyqhxb.fun` |
+| `SMELT_SIGNAL_WS` | 由 HTTP 推导 `/ws` |
+| `SMELT_GATEWAY` | `http://127.0.0.1:18765` |
+| `SMELT_GATEWAY_TOKEN` | **必填** |
+| `SMELT_SHARE_BASE` | 拼分享链接的页根 |
+
 ### DataChannel 标签
 
 - label: `smelt`

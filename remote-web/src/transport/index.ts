@@ -4,3 +4,5 @@ export * from "./types";
 export * from "./frames";
 export * from "./signaling";
 export * from "./rtc-peer";
+export * from "./rtc-backend";
+export * from "./TransportContext";

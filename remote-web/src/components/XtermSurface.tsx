@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { postInput, postResize, wsUrl } from "../api";
 import { serializeVisibleScreen } from "../lib/serializeScreen";
+import { useTransport } from "../transport/TransportContext";
 
 type Props = {
   sessionId: string;
@@ -69,6 +70,7 @@ export function XtermSurface({
   const wrapRef = useRef<HTMLDivElement>(null);
   const onBufRef = useRef(onBufferText);
   onBufRef.current = onBufferText;
+  const transport = useTransport();
 
   useEffect(() => {
     const host = hostRef.current;
@@ -143,13 +145,13 @@ export function XtermSurface({
       if (resizeTimer != null) window.clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(() => {
         resizeTimer = null;
-        void postResize(
-          sessionId,
-          cols,
-          rows,
-          Math.max(1, Math.round(cellW)),
-          Math.max(1, Math.round(cellH)),
-        );
+        const cw = Math.max(1, Math.round(cellW));
+        const ch = Math.max(1, Math.round(cellH));
+        if (transport.mode === "rtc" && transport.rtc) {
+          transport.rtc.postResize(sessionId, cols, rows, cw, ch);
+        } else {
+          void postResize(sessionId, cols, rows, cw, ch);
+        }
       }, 120);
     };
 
@@ -230,7 +232,11 @@ export function XtermSurface({
     /** 写入滚动序列（与 Composer 相同 POST /input） */
     const postScrollBytes = (payload: string) => {
       if (!writeEnabled || !payload) return;
-      void postInput(sessionId, payload);
+      if (transport.mode === "rtc" && transport.rtc) {
+        transport.rtc.postInput(sessionId, payload);
+      } else {
+        void postInput(sessionId, payload);
+      }
     };
 
     const sendAppScroll = (lines: number) => {
@@ -328,6 +334,7 @@ export function XtermSurface({
     let closed = false;
     let retry = 1000;
     let ws: WebSocket | null = null;
+    let stopRtc: (() => void) | null = null;
 
     const measureSoon = () => {
       requestAnimationFrame(() => {
@@ -337,8 +344,40 @@ export function XtermSurface({
       });
     };
 
+    const writePtyBytes = (bytes: Uint8Array) => {
+      const shouldStickBottom = (() => {
+        try {
+          const buf = term.buffer.active;
+          return buf.viewportY >= buf.baseY + term.rows - 3;
+        } catch {
+          return true;
+        }
+      })();
+      term.write(bytes, () => {
+        if (shouldStickBottom && !isAltScreen()) {
+          try {
+            term.scrollToBottom();
+          } catch {
+            /* ignore */
+          }
+        }
+        scheduleBufEmit();
+      });
+    };
+
     const connect = () => {
       if (closed) return;
+
+      if (transport.mode === "rtc" && transport.rtc) {
+        term.reset();
+        lastCols = 0;
+        lastRows = 0;
+        measureSoon();
+        unlockFocus = lockTermFocus() ?? unlockFocus;
+        stopRtc = transport.rtc.openPty(sessionId, writePtyBytes);
+        return;
+      }
+
       ws = new WebSocket(wsUrl(`/s/${encodeURIComponent(sessionId)}/stream`));
       ws.binaryType = "arraybuffer";
       ws.onopen = () => {
@@ -351,25 +390,7 @@ export function XtermSurface({
       };
       ws.onmessage = (ev) => {
         if (typeof ev.data === "string") return;
-        const bytes = new Uint8Array(ev.data as ArrayBuffer);
-        const shouldStickBottom = (() => {
-          try {
-            const buf = term.buffer.active;
-            return buf.viewportY >= buf.baseY + term.rows - 3;
-          } catch {
-            return true;
-          }
-        })();
-        term.write(bytes, () => {
-          if (shouldStickBottom && !isAltScreen()) {
-            try {
-              term.scrollToBottom();
-            } catch {
-              /* ignore */
-            }
-          }
-          scheduleBufEmit();
-        });
+        writePtyBytes(new Uint8Array(ev.data as ArrayBuffer));
       };
       ws.onclose = () => {
         if (closed) return;
@@ -383,6 +404,8 @@ export function XtermSurface({
 
     return () => {
       closed = true;
+      stopRtc?.();
+      stopRtc = null;
       if (resizeTimer != null) window.clearTimeout(resizeTimer);
       if (resizeTimer2 != null) window.clearTimeout(resizeTimer2);
       if (bufTimer != null) window.clearTimeout(bufTimer);
@@ -399,7 +422,7 @@ export function XtermSurface({
       ws?.close();
       term.dispose();
     };
-  }, [sessionId, writeEnabled]);
+  }, [sessionId, writeEnabled, transport.mode, transport.rtc]);
 
   return (
     <div ref={wrapRef} class={`relative h-full w-full min-h-0 overflow-hidden ${cls ?? ""}`}>
