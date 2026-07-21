@@ -987,6 +987,8 @@ struct Workspace {
     diff_gen: u64,
     /// diff 是否用并排（split）视图；false 为统一（unified）视图。
     diff_split: bool,
+    /// F7/Shift+F7 当前跳到第几个改动块（None = 还没跳过）。换文件重开 diff 时清空。
+    active_hunk: Option<usize>,
     /// 交互式 diff：选中待评论的行号集合（对应 GitDiff.lines 下标），换文件/重开 diff 时清空。
     diff_selected: HashSet<usize>,
     /// 交互式 diff 的评论输入框（懒创建，随 Git 视图渲染出待发送的 diff 时创建）。
@@ -1184,6 +1186,9 @@ struct Workspace {
     _new_worktree_sub: Option<Subscription>,
     /// 正在确认删除的 worktree（None = 没在删）。
     delete_worktree_target: Option<DeleteWorktreeTarget>,
+    /// 正在确认丢弃的 diff 块：(仓库根, hunk 下标)。丢弃直接改工作区文件且不进
+    /// reflog，找不回来，所以必须过一道确认。
+    discard_hunk_target: Option<(String, usize)>,
     /// 各类后台操作（建/删 worktree、生成 commit message 等）失败时的提示，render
     /// 顶部取走并弹成通知；后台任务里没有 Window，弹不了通知，所以先暂存到这。
     background_error: Option<String>,
@@ -1258,6 +1263,7 @@ impl Workspace {
             git_diff: None,
             diff_gen: 0,
             diff_split: false,
+            active_hunk: None,
             diff_selected: HashSet::new(),
             diff_comment_input: None,
             commit_msg_input: None,
@@ -1346,6 +1352,7 @@ impl Workspace {
             new_worktree_input: None,
             _new_worktree_sub: None,
             delete_worktree_target: None,
+            discard_hunk_target: None,
             background_error: None,
             daemon_outdated: None,
             daemon_upgrade_msg: None,
@@ -5159,6 +5166,12 @@ impl Render for Workspace {
                         }
                     }
                 }
+                // Git 页 F7 / Shift+F7：在改动块之间跳（对齐 JetBrains 的 next/previous
+                // difference）。不带 Cmd，所以要赶在下面的 platform 判断之前处理。
+                if this.view == MainView::Git && ks.key == "f7" && !ks.modifiers.platform {
+                    this.jump_hunk(!ks.modifiers.shift, cx);
+                    return;
+                }
                 if !ks.modifiers.platform {
                     return;
                 }
@@ -5516,6 +5529,7 @@ impl Render for Workspace {
                                 self.commit_msg_generating,
                                 &self.git_files_scroll,
                                 &self.diff_scroll,
+                                self.active_hunk,
                                 cx,
                             )
                         }
@@ -5567,6 +5581,7 @@ impl Render for Workspace {
             .children(self.new_worktree_target.is_some().then(|| self.render_new_worktree_dialog(cx)))
             // 删除 Worktree 确认拦截弹层
             .children(self.delete_worktree_target.is_some().then(|| self.render_delete_worktree_confirm(cx)))
+            .children(self.discard_hunk_target.is_some().then(|| self.render_discard_hunk_confirm(cx)))
             // 删除文件二次确认拦截弹层
             .children(self.delete_file_target.is_some().then(|| self.render_delete_file_confirm(cx)))
             // 重启守护确认弹层改挂在设置窗（SettingsWindow::render），不在主窗口画。

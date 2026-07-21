@@ -66,11 +66,39 @@ struct DiffLine {
     segments: Option<Vec<(String, bool)>>,
 }
 
+/// diff 里的一个 `@@` 段——按块暂存 / 丢弃的最小单位。
+///
+/// `raw` 必须是 git 原样吐出来的文本，**不能**从 `DiffLine` 反向拼：`\ No newline at
+/// end of file` 这类标记不进 DiffLine（它既不是增删也不是上下文），重建出来的 patch
+/// 喂给 `git apply` 会被判成损坏。行号同理——原文的 `@@ -a,b +c,d @@` 直接沿用就
+/// 一定对得上，自己算容易差一行（见 [[split-commits-patch-context]] 那次教训）。
+struct DiffHunk {
+    /// 在 [`GitDiff::lines`] 里的下标范围，起点是 `@@` 头那行。
+    range: std::ops::Range<usize>,
+    /// 本段原文（`@@` 头 + 各行，保留 `+`/`-`/空格前缀，每行以 \n 结尾）。
+    raw: String,
+}
+
 /// Git 视图里当前选中查看的文件 diff：文件相对路径 + 结构化的 diff 行。
 /// 用 Rc 供 uniform_list 闭包共享。
 pub struct GitDiff {
     path: String,
     lines: Rc<Vec<DiffLine>>,
+    /// 文件头原文（`diff --git` … `+++` 那几行），与单个 hunk 的 `raw` 拼起来
+    /// 才是一份能喂给 `git apply` 的完整 patch。
+    header: String,
+    hunks: Rc<Vec<DiffHunk>>,
+    /// 能否按块操作。两种 diff 拿不到合法 patch，只能整文件处理：
+    /// - submodule（`--submodule=diff`）：里面是**子仓库**的文件路径，主仓库 apply 不了
+    /// - 未跟踪文件（`--no-index`）：路径是 `/dev/null` 加工作区绝对路径，对不上索引
+    patchable: bool,
+}
+
+/// [`parse_diff`] 的产物：渲染要的行 + 按块操作要的 patch 素材。
+struct ParsedDiff {
+    lines: Vec<DiffLine>,
+    header: String,
+    hunks: Vec<DiffHunk>,
 }
 
 /// 一次 `git status` 的缓存结果（后台跑、render 只读，绝不在 render 同步跑 git）。
@@ -139,6 +167,38 @@ pub fn run_git(root: &str, args: &[&str]) -> std::io::Result<std::process::Outpu
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
+}
+
+/// 跑一条从 stdin 读输入的 git 子命令（`git apply` 收 patch 用）。
+///
+/// 必须先写完 stdin 再 `wait_with_output`：stdin 句柄不 drop，git 读不到 EOF 会一直
+/// 等，而我们又在等它退出，直接死锁。
+fn run_git_stdin(root: &str, args: &[&str], input: &str) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut si = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("拿不到 git 的 stdin"))?;
+        si.write_all(input.as_bytes())?;
+    } // si 在这里 drop → git 收到 EOF
+    child.wait_with_output()
+}
+
+/// 把单个 hunk 拼成一份完整 patch：文件头（`diff --git` … `+++`）+ 本段原文。
+/// 两截都是 git 原样吐出来的，不做任何重排，`git apply` 才会认。
+fn hunk_patch(header: &str, hunk: &DiffHunk) -> String {
+    format!("{header}{}", hunk.raw)
 }
 
 /// `out` 失败时把 stderr 整理成错误文案；stderr 为空（有些失败模式不写 stderr）就用
@@ -334,7 +394,7 @@ fn slugify_path_segment(s: &str) -> String {
 
 /// 把 git diff 文本解析成结构化的行：从 @@ 段头取起始行号，逐行推进旧/新行号，
 /// 并按前缀判定类型、剥掉 +/-/空格前缀。空 diff 给一句提示。
-fn parse_diff(text: &str) -> Vec<DiffLine> {
+fn parse_diff(text: &str) -> ParsedDiff {
     let mk = |old_ln, new_ln, kind, text: &str| DiffLine {
         old_ln,
         new_ln,
@@ -343,16 +403,41 @@ fn parse_diff(text: &str) -> Vec<DiffLine> {
         segments: None,
     };
     if text.trim().is_empty() {
-        return vec![mk(None, None, DiffKind::Meta, "（无差异）")];
+        return ParsedDiff {
+            lines: vec![mk(None, None, DiffKind::Meta, "（无差异）")],
+            header: String::new(),
+            hunks: Vec::new(),
+        };
     }
     let mut old_ln = 0u32;
     let mut new_ln = 0u32;
     let mut out = Vec::new();
+    // 按块操作的素材：第一个 @@ 之前的元信息行攒成 header，之后每段原文攒进 hunks。
+    let mut header = String::new();
+    let mut hunks: Vec<DiffHunk> = Vec::new();
     for line in text.lines() {
+        // 当前 hunk 未结束时，原样收本行（含前缀）——patch 的合法性全靠它。
+        if let Some(h) = hunks.last_mut() {
+            if h.range.end == usize::MAX {
+                if line.starts_with("@@") || line.starts_with("diff ") {
+                    // 段结束：补上真实终点，下面的分支再决定要不要开新段。
+                    h.range.end = out.len();
+                } else {
+                    h.raw.push_str(line);
+                    h.raw.push('\n');
+                }
+            }
+        }
         if line.starts_with("@@") {
             let (o, n) = parse_hunk(line);
             old_ln = o;
             new_ln = n;
+            hunks.push(DiffHunk {
+                // end 先占位成 MAX 表示「still open」，收到下一个 @@ / diff 或
+                // 遍历结束时再回填。
+                range: out.len()..usize::MAX,
+                raw: format!("{line}\n"),
+            });
             out.push(mk(None, None, DiffKind::Hunk, line));
         } else if line.starts_with("+++")
             || line.starts_with("---")
@@ -363,6 +448,12 @@ fn parse_diff(text: &str) -> Vec<DiffLine> {
             || line.starts_with("similarity")
             || line.starts_with("rename ")
         {
+            // 第一个 @@ 之前的元信息行就是文件头；之后再出现的（多文件 diff，如
+            // submodule）不进 header——那种 diff 本来也标 patchable=false。
+            if hunks.is_empty() {
+                header.push_str(line);
+                header.push('\n');
+            }
             out.push(mk(None, None, DiffKind::Meta, line));
         } else if let Some(t) = line.strip_prefix('+') {
             out.push(mk(None, Some(new_ln), DiffKind::Add, t));
@@ -378,8 +469,14 @@ fn parse_diff(text: &str) -> Vec<DiffLine> {
             new_ln += 1;
         }
     }
+    // 收尾：最后一段没有后继 @@ 来触发回填，这里补上。
+    if let Some(h) = hunks.last_mut() {
+        if h.range.end == usize::MAX {
+            h.range.end = out.len();
+        }
+    }
     mark_inline(&mut out);
-    out
+    ParsedDiff { lines: out, header, hunks }
 }
 
 /// 后处理：对每组「连续删行紧跟连续增行」按顺序逐行配对，做字符级 inline diff，
@@ -491,11 +588,68 @@ fn diff_text_area(l: &DiffLine, fg: Rgba, hl: Rgba) -> Div {
     }
 }
 
+/// 按块操作按钮渲染要的上下文：仓库根 + 该 diff 能不能拼出合法 patch。
+/// 打包传递，省得每个渲染函数都多挂两个参数。
+#[derive(Clone)]
+struct HunkCtx {
+    root: String,
+    patchable: bool,
+    /// 行下标 → 该行是第几个 hunk 的头。只有 hunk 头那行才渲染按钮。
+    starts: Rc<std::collections::HashMap<usize, usize>>,
+    /// F7 当前停在第几块，给它的头行描边，不然跳完不知道落在哪。
+    active: Option<usize>,
+}
+
+impl HunkCtx {
+    /// 这行是不是某个 hunk 的头；是就返回块序号。不可 patch 的 diff 不给按钮，
+    /// 但仍要返回序号——F7 导航和高亮对子模块/未跟踪文件一样有用。
+    fn idx_at(&self, line: usize) -> Option<usize> {
+        self.starts.get(&line).copied()
+    }
+}
+
+/// hunk 头那行右侧的按钮组：暂存本块 / 丢弃本块。
+///
+/// 用 div 而不是 Button 组件：这些行住在 uniform_list 里，只有可见区间会被构造，
+/// 行内嵌带状态的组件容易和虚拟滚动的复用打架，"查看完整文件 ↗" 也是同样的写法。
+fn hunk_buttons(idx: usize, ctx: &HunkCtx, ws: &Entity<Workspace>) -> Div {
+    let btn = |label: &'static str, id: &'static str, color: u32, hover: u32| {
+        div()
+            .id((id, idx))
+            .px_2()
+            .text_xs()
+            .cursor_pointer()
+            .text_color(rgb(color))
+            .hover(|s| s.text_color(rgb(hover)))
+            .child(label)
+    };
+    let (ws_stage, root_stage) = (ws.clone(), ctx.root.clone());
+    let (ws_discard, root_discard) = (ws.clone(), ctx.root.clone());
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(btn("暂存块", "hunk-stage", 0x7dcfff, 0xa9dcff).on_click(move |_ev, _w, cx| {
+            let root = root_stage.clone();
+            ws_stage.update(cx, |this, cx| this.stage_hunk(root, idx, cx));
+        }))
+        .child(btn("丢弃块", "hunk-discard", 0x8b6b7a, 0xff7a93).on_click(move |_ev, _w, cx| {
+            let root = root_discard.clone();
+            ws_discard.update(cx, |this, cx| this.start_discard_hunk(root, idx, cx));
+        }))
+}
+
 /// 渲染一行 diff：左侧色条 + 旧/新行号槽 + 文本；整行按类型上淡背景。
 /// 若有 segments（行内 diff 结果），变化片段再叠一层更深的底色。
 /// 增/删行（i 为 GitDiff.lines 下标）可点选：选中态描边，点击切给 Workspace
 /// 的 toggle_diff_line，配合底部评论框批量发给当前终端。
-fn render_diff_line(i: usize, l: &DiffLine, selected: bool, ws: &Entity<Workspace>) -> Stateful<Div> {
+fn render_diff_line(
+    i: usize,
+    l: &DiffLine,
+    selected: bool,
+    ws: &Entity<Workspace>,
+    hunks: &HunkCtx,
+) -> Stateful<Div> {
     let (fg, bg, bar, hl) = diff_colors(l.kind);
     let gutter = |n: Option<u32>| {
         div()
@@ -526,7 +680,12 @@ fn render_diff_line(i: usize, l: &DiffLine, selected: bool, ws: &Entity<Workspac
             ws.update(cx, |this, cx| this.toggle_diff_line(i, cx));
         });
     }
-    row
+    let hunk_idx = hunks.idx_at(i);
+    // F7 停在这块就描一道边，跳完才看得出落点。
+    if hunk_idx.is_some() && hunk_idx == hunks.active {
+        row = row.border_1().border_color(rgb(0x7dcfff));
+    }
+    let row = row
         // 左侧色条：增/删才有，其它用等宽透明占位保持对齐。
         .child(match bar {
             Some(c) => div().w(px(2.)).h_full().bg(c),
@@ -534,7 +693,12 @@ fn render_diff_line(i: usize, l: &DiffLine, selected: bool, ws: &Entity<Workspac
         })
         .child(gutter(l.old_ln))
         .child(gutter(l.new_ln))
-        .child(diff_text_area(l, fg, hl))
+        .child(diff_text_area(l, fg, hl));
+    match hunk_idx {
+        // 不可 patch 的 diff（子模块 / 未跟踪）不给按钮，但上面的高亮照给。
+        Some(idx) if hunks.patchable => row.child(hunk_buttons(idx, hunks, ws)),
+        _ => row,
+    }
 }
 
 /// 把线性的 diff 行重排成并排的行对：上下文左右对齐；一组删/增按顺序配对，
@@ -648,6 +812,7 @@ fn render_split_row(
     lines: &[DiffLine],
     selected: &HashSet<usize>,
     ws: &Entity<Workspace>,
+    hunks: &HunkCtx,
 ) -> Div {
     match row {
         SplitRow::Full(i) => {
@@ -663,7 +828,16 @@ fn render_split_row(
             if let Some(b) = bg {
                 d = d.bg(b);
             }
-            d.child(div().px_2().text_color(fg).child(l.text.clone()))
+            // hunk 头在并排视图里也是整行，同样挂按钮；文本占满剩余宽度把按钮推到右边。
+            let hunk_idx = hunks.idx_at(*i);
+            if hunk_idx.is_some() && hunk_idx == hunks.active {
+                d = d.border_1().border_color(rgb(0x7dcfff));
+            }
+            let d = d.child(div().flex_1().px_2().text_color(fg).child(l.text.clone()));
+            match hunk_idx {
+                Some(idx) if hunks.patchable => d.child(hunk_buttons(idx, hunks, ws)),
+                _ => d,
+            }
         }
         SplitRow::Both(l, r) => div()
             .flex()
@@ -689,6 +863,7 @@ fn git_diff_pane(
     diff_selected: &HashSet<usize>,
     diff_comment_input: Option<&Entity<gpui_component::input::InputState>>,
     diff_scroll: &UniformListScrollHandle,
+    active_hunk: Option<usize>,
     cx: &mut Context<Workspace>,
 ) -> Div {
     let (muted, fg, border, accent) = {
@@ -701,6 +876,14 @@ fn git_diff_pane(
             let name = d.path.rsplit('/').next().unwrap_or(d.path.as_str()).to_string();
             let lines = d.lines.clone();
             let ws = cx.entity();
+            let hunk_ctx = HunkCtx {
+                root: root.to_string(),
+                patchable: d.patchable,
+                starts: Rc::new(
+                    d.hunks.iter().enumerate().map(|(n, h)| (h.range.start, n)).collect(),
+                ),
+                active: active_hunk,
+            };
             // 完整文件路径：diff 里的 path 是相对仓库根的，拼上 root 才是 view_file
             // 要的绝对路径。
             let full_path = Path::new(root).join(&d.path).to_string_lossy().to_string();
@@ -728,18 +911,20 @@ fn git_diff_pane(
                 let lines2 = lines.clone();
                 let sel2 = diff_selected.clone();
                 let ws2 = ws.clone();
+                let hc = hunk_ctx.clone();
                 uniform_list("git-diff-split", count, move |range, _w, _cx| {
                     range
-                        .map(|i| render_split_row(i, &rows[i], &lines2, &sel2, &ws2))
+                        .map(|i| render_split_row(i, &rows[i], &lines2, &sel2, &ws2, &hc))
                         .collect::<Vec<_>>()
                 })
             } else {
                 let count = lines.len();
                 let sel2 = diff_selected.clone();
                 let ws2 = ws.clone();
+                let hc = hunk_ctx.clone();
                 uniform_list("git-diff", count, move |range, _w, _cx| {
                     range
-                        .map(|i| render_diff_line(i, &lines[i], sel2.contains(&i), &ws2))
+                        .map(|i| render_diff_line(i, &lines[i], sel2.contains(&i), &ws2, &hc))
                         .collect::<Vec<_>>()
                 })
             }
@@ -915,6 +1100,7 @@ pub fn git_view(
     commit_msg_generating: bool,
     files_scroll: &ScrollHandle,
     diff_scroll: &UniformListScrollHandle,
+    active_hunk: Option<usize>,
     cx: &mut Context<Workspace>,
 ) -> Div {
     let (muted, fg, border, accent) = {
@@ -1102,7 +1288,16 @@ pub fn git_view(
         .min_h_0()
         .flex()
         .child(left)
-        .child(git_diff_pane(&root, git_diff, split, diff_selected, diff_comment_input, diff_scroll, cx))
+        .child(git_diff_pane(
+            &root,
+            git_diff,
+            split,
+            diff_selected,
+            diff_comment_input,
+            diff_scroll,
+            active_hunk,
+            cx,
+        ))
 }
 
 // ===================== Workspace 方法 =====================
@@ -1359,6 +1554,103 @@ impl Workspace {
                     ),
             );
         Self::modal_shell(360., true, content, cx)
+    }
+
+    /// F7 / Shift+F7：跳到下一个 / 上一个改动块并滚到视野里。
+    ///
+    /// 首次按跳第一块；到头就停在两端，不回绕——回绕会让人以为还有更多改动。
+    pub fn jump_hunk(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(d) = self.git_diff.as_ref() else { return };
+        let n = d.hunks.len();
+        if n == 0 {
+            return;
+        }
+        let next = match self.active_hunk {
+            None => 0,
+            Some(i) if forward => (i + 1).min(n - 1),
+            Some(i) => i.saturating_sub(1),
+        };
+        let line = d.hunks[next].range.start;
+        // 并排视图里 uniform_list 的 item 是 SplitRow，下标和 lines 的下标不是一回事，
+        // 直接拿行号去滚会滚到别的位置——先翻译成 row 下标。
+        let item = if self.diff_split {
+            build_split_rows(&d.lines)
+                .iter()
+                .position(|r| matches!(r, SplitRow::Full(i) if *i == line))
+                .unwrap_or(line)
+        } else {
+            line
+        };
+        self.active_hunk = Some(next);
+        self.diff_scroll.scroll_to_item(item, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// 点「丢弃块」：先弹确认，不直接动文件。
+    pub fn start_discard_hunk(&mut self, root: String, idx: usize, cx: &mut Context<Self>) {
+        self.discard_hunk_target = Some((root, idx));
+        cx.notify();
+    }
+
+    /// 确认丢弃：关弹窗并真正执行 reverse apply。
+    pub fn confirm_discard_hunk(&mut self, cx: &mut Context<Self>) {
+        let Some((root, idx)) = self.discard_hunk_target.take() else { return };
+        self.discard_hunk(root, idx, cx);
+    }
+
+    /// 取消丢弃：什么都不发生。
+    pub fn cancel_discard_hunk(&mut self, cx: &mut Context<Self>) {
+        self.discard_hunk_target = None;
+        cx.notify();
+    }
+
+    /// 「丢弃这一块」确认弹窗。用危险配色，文案点明不可恢复——这个操作直接覆写
+    /// 工作区文件，既不进索引也不进 reflog，点完就真没了。
+    pub fn render_discard_hunk_confirm(&self, cx: &mut Context<Self>) -> Div {
+        let (fg, muted) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground)
+        };
+        let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(true);
+        let Some((_, idx)) = self.discard_hunk_target.as_ref() else { return div() };
+        let file = self.git_diff.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+
+        let content = v_flex()
+            .child(div().font_bold().text_color(fg).text_lg().child("确定丢弃这一块改动吗？"))
+            .child(div().text_sm().text_color(muted).child(format!(
+                "{file} 的第 {} 块改动会被还原成改动前的样子。",
+                idx + 1
+            )))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(accent_text)
+                    .child("直接改工作区文件，不进暂存区也不进 reflog——丢了就找不回来。"),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(Self::modal_button(
+                        "cancel-discard-hunk",
+                        "取消",
+                        neutral_bg,
+                        neutral_hover,
+                        fg,
+                        |this, _, _, cx| this.cancel_discard_hunk(cx),
+                        cx,
+                    ))
+                    .child(Self::modal_button(
+                        "confirm-discard-hunk",
+                        "丢弃这一块",
+                        tint,
+                        hover,
+                        accent_text,
+                        |this, _, _, cx| this.confirm_discard_hunk(cx),
+                        cx,
+                    )),
+            );
+        Self::modal_shell(380., true, content, cx)
     }
 
     /// 给某个 root 建一次性的文件监听（notify crate，macOS 走 FSEvents）：仓库目录树
@@ -1673,39 +1965,135 @@ impl Workspace {
         .detach();
     }
 
+    /// 把第 `idx` 个 hunk 单独加入暂存区（`git apply --cached`）。
+    ///
+    /// 只暂存一块、其余留在工作区，是 agent 写的代码「对一半」时最需要的动作：挑出
+    /// 对的先存下来，剩下的继续让它改。
+    pub fn stage_hunk(&mut self, root: String, idx: usize, cx: &mut Context<Self>) {
+        self.apply_hunk(root, idx, &["apply", "--cached", "-"], cx);
+    }
+
+    /// 丢弃第 `idx` 个 hunk（`git apply --reverse`，作用于工作区文件）。
+    ///
+    /// **会真的改用户的文件且不进 reflog**，调用方必须先让用户确认过。
+    pub fn discard_hunk(&mut self, root: String, idx: usize, cx: &mut Context<Self>) {
+        self.apply_hunk(root, idx, &["apply", "--reverse", "-"], cx);
+    }
+
+    /// stage_hunk / discard_hunk 共用：拼 patch → 后台 `git apply` → 刷新状态并重开 diff。
+    ///
+    /// 成功后必须重新拉一次 diff：apply 之后剩余 hunk 的行号和分段都变了，接着用旧的
+    /// 下标去点第二块，改的就是别的地方（`-U0` 那次错位是同一类问题）。
+    fn apply_hunk(
+        &mut self,
+        root: String,
+        idx: usize,
+        args: &'static [&'static str],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(d) = self.git_diff.as_ref() else { return };
+        if !d.patchable {
+            self.background_error =
+                Some("这个 diff 不支持按块操作（子模块 / 未跟踪文件），请用整文件的勾选框".into());
+            cx.notify();
+            return;
+        }
+        let Some(hunk) = d.hunks.get(idx) else { return };
+        let patch = hunk_patch(&d.header, hunk);
+        let path = d.path.clone();
+        cx.spawn(async move |this, cx| {
+            let r = root.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let out = run_git_stdin(&r, args, &patch).map_err(|e| e.to_string())?;
+                    if out.status.success() {
+                        return Ok(());
+                    }
+                    // apply 失败最常见的原因是这个文件已经部分暂存过：当前 diff 是
+                    // `git diff HEAD`（暂存+未暂存合起来），其中已进索引的那部分再
+                    // apply --cached 就会 "already exists"/"does not apply"。把原因
+                    // 说清楚，别只甩 git 的英文原文。
+                    let raw = git_err(&out, "git apply 失败");
+                    Err(format!(
+                        "按块操作失败：{raw}\n\
+                         （这个文件若已部分暂存，当前视图混着暂存与未暂存的改动，\
+                         按块操作会对不上号；先用勾选框整文件取消暂存再试）"
+                    ))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.invalidate_git_status(&root);
+                        // 行号已变，重新解析一份，避免下一次点击打在错的位置上。
+                        this.open_diff(root.clone(), path, false, cx);
+                    }
+                    Err(err) => this.background_error = Some(err),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 跑 git + 着色放后台，用 file_gen 丢弃过期结果。
     pub fn open_diff(&mut self, root: String, path: String, untracked: bool, cx: &mut Context<Self>) {
         self.diff_gen = self.diff_gen.wrapping_add(1);
         let r#gen = self.diff_gen;
-        self.git_diff = Some(GitDiff { path: path.clone(), lines: Rc::new(Vec::new()) });
+        self.git_diff = Some(GitDiff {
+            path: path.clone(),
+            lines: Rc::new(Vec::new()),
+            header: String::new(),
+            hunks: Rc::new(Vec::new()),
+            patchable: false,
+        });
         self.diff_selected.clear(); // 换文件/重开 diff：旧的行选区不再对应新内容
+        self.active_hunk = None; // 块下标同理，换了文件就不指向原来那块了
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let (r, p) = (root.clone(), path.clone());
-            let lines = cx
+            let parsed = cx
                 .background_executor()
                 .spawn(async move {
                     let out = if untracked {
                         run_git(&r, &["diff", "--no-index", "--", "/dev/null", &p])
                     } else {
-                        // --submodule=log：submodule 指针变化（mode 160000）默认只输出
+                        // --submodule=diff：submodule（mode 160000）默认只输出
                         // "Subproject commit <old sha>/<new sha>"，两行几乎全同的 hex
-                        // 走字符级 diff 高亮，等于啥有用信息都没给。=log 换成子仓库里
-                        // old..new 之间的实际 commit 列表，对普通文件这个参数完全不生效。
-                        run_git(&r, &["diff", "HEAD", "--submodule=log", "--", &p])
+                        // 走字符级 diff 高亮，等于啥有用信息都没给。=diff 换成子仓库
+                        // 内部的真实文件级 diff，对普通文件这个参数完全不生效。
+                        //
+                        // 别退回 =log：那个只列 old..new 之间的 commit 标题，而子模块
+                        // **内有未提交改动**时（agent 改代码最常见的形态）它只吐一句
+                        // "contains modified content"，改了什么完全看不见。
+                        run_git(&r, &["diff", "HEAD", "--submodule=diff", "--", &p])
                     };
                     // --no-index 有差异时退出码为 1，所以不看 status，只要拿到 stdout。
                     let text = match out {
                         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
                         Err(e) => format!("无法执行 git diff：{e}"),
                     };
-                    parse_diff(&text)
+                    // submodule 的 diff 里是子仓库的文件路径，主仓库 apply 不了；
+                    // 未跟踪走 --no-index，路径同样对不上索引。两者都退回整文件操作。
+                    let is_submodule = text.lines().any(|l| l.starts_with("Submodule "));
+                    (parse_diff(&text), !untracked && !is_submodule)
                 })
                 .await;
+            let (parsed, patchable) = parsed;
             let _ = this.update(cx, |this, cx| {
                 if this.diff_gen == r#gen {
-                    this.git_diff = Some(GitDiff { path, lines: Rc::new(lines) });
+                    // 没解析出文件头就拼不出合法 patch（比如 diff 为空、或 git 报错
+                    // 的文案），这时也不能让按块按钮亮着。
+                    let patchable = patchable && !parsed.header.is_empty();
+                    this.git_diff = Some(GitDiff {
+                        path,
+                        lines: Rc::new(parsed.lines),
+                        header: parsed.header,
+                        hunks: Rc::new(parsed.hunks),
+                        patchable,
+                    });
                     cx.notify();
                 }
             });
@@ -1862,5 +2250,130 @@ impl Workspace {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // 不用 `use super::*;`：本文件顶部有 gpui/gpui_component 的 glob 导入，带进测试
+    // 模块会让 trait 解析图爆炸，`cargo test` 编译期能把 rustc 撑崩（hotspot.rs 的
+    // 测试模块踩过，那边留了同样的注释）。只导入真正用到的名字。
+    use super::{hunk_patch, parse_diff, run_git, run_git_stdin};
+
+    /// 在临时目录里造一个仓库：写 `content`、提交，再覆写成 `modified`（不提交）。
+    /// 返回仓库根路径。用 pid + 标签避免并行测试互相踩。
+    fn repo_with_change(tag: &str, content: &str, modified: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("smelt-git-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let r = root.to_str().unwrap();
+        run_git(r, &["init", "-q"]).unwrap();
+        run_git(r, &["config", "user.email", "t@t"]).unwrap();
+        run_git(r, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(root.join("f.txt"), content).unwrap();
+        run_git(r, &["add", "-A"]).unwrap();
+        run_git(r, &["commit", "-qm", "init"]).unwrap();
+        std::fs::write(root.join("f.txt"), modified).unwrap();
+        root
+    }
+
+    /// 隔得够远的两处改动 → git 一定分成两个 hunk，且每段的 range 覆盖自己的行。
+    #[test]
+    fn parses_multiple_hunks_with_correct_ranges() {
+        let orig: String = (1..=60).map(|i| format!("line{i}\n")).collect();
+        let mut lines: Vec<String> = orig.lines().map(|l| l.to_string()).collect();
+        lines[2] = "CHANGED-TOP".into();
+        lines[55] = "CHANGED-BOTTOM".into();
+        let modified: String = lines.iter().map(|l| format!("{l}\n")).collect();
+
+        let root = repo_with_change("multi", &orig, &modified);
+        let out = run_git(root.to_str().unwrap(), &["diff", "HEAD", "--", "f.txt"]).unwrap();
+        let parsed = parse_diff(&String::from_utf8_lossy(&out.stdout));
+
+        assert_eq!(parsed.hunks.len(), 2, "相距 50 行的两处改动应分成两个 hunk");
+        // range 不能留占位值，且必须首尾相接不重叠
+        for h in &parsed.hunks {
+            assert!(h.range.end != usize::MAX, "range.end 占位值没回填");
+            assert!(h.range.start < h.range.end, "range 为空: {:?}", h.range);
+        }
+        assert!(parsed.hunks[0].range.end <= parsed.hunks[1].range.start, "两段 range 重叠");
+        // 每段原文里只该有自己那处改动
+        assert!(parsed.hunks[0].raw.contains("CHANGED-TOP"));
+        assert!(!parsed.hunks[0].raw.contains("CHANGED-BOTTOM"));
+        assert!(parsed.hunks[1].raw.contains("CHANGED-BOTTOM"));
+        assert!(!parsed.hunks[1].raw.contains("CHANGED-TOP"));
+        assert!(parsed.header.starts_with("diff --git"), "header 应从 diff --git 起头");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 光比字符串不算数——生成的 patch 必须真能被 `git apply` 吃下。
+    /// 只暂存第一个 hunk，索引里就该只有它那处改动。
+    #[test]
+    fn single_hunk_patch_applies_to_index() {
+        let orig: String = (1..=60).map(|i| format!("line{i}\n")).collect();
+        let mut lines: Vec<String> = orig.lines().map(|l| l.to_string()).collect();
+        lines[2] = "CHANGED-TOP".into();
+        lines[55] = "CHANGED-BOTTOM".into();
+        let modified: String = lines.iter().map(|l| format!("{l}\n")).collect();
+
+        let root = repo_with_change("apply", &orig, &modified);
+        let r = root.to_str().unwrap();
+        let out = run_git(r, &["diff", "HEAD", "--", "f.txt"]).unwrap();
+        let parsed = parse_diff(&String::from_utf8_lossy(&out.stdout));
+
+        let patch = hunk_patch(&parsed.header, &parsed.hunks[0]);
+        let applied = run_git_stdin(r, &["apply", "--cached", "-"], &patch).unwrap();
+        assert!(
+            applied.status.success(),
+            "单块 patch 被 git apply 拒绝：{}\n--- patch ---\n{patch}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+
+        // 索引里只有第一处改动，第二处仍留在工作区未暂存
+        let staged = run_git(r, &["diff", "--cached"]).unwrap();
+        let staged = String::from_utf8_lossy(&staged.stdout);
+        assert!(staged.contains("CHANGED-TOP"), "第一块没进索引");
+        assert!(!staged.contains("CHANGED-BOTTOM"), "第二块不该被一起暂存");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 末行无换行符时 git 会吐 `\ No newline at end of file`。这行不进 DiffLine，
+    /// 若 patch 从渲染结果反拼就会丢，apply 直接报 corrupt——必须留在 raw 里。
+    #[test]
+    fn patch_keeps_no_newline_marker() {
+        let root = repo_with_change("nonewline", "alpha\n", "beta");
+        let r = root.to_str().unwrap();
+        let out = run_git(r, &["diff", "HEAD", "--", "f.txt"]).unwrap();
+        let parsed = parse_diff(&String::from_utf8_lossy(&out.stdout));
+
+        let patch = hunk_patch(&parsed.header, &parsed.hunks[0]);
+        assert!(patch.contains("\\ No newline at end of file"), "patch 丢了无换行标记:\n{patch}");
+        let applied = run_git_stdin(r, &["apply", "--cached", "-"], &patch).unwrap();
+        assert!(
+            applied.status.success(),
+            "无换行结尾的 patch 被拒绝：{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 丢弃块走 `apply --reverse`（作用于工作区）：改动应从文件里消失。
+    #[test]
+    fn reverse_patch_discards_change_in_worktree() {
+        let root = repo_with_change("reverse", "alpha\nbravo\n", "alpha\nCHANGED\n");
+        let r = root.to_str().unwrap();
+        let out = run_git(r, &["diff", "HEAD", "--", "f.txt"]).unwrap();
+        let parsed = parse_diff(&String::from_utf8_lossy(&out.stdout));
+
+        let patch = hunk_patch(&parsed.header, &parsed.hunks[0]);
+        let applied = run_git_stdin(r, &["apply", "--reverse", "-"], &patch).unwrap();
+        assert!(
+            applied.status.success(),
+            "reverse apply 失败：{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        let text = std::fs::read_to_string(root.join("f.txt")).unwrap();
+        assert_eq!(text, "alpha\nbravo\n", "工作区没被还原");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
