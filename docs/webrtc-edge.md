@@ -100,3 +100,42 @@ hello | sessions | sessions_ok | open | pty | input | action | resize | state | 
 
 - 公网 VPS + 域名 TLS（signal + coturn）  
 - 无 VPS 则无法交付 W1 跨网主路径（局域网 HTTP 仍可用）  
+
+---
+
+## 浏览器实现选型（已定）
+
+| 层 | 选型 |
+|----|------|
+| 手机 WebRTC | **原生** `RTCPeerConnection` + `RTCDataChannel`（不引入 PeerJS / simple-peer） |
+| 信令 | 原生 `WebSocket`（`remote-web/src/transport/signaling.ts`） |
+| Mac Bridge | 后续 `webrtc-rs`（W0 spike） |
+
+### 前端脚手架（`feat/webrtc-edge`）
+
+```
+remote-web/src/transport/
+  types.ts       # 连接状态、ICE、信令消息
+  frames.ts      # DC 业务帧编解码 + base64
+  signaling.ts   # WSS 信令客户端
+  rtc-peer.ts    # 原生 PC + DC；parseRtcQuery
+  index.ts
+```
+
+局域网路径仍用现有 `api.ts` fetch/WS；跨网就绪后 UI 按 `?room=&k=&signal=` 走 `connectRtc`。
+
+### 信令线协议（与 `signaling.ts` 对齐）
+
+```json
+{ "op": "hello", "role": "client"|"host", "room": "...", "secret": "..." }
+{ "op": "hello_ok", "ice_servers": [{ "urls": "...", "username?", "credential?" }] }
+{ "op": "peer_joined", "role": "client"|"host" }
+{ "op": "signal", "from": "client"|"host", "payload": { "kind": "offer"|"answer"|"ice", ... } }
+{ "op": "err", "msg": "..." }
+{ "op": "ping" } / { "op": "pong" }
+```
+
+### DataChannel 标签
+
+- label: `smelt`
+- ordered: true  
