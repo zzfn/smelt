@@ -1,0 +1,19 @@
+[Unit]
+Description=smelt WebRTC signaling (no PTY)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/smelt/smelt-signal.env
+ExecStart=/usr/local/bin/smelt-signal
+Restart=on-failure
+RestartSec=2
+# 无业务数据；仍按最小权限跑
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

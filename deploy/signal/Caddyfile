@@ -1,0 +1,7 @@
+# 部署前把 signal.example.com 换成你的域名（A 记录 → 本机公网 IP）
+# sudo cp 到 /etc/caddy/Caddyfile 后: systemctl reload caddy
+
+signal.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:7878
+}

@@ -135,6 +135,32 @@ remote-web/src/transport/
 { "op": "ping" } / { "op": "pong" }
 ```
 
+### 信令服务（`crates/smelt-signal`，已实现）
+
+```bash
+cargo run -p smelt-signal
+# 默认 bind 127.0.0.1:7878
+```
+
+| 端点 | 作用 |
+|------|------|
+| `GET /health` | `{ ok, rooms }` |
+| `POST /v1/rooms` | body 可选 `{ "ttl_secs" }` → `{ room, secret, expires_at, ttl_secs, signal_ws }` |
+| `GET /ws` | 信令 WebSocket（上表协议） |
+
+环境变量：
+
+| 变量 | 默认 | 含义 |
+|------|------|------|
+| `SMELT_SIGNAL_BIND` | `127.0.0.1:7878` | 监听地址 |
+| `SMELT_ROOM_TTL_SECS` | `3600` | 房间默认存活 |
+| `SMELT_ICE_SERVERS` | Google 公共 STUN | JSON 数组，下发给 `hello_ok` |
+
+本地 dev 只给 STUN；生产把 coturn 写进 `SMELT_ICE_SERVERS`。房间内存存、短时效，进程重启清空。
+
+**公网部署（腾讯云 Ubuntu 等）：** 见 [`deploy/signal/README.md`](../deploy/signal/README.md)  
+（二进制 + systemd + Caddy → `https://域名/health`、`wss://域名/ws`）。
+
 ### DataChannel 标签
 
 - label: `smelt`

@@ -1,0 +1,25 @@
+[package]
+name = "smelt-signal"
+version.workspace = true
+edition.workspace = true
+description = "WebRTC 信令服务：房间 + SDP/ICE 转发，不碰 PTY（docs/webrtc-edge.md）"
+
+[[bin]]
+name = "smelt-signal"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8.9", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+dashmap = "6"
+futures-util = "0.3"
+base64 = "0.22"
