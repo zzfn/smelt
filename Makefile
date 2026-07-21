@@ -10,11 +10,11 @@ help: ## 显示可用命令
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-build: ## 编译 release 二进制（GUI + 守护必须一起）
-	cargo build --release --bin $(BIN) --bin $(DAEMON)
+build: ## 编译 release 二进制（GUI + 守护 + 跨网 bridge）
+	cargo build --release --bin $(BIN) --bin $(DAEMON) --bin smelt-bridge
 
-run: ## 本地直接跑 GUI（开发用；先保证 smeltd 与 workspace 同编）
-	cargo build --bin $(BIN) --bin $(DAEMON)
+run: ## 本地直接跑 GUI（开发用；先保证 smeltd / bridge 同编）
+	cargo build --bin $(BIN) --bin $(DAEMON) --bin smelt-bridge
 	cargo run --bin $(BIN)
 
 remote-web: ## 构建远程 H5（Preact CLI 面板 → remote-web/dist）

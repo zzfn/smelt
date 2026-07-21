@@ -23,10 +23,11 @@ MACOS="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
 BIN="$ROOT/target/release/$BIN_NAME"
 DAEMON_BIN="$ROOT/target/release/smeltd"   # 终端持久化守护（GUI 按同目录寻址拉起）
+BRIDGE_BIN="$ROOT/target/release/smelt-bridge"  # 跨网 WebRTC 桥（设置页「跨网」拉起）
 
 if [[ "${1:-}" == "--build" ]]; then
   echo "▶ 编译 release …"
-  cargo build --release --bin "$BIN_NAME" --bin smeltd
+  cargo build --release --bin "$BIN_NAME" --bin smeltd --bin smelt-bridge
 fi
 
 if [[ ! -f "$BIN" ]]; then
@@ -35,6 +36,10 @@ if [[ ! -f "$BIN" ]]; then
 fi
 if [[ ! -f "$DAEMON_BIN" ]]; then
   echo "✗ 找不到 ${DAEMON_BIN}（终端持久化守护），先：cargo build --release --bin smeltd" >&2
+  exit 1
+fi
+if [[ ! -f "$BRIDGE_BIN" ]]; then
+  echo "✗ 找不到 ${BRIDGE_BIN}（跨网 bridge），先：cargo build --release --bin smelt-bridge" >&2
   exit 1
 fi
 
@@ -69,6 +74,9 @@ chmod +x "$MACOS/$EXEC_NAME"
 # 守护与 GUI 同目录（GUI 用 current_exe().with_file_name("smeltd") 寻址拉起）。
 cp "$DAEMON_BIN" "$MACOS/smeltd"
 chmod +x "$MACOS/smeltd"
+# 跨网 bridge 与 GUI 同目录（设置页 resolve_smelt_bridge 按 current_exe 旁路找）
+cp "$BRIDGE_BIN" "$MACOS/smelt-bridge"
+chmod +x "$MACOS/smelt-bridge"
 
 # 图标（可选）：存在 assets/AppIcon.icns 就带上
 ICON_LINE=""
