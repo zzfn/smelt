@@ -15,7 +15,6 @@ use gpui::InteractiveElement;
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::text::TextView;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 
@@ -616,7 +615,7 @@ pub fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspac
                     .overflow_y_scroll()
                     .p_3()
                     .child(
-                        div().text_sm().text_color(fg).child(TextView::markdown(
+                        div().text_sm().text_color(fg).child(crate::markdown_mermaid::markdown_view(
                             "md-preview-body",
                             of.editor.read(cx).value().to_string(),
                         )),
@@ -1261,7 +1260,7 @@ impl Workspace {
             })
             .unwrap_or_else(|| path.clone());
         let msg = format!("@{rel} ");
-        if let Some(view) = self.cur().map(|s| s.active.clone()) {
+        if let Some(view) = self.cur().and_then(|s| s.active_term().cloned()) {
             view.update(cx, |tv, cx| tv.send_text(&msg, cx));
         }
     }
@@ -1281,7 +1280,7 @@ impl Workspace {
             })
             .unwrap_or_else(|| of.path.clone());
         let msg = format!("{rel} 里选中的这段：\n```\n{selected}\n```\n");
-        if let Some(view) = self.cur().map(|s| s.active.clone()) {
+        if let Some(view) = self.cur().and_then(|s| s.active_term().cloned()) {
             view.update(cx, |tv, cx| tv.send_text(&msg, cx));
         }
     }

@@ -291,8 +291,8 @@ smelt 不建数据库，状态都是本地小文件：
 目前只做 Mac。GPU 渲染依赖 Metal，暂时没有跨平台计划。
 
 **在哪反馈问题？**
-仓库还没有开放稳定的 issue 流程，先看 [README](https://github.com/smelt-ai/smelt) 或直接
-去看源码。
+去 [GitHub Issues](https://github.com/smelt-ai/smelt/issues/new/choose) 提，有 Bug 反馈
+和功能建议两个模板；应用内设置页「更新」tab 也有「反馈问题」快捷入口。
 
 **想从源码构建、了解内部架构、或者参与开发？**
 这些不算"怎么用"，单独整理在[开发文档](/develop)里。

@@ -19,3 +19,6 @@ dist/
 remote-web/node_modules/
 remote-web/dist/
 
+# 本地手测用的一次性文件
+/mermaid-test.md
+

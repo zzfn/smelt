@@ -230,7 +230,6 @@ fn truncate(s: &str, max_chars: usize) -> String {
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::table::{Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState};
-use gpui_component::text::TextView;
 use gpui_component::*;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -461,7 +460,7 @@ pub fn history_view(
                         div()
                             .text_sm()
                             .text_color(fg)
-                            .child(TextView::markdown(("turn-md", i), t.text.clone())),
+                            .child(crate::markdown_mermaid::markdown_view(("turn-md", i), t.text.clone())),
                     )
                     .children(tool_summary.map(|s| {
                         div().text_xs().text_color(muted).child(format!("🔧 {s}"))
@@ -603,7 +602,7 @@ fn memory_body(
                 div()
                     .w_full()
                     .min_w_0()
-                    .child(TextView::markdown("memory-md", m.body.clone())),
+                    .child(crate::markdown_mermaid::markdown_view("memory-md", m.body.clone())),
             )
             .into_any_element(),
     };

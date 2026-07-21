@@ -250,6 +250,16 @@ pub struct AgentUiConfig {
     /// 状态通道进入「等你批准 / 等你输入」时用 Notification 组件弹出。
     #[serde(default = "default_true")]
     pub notify_awaiting: bool,
+    /// ACP 会话的 agent 启动命令（空白分词）。默认 Claude 官方适配器；权限门保留
+    /// ——结构化审批正是这条通道的卖点，别在这里加 bypass 类参数。
+    #[serde(default = "default_acp_cmd")]
+    pub acp_cmd: String,
+}
+
+pub fn default_acp_cmd() -> String {
+    // bunx 由 smelt 解析到受管 bun（~/.smelt/runtime，首次自动下载，见 acp.rs）；
+    // 适配器锁版本——方言适配与回归测试都对着这个版本做，升级是主动行为。
+    "bunx @agentclientprotocol/claude-agent-acp@0.60.0".to_string()
 }
 
 impl Default for AgentUiConfig {
@@ -258,6 +268,7 @@ impl Default for AgentUiConfig {
             show_structure_panel: true,
             structure_panel_expanded: true,
             notify_awaiting: true,
+            acp_cmd: default_acp_cmd(),
         }
     }
 }
@@ -297,12 +308,17 @@ fn claude_settings_path() -> Option<std::path::PathBuf> {
 }
 
 const SMELT_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
     "PreToolUse",
     "PostToolUse",
+    "PostToolUseFailure",
     "PermissionRequest",
     "Notification",
     "UserPromptSubmit",
+    "SubagentStart",
+    "SubagentStop",
     "Stop",
+    "StopFailure",
     "SessionEnd",
 ];
 
@@ -1756,6 +1772,20 @@ impl Workspace {
                                             .on_mouse_down(MouseButton::Left, |_, _window, cx| {
                                                 cx.open_url("https://github.com/smelt-ai/smelt");
                                             }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-report-issue-link")
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .text_color(muted)
+                                            .hover(|s| s.text_color(fg))
+                                            .child("反馈问题 ↗")
+                                            .on_mouse_down(MouseButton::Left, |_, _window, cx| {
+                                                cx.open_url(
+                                                    "https://github.com/smelt-ai/smelt/issues/new/choose",
+                                                );
+                                            }),
                                     ),
                             )
                             .child(
@@ -1894,6 +1924,34 @@ impl Workspace {
                          （不依赖系统横幅）。",
                     )
                     .keywords(["通知", "notification", "审批"]),
+                )
+                .item(
+                    SettingItem::new(
+                        "ACP 启动命令",
+                        SettingField::input(
+                            |cx: &App| {
+                                cx.try_global::<AgentUiConfig>()
+                                    .map(|c| c.acp_cmd.clone())
+                                    .unwrap_or_else(default_acp_cmd)
+                                    .into()
+                            },
+                            |v: SharedString, cx: &mut App| {
+                                let v = v.trim().to_string();
+                                apply_agent_ui(
+                                    |c| {
+                                        c.acp_cmd =
+                                            if v.is_empty() { default_acp_cmd() } else { v.clone() }
+                                    },
+                                    cx,
+                                );
+                            },
+                        ),
+                    )
+                    .description(
+                        "「Claude 消息流」会话的 agent 启动命令（ACP 协议，空白分词）。\
+                         留空恢复默认；改动只影响之后新建的会话。",
+                    )
+                    .keywords(["acp", "消息流", "agent", "claude"]),
                 )
                 .item(SettingItem::render(move |_, _, cx: &mut App| {
                     let installed = claude_hooks_installed();

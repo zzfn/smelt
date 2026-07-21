@@ -1754,7 +1754,9 @@ pub fn git_view(
                 // 展开含 `flex-basis: 0%`，直接当 panel 的 child 会盖掉 panel 由
                 // ResizableState 管理的 flex_basis——组件文档专门把 flex_basis 列为
                 // 「调用方不许碰」的保留样式。包一层就把 flex_1 挡在里面了。
-                .child(resizable_panel().child(div().size_full().child(git_diff_pane(
+                // 这层必须是 .flex()：GPUI 的 div 默认 display: Block，flex_1 的
+                // 子节点在 Block 里高度塌成 auto（列表 0 高，整个 diff 不可见）。
+                .child(resizable_panel().child(div().size_full().flex().child(git_diff_pane(
                     &root,
                     git_diff,
                     split,
@@ -2907,7 +2909,7 @@ impl Workspace {
             msg.push_str(&format!("\n{comment}\n"));
         }
 
-        let target = self.cur().map(|s| s.active.clone());
+        let target = self.cur().and_then(|s| s.active_term().cloned());
         if let Some(view) = target {
             view.update(cx, |tv, cx| tv.send_text(&msg, cx));
         }

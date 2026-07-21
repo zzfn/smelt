@@ -53,34 +53,28 @@ fn run() -> Option<()> {
 fn map_hook_event(hook: &serde_json::Value) -> Option<(&'static str, Option<String>)> {
     let event = hook["hook_event_name"].as_str()?;
     match event {
+        // 会话刚起、hooks 链路第一次有机会发声——不上报的话，Idle 态和「hooks
+        // 根本没装/装的是旧配置/socket 连不上」在 UI 上长得一模一样；有这一条，
+        // DaemonStates 里出现记录本身就是「链路确认通了」的信号。
+        "SessionStart" => Some(("idle", None)),
         "UserPromptSubmit" => Some(("thinking", None)),
         "PreToolUse" => {
             // question 槽位复用为「当前工具」展示（结构面板 / 总览）。
-            let tool = hook["tool_name"].as_str().map(|t| {
-                // 尽量带一点路径/命令摘要
-                let input = &hook["tool_input"];
-                if let Some(cmd) = input["command"].as_str() {
-                    // 按字符截断，别按字节：cmd.len() 是字节数，&cmd[..48] 也是按字节
-                    // 切片——第 48 字节一旦落在中文/emoji 的多字节编码中间就会 panic
-                    // （byte index is not a char boundary），把整个 hook 打挂。
-                    let short = match cmd.char_indices().nth(48) {
-                        Some((end, _)) => format!("{}…", &cmd[..end]),
-                        None => cmd.to_string(),
-                    };
-                    format!("Bash: {short}")
-                } else if let Some(p) = input["file_path"]
-                    .as_str()
-                    .or_else(|| input["path"].as_str())
-                {
-                    let name = p.rsplit('/').next().unwrap_or(p);
-                    format!("{t}: {name}")
-                } else {
-                    t.to_string()
-                }
-            });
-            Some(("executing_tool", tool))
+            Some(("executing_tool", describe_tool_call(hook)))
         }
         "PostToolUse" => Some(("thinking", None)),
+        // 工具跑挂了：跟 PostToolUse 一样回到 thinking（agent 马上会看着错误决定
+        // 下一步），但 question 带上失败标记——不然「刚才那个工具是不是炸了」在
+        // UI 上完全看不出来，跟正常跑完长得一样。
+        "PostToolUseFailure" => {
+            let tool = hook["tool_name"].as_str().unwrap_or("工具");
+            let err = first_present_str(hook, &["error", "error_message", "tool_error", "reason"]);
+            let q = match err {
+                Some(e) => format!("⚠ {tool} 执行失败：{}", truncate_chars(e, 60)),
+                None => format!("⚠ {tool} 执行失败"),
+            };
+            Some(("thinking", Some(q)))
+        }
         // 独立的权限请求事件（比 Notification 更明确），见官方 hooks 文档。
         "PermissionRequest" => {
             let tool = hook["tool_name"].as_str().unwrap_or("");
@@ -98,10 +92,65 @@ fn map_hook_event(hook: &serde_json::Value) -> Option<(&'static str, Option<Stri
                 _ => None,
             }
         }
+        // agent 起了个子任务（比如 Task 工具）：这段时间之前完全是黑箱，只显示
+        // 笼统的 executing_tool；agent_type 是官方 hooks 字段（"Explore" /
+        // "security-reviewer" 这类），带上就知道具体在跑哪个子任务。
+        "SubagentStart" => {
+            let name = hook["agent_type"].as_str();
+            let q = match name {
+                Some(n) => format!("子任务：{n}"),
+                None => "运行子任务".to_string(),
+            };
+            Some(("executing_tool", Some(q)))
+        }
+        // 子任务做完，主 agent 回去汇总/继续思考。
+        "SubagentStop" => Some(("thinking", None)),
         "Stop" => Some(("waiting_for_user", None)),
+        // 回合因 API 错误中断，跟正常「说完了等你」（Stop）语义不同——同样落
+        // waiting_for_user（协议里没有更细的档位，见 status_color 只到五色），
+        // 但 question 标出「出错」，detail_line 上能看出差别，不会跟正常收尾混淆。
+        "StopFailure" => {
+            let reason = first_present_str(hook, &["error", "error_type", "reason"]);
+            let q = match reason {
+                Some(r) => format!("⚠ 因错误中断：{r}"),
+                None => "⚠ 因错误中断".to_string(),
+            };
+            Some(("waiting_for_user", Some(q)))
+        }
         "SessionEnd" => Some(("dead", None)),
         _ => None,
     }
+}
+
+/// PreToolUse 的「当前工具」摘要：尽量带点路径/命令细节。
+fn describe_tool_call(hook: &serde_json::Value) -> Option<String> {
+    let tool = hook["tool_name"].as_str()?;
+    let input = &hook["tool_input"];
+    Some(if let Some(cmd) = input["command"].as_str() {
+        format!("Bash: {}", truncate_chars(cmd, 48))
+    } else if let Some(p) = input["file_path"].as_str().or_else(|| input["path"].as_str()) {
+        let name = p.rsplit('/').next().unwrap_or(p);
+        format!("{tool}: {name}")
+    } else {
+        tool.to_string()
+    })
+}
+
+/// 按**字符**截断，不能按字节切：`&s[..n]` 是字节切片，第 n 字节一旦落在中文/
+/// emoji 的多字节编码中间就会 panic（byte index is not a char boundary）。
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_string(),
+    }
+}
+
+/// 依次尝试几个可能的字段名，返回第一个存在的字符串——官方文档没有给出
+/// `PostToolUseFailure`/`StopFailure` 的精确错误字段名，宽容读取：拿不到具体
+/// 错误文案就退化成通用提示，但「失败」这个事实本身来自 hook_event_name 自己，
+/// 不依赖猜中字段名，不会因为猜错而整条不上报。
+fn first_present_str<'a>(hook: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|k| hook[*k].as_str())
 }
 
 #[cfg(test)]
@@ -235,5 +284,82 @@ mod tests {
     #[test]
     fn missing_hook_event_name_is_ignored() {
         assert_eq!(map_hook_event(&json!({})), None);
+    }
+
+    #[test]
+    fn session_start_maps_to_idle() {
+        let hook = json!({ "hook_event_name": "SessionStart" });
+        assert_eq!(map_hook_event(&hook), Some(("idle", None)));
+    }
+
+    #[test]
+    fn subagent_start_carries_agent_type() {
+        let hook = json!({ "hook_event_name": "SubagentStart", "agent_type": "Explore" });
+        assert_eq!(map_hook_event(&hook), Some(("executing_tool", Some("子任务：Explore".to_string()))));
+    }
+
+    #[test]
+    fn subagent_start_without_agent_type_falls_back() {
+        let hook = json!({ "hook_event_name": "SubagentStart" });
+        assert_eq!(map_hook_event(&hook), Some(("executing_tool", Some("运行子任务".to_string()))));
+    }
+
+    #[test]
+    fn subagent_stop_maps_to_thinking() {
+        let hook = json!({ "hook_event_name": "SubagentStop" });
+        assert_eq!(map_hook_event(&hook), Some(("thinking", None)));
+    }
+
+    #[test]
+    fn post_tool_use_failure_carries_error_when_present() {
+        let hook = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "error": "command not found",
+        });
+        let (phase, q) = map_hook_event(&hook).unwrap();
+        assert_eq!(phase, "thinking");
+        assert_eq!(q.as_deref(), Some("⚠ Bash 执行失败：command not found"));
+    }
+
+    /// 官方字段名没有精确文档，宽容读取：这里故意不给 `error`，只给
+    /// `tool_error`，验证 first_present_str 会往下试。
+    #[test]
+    fn post_tool_use_failure_falls_back_to_alternate_field_name() {
+        let hook = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Write",
+            "tool_error": "permission denied",
+        });
+        let (_, q) = map_hook_event(&hook).unwrap();
+        assert_eq!(q.as_deref(), Some("⚠ Write 执行失败：permission denied"));
+    }
+
+    /// 一个错误字段都拿不到也不能整条不上报——「失败」这个事实来自
+    /// hook_event_name 本身，不依赖猜中字段名。
+    #[test]
+    fn post_tool_use_failure_without_any_known_field_still_reports() {
+        let hook = json!({ "hook_event_name": "PostToolUseFailure", "tool_name": "Bash" });
+        let (phase, q) = map_hook_event(&hook).unwrap();
+        assert_eq!(phase, "thinking");
+        assert_eq!(q.as_deref(), Some("⚠ Bash 执行失败"));
+    }
+
+    #[test]
+    fn stop_failure_differs_from_plain_stop() {
+        let hook = json!({ "hook_event_name": "StopFailure", "error_type": "rate_limit" });
+        let (phase, q) = map_hook_event(&hook).unwrap();
+        assert_eq!(phase, "waiting_for_user");
+        assert_eq!(q.as_deref(), Some("⚠ 因错误中断：rate_limit"));
+        // 跟正常 Stop 同一个 phase，但 question 不同——detail_line 上能看出区别，
+        // 不会跟「说完了等你」混淆。
+        assert_ne!(map_hook_event(&hook), map_hook_event(&json!({ "hook_event_name": "Stop" })));
+    }
+
+    #[test]
+    fn stop_failure_without_reason_still_flags_error() {
+        let hook = json!({ "hook_event_name": "StopFailure" });
+        let (_, q) = map_hook_event(&hook).unwrap();
+        assert_eq!(q.as_deref(), Some("⚠ 因错误中断"));
     }
 }

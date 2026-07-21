@@ -742,8 +742,7 @@ impl Workspace {
     /// 按 smeltd session id 查终端 cwd。
     fn cwd_for_session(&self, session_id: &str, cx: &App) -> Option<String> {
         for sess in &self.sessions {
-            let mut leaves = Vec::new();
-            crate::collect_leaves(&sess.layout, &mut leaves);
+            let leaves = sess.term_leaves();
             for leaf in leaves {
                 if leaf.read(cx).session_id() == session_id {
                     return leaf.read(cx).cwd();
@@ -1596,9 +1595,7 @@ impl Workspace {
 
         let mut found: Option<(usize, Entity<TerminalView>)> = None;
         for i in 0..self.sessions.len() {
-            let mut leaves = Vec::new();
-            crate::collect_leaves(&self.sessions[i].layout, &mut leaves);
-            for leaf in leaves {
+            for leaf in self.sessions[i].term_leaves() {
                 if leaf.read(cx).session_id() == sid {
                     found = Some((i, leaf));
                     break;
@@ -1630,7 +1627,7 @@ impl Workspace {
         });
 
         self.active_session = ix;
-        self.sessions[ix].active = leaf.clone();
+        self.sessions[ix].set_active_term(leaf.clone());
         self.view = crate::MainView::Terminal;
 
         if inject && !prompt.is_empty() {
@@ -1651,13 +1648,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         for i in 0..self.sessions.len() {
-            let mut leaves = Vec::new();
-            crate::collect_leaves(&self.sessions[i].layout, &mut leaves);
-            for leaf in leaves {
+            for leaf in self.sessions[i].term_leaves() {
                 if leaf.read(cx).session_id() == sid {
                     self.active_session = i;
                     self.view = crate::MainView::Terminal;
-                    self.sessions[i].active = leaf;
+                    self.sessions[i].set_active_term(leaf);
                     self.focus_active(window, cx);
                     cx.notify();
                     return true;
@@ -1729,8 +1724,7 @@ impl Workspace {
             // 会话还在：把首包打进该终端（右键新建仅创建后的「开跑」）
             let mut alive = false;
             for sess in &self.sessions {
-                let mut leaves = Vec::new();
-                crate::collect_leaves(&sess.layout, &mut leaves);
+                let leaves = sess.term_leaves();
                 if leaves.iter().any(|l| l.read(cx).session_id() == sid) {
                     alive = true;
                     break;

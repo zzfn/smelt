@@ -61,6 +61,8 @@ smelt 把终端——agent 真正干活的地方——变成主战场。
 - 文件树 + 文件名/内容搜索，内置编辑器（tree-sitter 语法高亮、行号、`Cmd+S` 保存）
 - Git diff 视图，字符级行内高亮
 - 代码热力图：从 `git log` 提炼改动热点（改得越勤、越近，分数越高）
+- Markdown 渲染（会话历史、ACP 对话、文件预览三处统一）支持 ```mermaid 代码块画图，
+  跟着亮暗主题走，纯 Rust 渲染不依赖浏览器/Node
 
 **远程访问**（默认关闭）
 - 开个开关拿一条链接，手机浏览器就能看本机 agent 会话的实时终端画面（真 xterm 渲染，TUI 正常显示）
@@ -139,6 +141,7 @@ cargo test
 Rust 2021 · [GPUI](https://github.com/zed-industries/zed) + [gpui-component](https://github.com/longbridge/gpui-component)
 · portable-pty（PTY）· alacritty_terminal（ANSI 状态机）· tokio · smol · similar（diff）
 · notify（文件监听）· reqwest · anyhow · axum（远程网关 HTTP/WS）· rust-embed（把手机端 H5 编进二进制）
+· rusty-mermaid（markdown 里的 mermaid 图渲染）
 
 手机端 H5：Preact + Tailwind + xterm.js（`remote-web/`，Vite 构建）。
 

@@ -70,5 +70,5 @@ smelt 只有两个二进制：
 
 ## 反馈与贡献
 
-仓库还没有开放稳定的 issue 流程，先看 [README](https://github.com/smelt-ai/smelt) 或
-直接去看源码。
+Bug / 功能建议去 [GitHub Issues](https://github.com/smelt-ai/smelt/issues/new/choose) 提，
+选对应模板即可；其他情况先看 [README](https://github.com/smelt-ai/smelt) 或直接去看源码。
