@@ -1,0 +1,54 @@
+name: "🐛 Bug 反馈"
+description: 报告一个 smelt 里遇到的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！信息越具体越好，方便定位问题。
+  - type: input
+    id: version
+    attributes:
+      label: smelt 版本
+      description: 设置页「更新」tab 顶部能看到，例如 v0.5.8
+      placeholder: v0.5.8
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS 版本 / 芯片
+      placeholder: 例如 macOS 15.1, Apple M2
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 越具体越好，最好能稳定复现
+      placeholder: |
+        1. 打开 ...
+        2. 点击 ...
+        3. 看到 ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: false
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为 / 报错信息
+      description: 如果有崩溃，可以贴 ~/.smelt/daemon.log 里相关的片段
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息（截图、日志等）
+    validations:
+      required: false

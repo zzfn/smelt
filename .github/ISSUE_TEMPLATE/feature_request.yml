@@ -1,0 +1,28 @@
+name: "💡 功能建议"
+description: 提一个 smelt 的新功能或改进想法
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提想法！尽量说清楚想解决的具体场景，方便评估。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题 / 使用场景
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的方案
+      description: 有具体想法可以描述一下，没有也没关系
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 有没有考虑过别的解决办法
+    validations:
+      required: false
