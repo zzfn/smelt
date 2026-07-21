@@ -6,7 +6,7 @@
 wss://<你的域名>/ws
 ```
 
-本目录默认方案：**本机二进制 + systemd + Caddy（自动 HTTPS）**。  
+**推荐：CI 打好的 Linux 二进制 + systemd + Caddy**（VPS **不用装 Rust**）。  
 进程只听 `127.0.0.1:7878`，外网只开 **80/443**。
 
 ---
@@ -15,7 +15,7 @@ wss://<你的域名>/ws
 
 | 项 | 说明 |
 |----|------|
-| 腾讯云 CVM | Ubuntu 22.04/24.04，有公网 IP |
+| 腾讯云 CVM | Ubuntu 22.04/24.04 **x86_64**，有公网 IP |
 | **域名** | A 记录指到该公网 IP（Let's Encrypt 必需；纯 IP 不好做正规 WSS） |
 | 安全组 | 入站放行 **TCP 80、443**（不必放行 7878） |
 
@@ -23,52 +23,87 @@ DNS 示例：`signal.example.com` → `1.2.3.4`。
 
 ---
 
-## 一键脚本（推荐）
+## 推荐：下载 GitHub Actions 产物
 
-在 **VPS** 上：
+CI 工作流：`.github/workflows/signal.yml`  
+每次 push 信令相关改动（或手动 Run workflow）会：
+
+1. 在 `ubuntu-latest` 编译 `smelt-signal`
+2. 发布到滚动 pre-release 标签 **`signal-nightly`**
+
+### 固定下载 URL
+
+把 `OWNER/REPO` 换成实际仓库（例如 `smelt-ai/smelt`）：
 
 ```bash
-# 1) 装依赖（首次）
+REPO=smelt-ai/smelt
+BASE="https://github.com/${REPO}/releases/download/signal-nightly"
+curl -fsSL -o smelt-signal -L \
+  "${BASE}/smelt-signal-x86_64-unknown-linux-gnu"
+curl -fsSL -o smelt-signal.sha256 -L \
+  "${BASE}/smelt-signal-x86_64-unknown-linux-gnu.sha256"
+# 可选校验
+sha256sum -c smelt-signal.sha256
+chmod +x smelt-signal
+sudo install -m 755 smelt-signal /usr/local/bin/smelt-signal
+```
+
+> 仓库若是 **private**：公开 URL 会 404，改用  
+> `gh release download signal-nightly -R OWNER/REPO -p 'smelt-signal*'`  
+>（需 `gh auth login` 或 `GH_TOKEN`）。
+
+### VPS 首次部署（无 Rust）
+
+```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config curl git
+sudo apt install -y curl ca-certificates
 
-# Rust（若还没有）
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
+# 1) 二进制（见上）
+REPO=smelt-ai/smelt
+BASE="https://github.com/${REPO}/releases/download/signal-nightly"
+curl -fsSL -o /tmp/smelt-signal -L \
+  "${BASE}/smelt-signal-x86_64-unknown-linux-gnu"
+sudo install -m 755 /tmp/smelt-signal /usr/local/bin/smelt-signal
 
-# Caddy（官方源）
-sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+# 2) 配置文件：可只 clone 本目录，或从仓库 curl 原材料
+#    若已 git clone：
+#    cd ~/smelt && git checkout feat/webrtc-edge
+sudo mkdir -p /etc/smelt
+sudo curl -fsSL -o /etc/smelt/smelt-signal.env \
+  "https://raw.githubusercontent.com/${REPO}/feat/webrtc-edge/deploy/signal/smelt-signal.env.example"
+sudo curl -fsSL -o /etc/systemd/system/smelt-signal.service \
+  "https://raw.githubusercontent.com/${REPO}/feat/webrtc-edge/deploy/signal/smelt-signal.service"
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now smelt-signal
+curl -sS http://127.0.0.1:7878/health
+# 期望：{"ok":true,"rooms":0}
+
+# 3) Caddy
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
   | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
   | sudo tee /etc/apt/sources.list.d/caddy-stable.list
 sudo apt update && sudo apt install -y caddy
 
-# 2) 拉代码并编译（只编信令，不碰 GUI）
-git clone <你的 smelt 仓库 URL> ~/smelt
-cd ~/smelt
-git checkout feat/webrtc-edge   # 或合并后的主分支
-cargo build -p smelt-signal --release
-
-# 3) 安装二进制 + systemd
-sudo install -m 755 target/release/smelt-signal /usr/local/bin/smelt-signal
-sudo mkdir -p /etc/smelt
-sudo cp deploy/signal/smelt-signal.env.example /etc/smelt/smelt-signal.env
-sudo cp deploy/signal/smelt-signal.service /etc/systemd/system/smelt-signal.service
-# 编辑环境文件（通常不用改 bind）
-sudo systemctl daemon-reload
-sudo systemctl enable --now smelt-signal
-curl -sS http://127.0.0.1:7878/health
-# 期望：{"ok":true,"rooms":0}
-
-# 4) Caddy 反代 + 自动证书
-# 把 Caddyfile 里的域名改成你的
-sudo cp deploy/signal/Caddyfile /etc/caddy/Caddyfile
+sudo curl -fsSL -o /etc/caddy/Caddyfile \
+  "https://raw.githubusercontent.com/${REPO}/feat/webrtc-edge/deploy/signal/Caddyfile"
 sudo sed -i 's/signal.example.com/你的真实域名/g' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 
-# 5) 公网探活
 curl -sS https://你的真实域名/health
+```
+
+### 升级二进制
+
+```bash
+REPO=smelt-ai/smelt
+BASE="https://github.com/${REPO}/releases/download/signal-nightly"
+curl -fsSL -o /tmp/smelt-signal -L \
+  "${BASE}/smelt-signal-x86_64-unknown-linux-gnu"
+sudo install -m 755 /tmp/smelt-signal /usr/local/bin/smelt-signal
+sudo systemctl restart smelt-signal
 ```
 
 建房试一下：
@@ -86,6 +121,20 @@ wss://你的真实域名/ws
 
 ---
 
+## 备选：在 VPS 上自己编译
+
+国内机房访问 `sh.rustup.rs` / crates.io 常很慢，需 [rsproxy](https://rsproxy.cn/) 等镜像。  
+一般 **不推荐**，优先用上面的 CI 二进制。
+
+```bash
+# 装好 rustup + cargo 镜像后
+git clone -b feat/webrtc-edge <repo> ~/smelt && cd ~/smelt
+cargo build -p smelt-signal --release
+sudo install -m 755 target/release/smelt-signal /usr/local/bin/smelt-signal
+```
+
+---
+
 ## 文件说明
 
 | 文件 | 作用 |
@@ -93,7 +142,8 @@ wss://你的真实域名/ws
 | `smelt-signal.service` | systemd 单元 |
 | `smelt-signal.env.example` | 环境变量模板 → `/etc/smelt/smelt-signal.env` |
 | `Caddyfile` | TLS + 反代到 127.0.0.1:7878 |
-| `Dockerfile` | 可选：容器构建（小机可先用二进制方案） |
+| `Dockerfile` | 可选：容器构建 |
+| `../.github/workflows/signal.yml` | CI 打 Linux 二进制 → `signal-nightly` |
 
 ---
 

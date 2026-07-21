@@ -1,0 +1,99 @@
+# 编译 smelt-signal（Linux x86_64），供腾讯云等 VPS 直接下载二进制部署。
+# 不编 GUI / smeltd，与 macOS DMG 的 release.yml 分离。
+#
+# 触发：手动 / push（main、feat/webrtc-edge，信令相关路径变更）
+#
+# 产物：
+#   1) Actions Artifact（保留 14 天）
+#   2) 滚动 pre-release 标签 signal-nightly（固定 curl URL，--clobber 覆盖）
+name: signal
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - feat/webrtc-edge
+    paths:
+      - "crates/smelt-signal/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/signal.yml"
+      - "deploy/signal/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          shared-key: smelt-signal-linux
+
+      - name: Build smelt-signal (release)
+        run: cargo build -p smelt-signal --release
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          BIN=target/release/smelt-signal
+          test -x "$BIN"
+          strip "$BIN" || true
+          OUT=smelt-signal-x86_64-unknown-linux-gnu
+          cp "$BIN" "$OUT"
+          chmod +x "$OUT"
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          ls -lh "$OUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smelt-signal-linux-x86_64
+          path: |
+            smelt-signal-x86_64-unknown-linux-gnu
+            smelt-signal-x86_64-unknown-linux-gnu.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      # 固定 URL（仓库公开时无需 token）：
+      #   https://github.com/<owner>/<repo>/releases/download/signal-nightly/smelt-signal-x86_64-unknown-linux-gnu
+      - name: Publish rolling pre-release (signal-nightly)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES="smelt-signal Linux x86_64 滚动构建
+
+          - commit: \`${GITHUB_SHA}\`
+          - ref: \`${GITHUB_REF_NAME}\`
+          - run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          \`\`\`bash
+          curl -fsSL -o smelt-signal -L \\
+            ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/signal-nightly/smelt-signal-x86_64-unknown-linux-gnu
+          chmod +x smelt-signal
+          sudo install -m 755 smelt-signal /usr/local/bin/smelt-signal
+          \`\`\`
+          "
+          if gh release view signal-nightly >/dev/null 2>&1; then
+            gh release edit signal-nightly --notes "$NOTES"
+          else
+            gh release create signal-nightly \
+              --prerelease \
+              --title "smelt-signal nightly (Linux)" \
+              --notes "$NOTES"
+          fi
+          gh release upload signal-nightly \
+            smelt-signal-x86_64-unknown-linux-gnu \
+            smelt-signal-x86_64-unknown-linux-gnu.sha256 \
+            --clobber

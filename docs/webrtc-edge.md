@@ -159,7 +159,10 @@ cargo run -p smelt-signal
 本地 dev 只给 STUN；生产把 coturn 写进 `SMELT_ICE_SERVERS`。房间内存存、短时效，进程重启清空。
 
 **公网部署（腾讯云 Ubuntu 等）：** 见 [`deploy/signal/README.md`](../deploy/signal/README.md)  
-（二进制 + systemd + Caddy → `https://域名/health`、`wss://域名/ws`）。
+（推荐 CI 产物 + systemd + Caddy → `https://域名/health`、`wss://域名/ws`）。
+
+CI：`.github/workflows/signal.yml` → 滚动 release 标签 `signal-nightly`  
+下载：`.../releases/download/signal-nightly/smelt-signal-x86_64-unknown-linux-gnu`
 
 ### DataChannel 标签
 
