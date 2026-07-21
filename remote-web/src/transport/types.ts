@@ -6,6 +6,7 @@ export type RtcConnPhase =
   | "ice"
   | "connected"
   | "relay" // ICE 选中 relay 时可由上层标
+  | "reconnecting" // 换网 / 断线后自动重连
   | "failed"
   | "closed";
 
@@ -47,5 +48,6 @@ export type RtcConnectOptions = {
   write?: boolean;
   onPhase?: (phase: RtcConnPhase, detail?: string) => void;
   onFrame?: (raw: string) => void;
+  /** 非主动 close 时的断线（换网 / PC failed / DC 关） */
   onClose?: (reason: string) => void;
 };

@@ -1,9 +1,8 @@
 /**
  * 浏览器原生 WebRTC（RTCPeerConnection + RTCDataChannel）。
- * 无 simple-peer / PeerJS；信令经外部 WebSocket 注入。
+ * 角色：手机端为 **client**（peer_joined host 后发 offer）。
  *
- * 角色：手机端为 **client**（收 offer 或发 offer 由协议约定；此处 client 在
- * peer_joined 后创建 offer，host/bridge 回 answer）。
+ * 主动 close() 不会触发 onClose；意外断线会触发 onClose，供上层自动重连。
  */
 
 import { connectSignaling, iceServersFromHello } from "./signaling";
@@ -13,9 +12,7 @@ import { encodeFrame, type DcFrame } from "./frames";
 const DC_LABEL = "smelt";
 
 export type RtcSession = {
-  /** DataChannel 就绪后可发业务帧 */
   sendFrame: (frame: DcFrame) => void;
-  /** 原始字符串（已 JSON） */
   sendRaw: (raw: string) => void;
   close: () => void;
   getPhase: () => RtcConnPhase;
@@ -23,9 +20,18 @@ export type RtcSession = {
 
 export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
   let phase: RtcConnPhase = "idle";
+  let intentionalClose = false;
+
   const setPhase = (p: RtcConnPhase, detail?: string) => {
     phase = p;
     opts.onPhase?.(p, detail);
+  };
+
+  const fail = (reason: string) => {
+    if (intentionalClose) return;
+    if (phase === "failed" || phase === "closed") return;
+    setPhase("failed", reason);
+    opts.onClose?.(reason);
   };
 
   setPhase("signaling");
@@ -50,17 +56,15 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       void handleSignal(msg);
     },
     onClose() {
-      if (phase !== "closed" && phase !== "failed") {
-        setPhase("failed", "signaling closed");
-        opts.onClose?.("signaling closed");
-      }
+      if (!intentionalClose) fail("signaling closed");
     },
     onError() {
-      setPhase("failed", "signaling error");
+      if (!intentionalClose) fail("signaling error");
     },
   });
 
   async function handleSignal(msg: SignalingMessage) {
+    if (intentionalClose) return;
     switch (msg.op) {
       case "hello_ok": {
         iceServers = iceServersFromHello(msg);
@@ -69,7 +73,6 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       }
       case "peer_joined": {
         if (msg.role === "host") {
-          // Bridge 上线或重连：整页新 PC + 新 offer（避免复用旧 ICE）
           resetPc();
           ensurePc();
           await createAndSendOffer();
@@ -78,8 +81,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       }
       case "peer_left": {
         if (msg.role === "host") {
-          setPhase("failed", "host left");
-          opts.onClose?.("host left");
+          fail("host left");
         }
         break;
       }
@@ -89,8 +91,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
         break;
       }
       case "err": {
-        setPhase("failed", msg.msg);
-        opts.onClose?.(msg.msg);
+        fail(msg.msg);
         break;
       }
       case "ping":
@@ -124,6 +125,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     pc = new RTCPeerConnection({ iceServers });
 
     pc.onicecandidate = (ev) => {
+      if (intentionalClose) return;
       const payload: SignalPayload = ev.candidate
         ? { kind: "ice", candidate: ev.candidate.toJSON() }
         : { kind: "ice", candidate: null };
@@ -131,25 +133,32 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     };
 
     pc.onconnectionstatechange = () => {
+      if (intentionalClose) return;
       const s = pc?.connectionState;
       if (s === "connected") setPhase("connected");
-      else if (s === "failed") {
-        setPhase("failed", "pc failed");
-        opts.onClose?.("peer connection failed");
-      } else if (s === "closed" || s === "disconnected") {
-        if (phase === "connected") {
-          setPhase("closed");
-          opts.onClose?.("disconnected");
-        }
+      else if (s === "failed") fail("peer connection failed");
+      else if (s === "disconnected") {
+        // 换网常见：先 disconnected，稍后可能 failed 或自己恢复；给宽限
+        setPhase("ice", "disconnected");
+        window.setTimeout(() => {
+          if (intentionalClose) return;
+          if (pc?.connectionState === "disconnected" || pc?.connectionState === "failed") {
+            fail("peer disconnected");
+          }
+        }, 4000);
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      if (intentionalClose) return;
+      const s = pc?.iceConnectionState;
+      if (s === "failed") fail("ice failed");
+    };
+
     pc.ondatachannel = (ev) => {
-      // 若 host 创建 channel
       wireDc(ev.channel);
     };
 
-    // client 主动建 channel（与 bridge 约定：client create）
     const channel = pc.createDataChannel(DC_LABEL, {
       ordered: true,
     });
@@ -160,8 +169,8 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     dc = channel;
     channel.binaryType = "arraybuffer";
     channel.onopen = () => {
+      if (intentionalClose) return;
       setPhase("connected");
-      // 业务握手
       sendRaw(
         encodeFrame({
           t: "hello",
@@ -174,15 +183,13 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       if (typeof ev.data === "string") {
         opts.onFrame?.(ev.data);
       } else if (ev.data instanceof ArrayBuffer) {
-        // 预留：二进制 pty 帧
         const text = new TextDecoder().decode(ev.data);
         opts.onFrame?.(text);
       }
     };
     channel.onclose = () => {
-      if (phase !== "closed") {
-        setPhase("closed");
-        opts.onClose?.("datachannel closed");
+      if (!intentionalClose && phase !== "closed") {
+        fail("datachannel closed");
       }
     };
   }
@@ -255,6 +262,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
   }
 
   function close() {
+    intentionalClose = true;
     setPhase("closed");
     resetPc();
     signal.close();
@@ -271,7 +279,6 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
 /**
  * 从 URL query 解析跨网参数：
  *   ?room=AB12&k=secret&signal=wss%3A%2F%2F...
- * token 仍可用 smelt 的 token= 或 room secret 衍生（bridge 侧校验）。
  */
 export function parseRtcQuery(
   search: string = location.search,

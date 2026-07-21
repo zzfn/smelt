@@ -193,6 +193,11 @@ SMELT_SIGNAL_HTTP=https://signal.zhyqhxb.fun \
 | `SMELT_GATEWAY_TOKEN` | **必填** |
 | `SMELT_SHARE_BASE` | 默认 = `SMELT_SIGNAL_HTTP/` |
 
+### 换网 / 断线（手机）
+
+SPA 会自动重连：检测 PC/ICE/DC/信令断开与 `online` 事件 → 退避重建信令+WebRTC → `hello` 后 **重新 open 已打开的终端**。  
+Mac bridge 侧每次新 offer 新建 PC（见 reconnect fix）。顶栏显示「网络变化，正在重连…」。
+
 ### DataChannel 标签
 
 - label: `smelt`
