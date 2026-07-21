@@ -765,112 +765,31 @@ fn spawn_webrtc_start(cx: &mut App) {
     });
 
     cx.spawn(async move |cx| {
+        // GPUI 的 background executor 不是 tokio。reqwest 的 .await 必须在临时
+        // current-thread runtime 里 block_on，否则会 panic「no reactor running」
+        // （表现为 Option::expect_failed，直接把 GUI 崩掉）。套路同 pet.rs / updater.rs。
         let result = cx
             .background_executor()
             .spawn(async move {
-                // 0) 本机远程网关（阻塞 unix socket，必须在后台）
-                let status = if let Some(t) = existing_token {
-                    // 已有 token 时仍探测 addr；若空再 start
-                    let cur = terminal::remote_status();
-                    if cur.token.as_ref().is_some_and(|x| !x.is_empty()) {
-                        cur
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    webrtc_start_blocking(
+                        existing_token,
+                        existing_addr,
+                        write,
+                        signal_http,
+                        bridge_bin,
+                    )
+                }))
+                .unwrap_or_else(|payload| {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
                     } else {
-                        terminal::RemoteStatus {
-                            running: true,
-                            token: Some(t),
-                            addr: existing_addr,
-                            write,
-                        }
-                    }
-                } else {
-                    terminal::remote_start("127.0.0.1", write)
-                        .map_err(|e| format!("开启本机远程失败：{e}"))?
-                };
-                let token = status
-                    .token
-                    .filter(|t| !t.is_empty())
-                    .ok_or_else(|| "本机远程网关没有 token".to_string())?;
-                let gateway_base = status
-                    .addr
-                    .as_ref()
-                    .map(|a| {
-                        if a.starts_with("http") {
-                            a.clone()
-                        } else {
-                            format!("http://{a}")
-                        }
-                    })
-                    .unwrap_or_else(|| "http://127.0.0.1:18765".into());
-
-                let Some(bridge) = bridge_bin else {
-                    return Err(
-                        "找不到 smelt-bridge。请 make dist-build 安装，或 cargo build -p smelt-bridge。"
-                            .into(),
-                    );
-                };
-
-                // 1) 公网信令建房
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(20))
-                    .build()
-                    .map_err(|e| e.to_string())?;
-                let room_url = format!("{signal_http}/v1/rooms");
-                let resp = client
-                    .post(&room_url)
-                    .header("content-type", "application/json")
-                    .body("{}")
-                    .send()
-                    .await
-                    .map_err(|e| format!("连信令失败（{signal_http}）：{e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!(
-                        "建房失败 HTTP {}：{}",
-                        resp.status(),
-                        resp.text().await.unwrap_or_default()
-                    ));
-                }
-                #[derive(serde::Deserialize)]
-                struct Room {
-                    room: String,
-                    secret: String,
-                }
-                let room: Room = resp.json().await.map_err(|e| e.to_string())?;
-                let signal_ws = {
-                    let u = signal_http
-                        .replacen("https://", "wss://", 1)
-                        .replacen("http://", "ws://", 1);
-                    format!("{u}/ws")
-                };
-                let share = format!(
-                    "{signal_http}/?room={}&k={}&signal={}&token={}",
-                    urlencoding_minimal(&room.room),
-                    urlencoding_minimal(&room.secret),
-                    urlencoding_minimal(&signal_ws),
-                    urlencoding_minimal(&token),
-                );
-
-                // 2) 拉起 bridge
-                let mut cmd = std::process::Command::new(&bridge);
-                cmd.env("SMELT_SIGNAL_HTTP", &signal_http)
-                    .env("SMELT_SIGNAL_WS", &signal_ws)
-                    .env("SMELT_GATEWAY", &gateway_base)
-                    .env("SMELT_GATEWAY_TOKEN", &token)
-                    .env("SMELT_ROOM", &room.room)
-                    .env("SMELT_SECRET", &room.secret)
-                    .env("SMELT_WRITE", if write { "true" } else { "false" })
-                    .env("RUST_LOG", "info")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                let child = cmd
-                    .spawn()
-                    .map_err(|e| format!("启动 smelt-bridge 失败：{e}"))?;
-                let pid = child.id();
-                std::mem::forget(child);
-
-                // 3) RGB 二维码（后台生成，勿在 UI 线程）
-                let qr = qr_png_for_url(&share);
-                Ok((share, pid, qr, token, status.addr, status.write))
+                        "WebRTC 启动过程中发生内部错误".into()
+                    };
+                    Err(format!("跨网启动崩溃（已拦截）：{msg}"))
+                })
             })
             .await;
 
@@ -906,6 +825,129 @@ fn spawn_webrtc_start(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// 在后台线程同步跑完整条 WebRTC 启动链（网关 → 信令建房 → bridge → QR）。
+/// 所有 reqwest 调用包在临时 tokio current-thread runtime 里，避免「no reactor」。
+fn webrtc_start_blocking(
+    existing_token: Option<String>,
+    existing_addr: Option<String>,
+    write: bool,
+    signal_http: String,
+    bridge_bin: Option<std::path::PathBuf>,
+) -> Result<(String, u32, Option<Vec<u8>>, String, Option<String>, bool), String> {
+    // 0) 本机远程网关（阻塞 unix socket）
+    let status = if let Some(t) = existing_token {
+        let cur = terminal::remote_status();
+        if cur.token.as_ref().is_some_and(|x| !x.is_empty()) {
+            cur
+        } else {
+            terminal::RemoteStatus {
+                running: true,
+                token: Some(t),
+                addr: existing_addr,
+                write,
+            }
+        }
+    } else {
+        terminal::remote_start("127.0.0.1", write)
+            .map_err(|e| format!("开启本机远程失败：{e}"))?
+    };
+    let token = status
+        .token
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "本机远程网关没有 token".to_string())?;
+    let gateway_base = status
+        .addr
+        .as_ref()
+        .map(|a| {
+            if a.starts_with("http") {
+                a.clone()
+            } else {
+                format!("http://{a}")
+            }
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:18765".into());
+
+    let Some(bridge) = bridge_bin else {
+        return Err(
+            "找不到 smelt-bridge。请 make dist-build 安装，或 cargo build -p smelt-bridge。"
+                .into(),
+        );
+    };
+
+    // 1) 公网信令建房（reqwest 需要 tokio runtime）
+    #[derive(serde::Deserialize)]
+    struct Room {
+        room: String,
+        secret: String,
+    }
+    let room: Room = {
+        let signal_http = signal_http.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("无法创建网络运行时：{e}"))?;
+        rt.block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let room_url = format!("{signal_http}/v1/rooms");
+            let resp = client
+                .post(&room_url)
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await
+                .map_err(|e| format!("连信令失败（{signal_http}）：{e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "建房失败 HTTP {}：{}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+            resp.json::<Room>().await.map_err(|e| e.to_string())
+        })?
+    };
+
+    let signal_ws = {
+        let u = signal_http
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        format!("{u}/ws")
+    };
+    let share = format!(
+        "{signal_http}/?room={}&k={}&signal={}&token={}",
+        urlencoding_minimal(&room.room),
+        urlencoding_minimal(&room.secret),
+        urlencoding_minimal(&signal_ws),
+        urlencoding_minimal(&token),
+    );
+
+    // 2) 拉起 bridge
+    let mut cmd = std::process::Command::new(&bridge);
+    cmd.env("SMELT_SIGNAL_HTTP", &signal_http)
+        .env("SMELT_SIGNAL_WS", &signal_ws)
+        .env("SMELT_GATEWAY", &gateway_base)
+        .env("SMELT_GATEWAY_TOKEN", &token)
+        .env("SMELT_ROOM", &room.room)
+        .env("SMELT_SECRET", &room.secret)
+        .env("SMELT_WRITE", if write { "true" } else { "false" })
+        .env("RUST_LOG", "info")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("启动 smelt-bridge 失败：{e}"))?;
+    let pid = child.id();
+    std::mem::forget(child);
+
+    // 3) RGB 二维码（后台生成，勿在 UI 线程）
+    let qr = qr_png_for_url(&share);
+    Ok((share, pid, qr, token, status.addr, status.write))
 }
 
 fn urlencoding_minimal(s: &str) -> String {
@@ -1055,33 +1097,35 @@ pub fn apply_write_toggle(enabled: bool, cx: &mut App) {
 }
 
 /// 分享卡片上的「重试」：按当前配置把网关 / 隧道 / WebRTC 重新拉齐。
+/// 与 [`apply_write_toggle`] 相同：WebRTC 与 CF 隧道可同时开，必须各自独立
+/// 重启，不能 if/else 只走一路（否则另一路仍挂旧 token/端口）。
 pub fn retry_remote_setup(cx: &mut App) {
-    let c = cx.global::<RemoteConfig>().clone();
+    let mut c = cx.global::<RemoteConfig>().clone();
     if !c.enabled && !c.tunnel_enabled && !c.webrtc_enabled {
         return;
     }
+    // 外网通道开着时确保总开关也开着（依赖由这里消化）
+    if c.tunnel_enabled || c.webrtc_enabled {
+        c.enabled = true;
+        save_remote_config(&c);
+        cx.set_global(c.clone());
+    }
     let write = c.write_enabled;
+
     if c.webrtc_enabled {
-        let mut cfg = c;
-        cfg.enabled = true;
-        cfg.webrtc_enabled = true;
-        save_remote_config(&cfg);
-        cx.set_global(cfg);
         stop_webrtc_bridge(cx);
-        set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
-        spawn_webrtc_start(cx);
-    } else if c.tunnel_enabled {
-        let mut cfg = c;
-        cfg.enabled = true;
-        cfg.tunnel_enabled = true;
-        save_remote_config(&cfg);
-        cx.set_global(cfg);
+    }
+    if c.tunnel_enabled {
         terminal::tunnel_stop();
-        terminal::remote_stop();
-        set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
+    }
+    // 网关先停再起，让 token/端口与两条外网通道对齐
+    terminal::remote_stop();
+    set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
+    if c.tunnel_enabled {
         spawn_tunnel_start(write, cx);
-    } else if c.enabled {
-        set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
+    }
+    if c.webrtc_enabled {
+        spawn_webrtc_start(cx);
     }
 }
 
