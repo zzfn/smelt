@@ -9,7 +9,7 @@ resolver = "3"
 # 版本号唯一真源：发版只改这里（scripts/package-mac.sh 与 release CI 都
 # grep 本文件的 '^version' 行做校验），各成员 version.workspace = true 继承。
 [workspace.package]
-version = "0.5.7"
+version = "0.5.8"
 edition = "2024"
 
 # 老版 objc 0.2 的 msg_send!/class! 宏展开带 cfg(feature="cargo-clippy")，新 Rust 的
