@@ -666,24 +666,22 @@ fn resolve_smelt_bridge() -> Option<std::path::PathBuf> {
     None
 }
 
+/// 生成 RGB PNG（避免 L8 灰度图在 GPUI/Metal 解码时 abort）。
 fn qr_png_for_url(url: &str) -> Option<Vec<u8>> {
-    use image::ImageEncoder;
     use qrcode::QrCode;
     let code = QrCode::new(url.as_bytes()).ok()?;
-    let img = code
+    let luma = code
         .render::<image::Luma<u8>>()
         .dark_color(image::Luma([0u8]))
         .light_color(image::Luma([255u8]))
         .min_dimensions(160, 160)
         .quiet_zone(true)
         .build();
+    let rgb = image::DynamicImage::ImageLuma8(luma).into_rgb8();
     let mut buf = Vec::new();
-    let enc = image::codecs::png::PngEncoder::new(&mut buf);
-    enc.write_image(
-        img.as_raw(),
-        img.width(),
-        img.height(),
-        image::ExtendedColorType::L8,
+    rgb.write_to(
+        &mut std::io::Cursor::new(&mut buf),
+        image::ImageFormat::Png,
     )
     .ok()?;
     Some(buf)
@@ -694,15 +692,19 @@ fn stop_webrtc_bridge(cx: &mut App) {
         .try_global::<WebrtcRuntimeState>()
         .and_then(|s| s.bridge_pid)
     {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+        // 只杀我们拉起的 bridge，勿误伤自己
+        let self_pid = std::process::id();
+        if pid != 0 && pid != self_pid {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
         }
     }
     cx.set_global(WebrtcRuntimeState::default());
 }
 
-/// 开关「跨网 WebRTC」：确保本机网关 + 拉 smelt-bridge，生成 signal 同域分享链接。
+/// 开关「跨网 WebRTC」：只改配置 + 异步拉 bridge（不在 UI 线程阻塞/建房）。
 pub fn apply_webrtc_toggle(enabled: bool, cx: &mut App) {
     let mut c = cx.global::<RemoteConfig>().clone();
     c.webrtc_enabled = enabled;
@@ -710,59 +712,44 @@ pub fn apply_webrtc_toggle(enabled: bool, cx: &mut App) {
         c.enabled = true;
     }
     save_remote_config(&c);
-    cx.set_global(c.clone());
+    cx.set_global(c);
 
     if !enabled {
         stop_webrtc_bridge(cx);
+        cx.refresh_windows();
         return;
     }
 
-    let write = c.write_enabled;
-    if !cx
-        .global::<RemoteRuntimeState>()
-        .token
-        .as_ref()
-        .is_some_and(|t| !t.is_empty())
-    {
-        set_remote_from_start_result(terminal::remote_start("127.0.0.1", write), cx);
-    }
+    // 全部放到后台：remote_start / HTTP 建房 / spawn bridge，避免卡 UI 或跨 FFI panic
     spawn_webrtc_start(cx);
+    cx.refresh_windows();
 }
 
 fn spawn_webrtc_start(cx: &mut App) {
-    stop_webrtc_bridge(cx);
-    let cfg = cx.global::<RemoteConfig>().clone();
-    let token = cx
-        .global::<RemoteRuntimeState>()
-        .token
-        .clone()
-        .filter(|t| !t.is_empty());
-    let Some(token) = token else {
-        cx.set_global(WebrtcRuntimeState {
-            connecting: false,
-            share_url: None,
-            error: Some("本机远程网关还没有密钥，请先打开「开启远程」".into()),
-            bridge_pid: None,
-            qr_png: None,
-        });
-        return;
-    };
-
-    let signal_http = cfg.signal_http.trim_end_matches('/').to_string();
-    let write = cfg.write_enabled;
-    let bridge_bin = resolve_smelt_bridge();
-    let gateway_base = cx
-        .global::<RemoteRuntimeState>()
-        .addr
-        .as_ref()
-        .map(|a| {
-            if a.starts_with("http") {
-                a.clone()
-            } else {
-                format!("http://{a}")
+    // 先停旧 bridge（清 pid）
+    if let Some(old) = cx.try_global::<WebrtcRuntimeState>().cloned() {
+        if let Some(pid) = old.bridge_pid {
+            let self_pid = std::process::id();
+            if pid != 0 && pid != self_pid {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
             }
-        })
-        .unwrap_or_else(|| "http://127.0.0.1:18765".into());
+        }
+    }
+
+    let cfg = cx.global::<RemoteConfig>().clone();
+    let existing_token = cx
+        .try_global::<RemoteRuntimeState>()
+        .and_then(|r| r.token.clone())
+        .filter(|t| !t.is_empty());
+    let existing_addr = cx
+        .try_global::<RemoteRuntimeState>()
+        .and_then(|r| r.addr.clone());
+    let write = cfg.write_enabled;
+    let signal_http = cfg.signal_http.trim_end_matches('/').to_string();
+    let bridge_bin = resolve_smelt_bridge();
 
     cx.set_global(WebrtcRuntimeState {
         connecting: true,
@@ -776,13 +763,48 @@ fn spawn_webrtc_start(cx: &mut App) {
         let result = cx
             .background_executor()
             .spawn(async move {
+                // 0) 本机远程网关（阻塞 unix socket，必须在后台）
+                let status = if let Some(t) = existing_token {
+                    // 已有 token 时仍探测 addr；若空再 start
+                    let cur = terminal::remote_status();
+                    if cur.token.as_ref().is_some_and(|x| !x.is_empty()) {
+                        cur
+                    } else {
+                        terminal::RemoteStatus {
+                            running: true,
+                            token: Some(t),
+                            addr: existing_addr,
+                            write,
+                        }
+                    }
+                } else {
+                    terminal::remote_start("127.0.0.1", write)
+                        .map_err(|e| format!("开启本机远程失败：{e}"))?
+                };
+                let token = status
+                    .token
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| "本机远程网关没有 token".to_string())?;
+                let gateway_base = status
+                    .addr
+                    .as_ref()
+                    .map(|a| {
+                        if a.starts_with("http") {
+                            a.clone()
+                        } else {
+                            format!("http://{a}")
+                        }
+                    })
+                    .unwrap_or_else(|| "http://127.0.0.1:18765".into());
+
                 let Some(bridge) = bridge_bin else {
                     return Err(
-                        "找不到 smelt-bridge。开发：cargo build -p smelt-bridge；发版请随 app 打包。"
+                        "找不到 smelt-bridge。请 make dist-build 安装，或 cargo build -p smelt-bridge。"
                             .into(),
                     );
                 };
-                // 1) 在公网信令上建房
+
+                // 1) 公网信令建房
                 let client = reqwest::Client::builder()
                     .timeout(Duration::from_secs(20))
                     .build()
@@ -822,7 +844,7 @@ fn spawn_webrtc_start(cx: &mut App) {
                     urlencoding_minimal(&token),
                 );
 
-                // 2) 拉起 bridge（预置房间）
+                // 2) 拉起 bridge
                 let mut cmd = std::process::Command::new(&bridge);
                 cmd.env("SMELT_SIGNAL_HTTP", &signal_http)
                     .env("SMELT_SIGNAL_WS", &signal_ws)
@@ -835,18 +857,28 @@ fn spawn_webrtc_start(cx: &mut App) {
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
-                let child = cmd.spawn().map_err(|e| format!("启动 smelt-bridge 失败：{e}"))?;
+                let child = cmd
+                    .spawn()
+                    .map_err(|e| format!("启动 smelt-bridge 失败：{e}"))?;
                 let pid = child.id();
-                // 泄漏 Child：用 pid 管理生命周期
                 std::mem::forget(child);
+
+                // 3) RGB 二维码（后台生成，勿在 UI 线程）
                 let qr = qr_png_for_url(&share);
-                Ok((share, pid, qr))
+                Ok((share, pid, qr, token, status.addr, status.write))
             })
             .await;
 
         let _ = cx.update(|cx| {
             match result {
-                Ok((share, pid, qr)) => {
+                Ok((share, pid, qr, token, addr, write)) => {
+                    // 回填网关状态（可能是这次才 remote_start 的）
+                    cx.set_global(RemoteRuntimeState {
+                        token: Some(token),
+                        addr,
+                        write,
+                        error: None,
+                    });
                     cx.set_global(WebrtcRuntimeState {
                         connecting: false,
                         share_url: Some(share),
@@ -2542,31 +2574,30 @@ impl Workspace {
                     };
 
                     let primary_copy = primary.clone();
-                    let qr_png = if webrtc_url.is_some() {
-                        webrtc.qr_png.clone()
-                    } else {
-                        qr_png_for_url(&primary)
-                    };
+                    // 仅展示后台预生成的 RGB 二维码（绝不在 UI 线程现算 QR）
+                    let qr_png = webrtc.qr_png.clone().filter(|_| webrtc_url.is_some());
 
                     let mut card = v_flex().gap_2();
 
                     // 二维码 + 链接区
                     let mut row = h_flex().items_start().gap_3();
                     if let Some(png) = qr_png {
-                        row = row.child(
-                            div()
-                                .p_2()
-                                .rounded(px(8.))
-                                .bg(gpui::white())
-                                .child(
-                                    img(std::sync::Arc::new(Image::from_bytes(
-                                        ImageFormat::Png,
-                                        png,
-                                    )))
-                                    .w(px(132.))
-                                    .h(px(132.)),
-                                ),
-                        );
+                        if !png.is_empty() {
+                            row = row.child(
+                                div()
+                                    .p_2()
+                                    .rounded(px(8.))
+                                    .bg(gpui::rgb(0xffffff))
+                                    .child(
+                                        img(std::sync::Arc::new(Image::from_bytes(
+                                            ImageFormat::Png,
+                                            png,
+                                        )))
+                                        .w(px(132.))
+                                        .h(px(132.)),
+                                    ),
+                            );
+                        }
                     }
                     row = row.child(
                         v_flex()
