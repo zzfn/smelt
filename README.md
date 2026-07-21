@@ -101,7 +101,7 @@ smelt 把终端——agent 真正干活的地方——变成主战场。
 `runtime_shaders` feature 把 Metal 着色器改到运行时编译，只装 Command Line Tools 即可。
 
 ```sh
-cargo run --bin workspace   # 开发模式直接跑 GUI
+cargo run --bin smelt       # 开发模式直接跑 GUI
 make dist-build             # 编译 release 并打包出 dist/Smelt.dmg
 make help                   # 查看全部构建目标
 ```
@@ -119,10 +119,10 @@ cargo test
 
 | 二进制 | 作用 |
 |---|---|
-| `workspace` | GUI 主程序（`src/bin/workspace/`） |
-| `smeltd` | 终端持久化守护进程，类 tmux（`src/bin/smeltd.rs`）；远程网关也跑在它里面 |
-| `gateway` | 远程网关的独立可执行版（`src/bin/gateway.rs`），与 smeltd 共用 `src/remote_gateway.rs`，主要用于开发调试 |
-| `smelt-notify` | Claude Code hooks 调用的状态上报小工具（`src/bin/smelt-notify.rs`） |
+| `smelt` | GUI 主程序（`crates/smelt/`） |
+| `smeltd` | 终端持久化守护进程，类 tmux（`crates/smeltd/src/main.rs`）；远程网关也跑在它里面 |
+| `gateway` | 远程网关的独立可执行版（`crates/smeltd/src/bin/gateway.rs`），与 smeltd 共用 `crates/smelt-core/src/remote_gateway.rs`，主要用于开发调试 |
+| `smelt-notify` | Claude Code hooks 调用的状态上报小工具（`crates/smeltd/src/bin/smelt-notify.rs`） |
 
 `smeltd` 由 GUI 按需自动拉起并托管（独立进程组，GUI 退出不波及），**不需要手动运行**。
 它以字节流 + 重放 + 尺寸协商的方式为每个终端会话保活，重开 GUI 时按会话 id reattach。

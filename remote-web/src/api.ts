@@ -57,7 +57,7 @@ export async function fetchSessions(): Promise<SessionInfo[]> {
 }
 
 /**
- * 权限菜单 —— 与 src/permission_menu.rs 的 PermissionPrompt / PermissionOption 一一对应。
+ * 权限菜单 —— 与 crates/smelt-core/src/permission_menu.rs 的 PermissionPrompt / PermissionOption 一一对应。
  *
  * 这里**只有类型、没有解析**：解析器是 Rust 那一份（GUI 与 smeltd 共用），前端拉现成
  * 结果来渲染。曾经这边自己写过一份 TS 解析器（lib/parseChoiceMenu.ts），与 Rust 那份

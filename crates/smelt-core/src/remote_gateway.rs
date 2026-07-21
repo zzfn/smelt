@@ -870,7 +870,7 @@ fn read_smeltd_reply(conn: UnixStream) -> serde_json::Value {
 }
 
 /// 拉当前可视区里的权限菜单（守护现场解析）。手机端不再自己解析终端文本——
-/// 解析器只有一份，在 src/permission_menu.rs，GUI / smeltd 共用。
+/// 解析器只有一份，在本 crate 的 permission_menu 模块，GUI / smeltd 共用。
 fn send_menu(id: &str) -> serde_json::Value {
     let Ok(mut conn) = UnixStream::connect(sock_path()) else {
         return serde_json::json!({ "ok": false, "err": "连不上守护" });

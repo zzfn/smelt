@@ -62,7 +62,7 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
     };
   }, [sessionId]);
 
-  // 菜单不在前端解析——解析器只有 Rust 那一份（src/permission_menu.rs，GUI 与 smeltd
+  // 菜单不在前端解析——解析器只有 Rust 那一份（crates/smelt-core/src/permission_menu.rs，GUI 与 smeltd
   // 共用），这里拉守护现场解析的结果。画面何时变只有本端最清楚（它在渲染 xterm），
   // 所以由本端 debounce 后拉一次；服务端因此不必在 PTY 泵那条每字节都过的热路径上
   // 挂解析，也不受「state 广播只由 hook 驱动、没接 hook 的 agent 永不广播」所限。

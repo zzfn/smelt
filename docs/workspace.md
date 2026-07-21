@@ -10,7 +10,7 @@
 运行：
 
 ```bash
-cargo run --bin workspace
+cargo run --bin smelt
 ```
 
 > 注：`smelt` 原有的 instincts 蒸馏 CLI（`observe`/`digest`/`merge` 等）已整体移除；
@@ -36,7 +36,7 @@ cargo run --bin workspace
 ## 目录结构
 
 ```
-src/bin/workspace/
+crates/smelt/src/
 ├── main.rs           # Workspace：多标签管理器 + 应用入口
 ├── terminal_view.rs  # TerminalView：单个终端视图（渲染/输入/IME/选区/滚动/resize）
 └── terminal.rs       # Terminal：终端后端（PTY + alacritty 状态机 + 颜色解析）

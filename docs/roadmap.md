@@ -35,7 +35,7 @@
 
 ### ✅ 根治 Ctrl+C 重连错位：daemon 侧常驻 Term，attach 时吐网格快照
 
-**已落地（完整快照）**（`src/bin/smeltd.rs`）：
+**已落地（完整快照）**（`crates/smeltd/src/main.rs`）：
 1. 每会话常驻 `alacritty_terminal::Term`（history 1 万行），PTY 泵 `parser.advance`（`catch_unwind`）。
 2. attach 时 `snapshot_ansi`：**scrollback（上限 1 万行）+ 可视区**自洽 ANSI；备用屏、SGR、
    软换行、OSC 8、光标形状/显隐、bracketed paste / app cursor / 鼠标 / focus 等模式恢复。
