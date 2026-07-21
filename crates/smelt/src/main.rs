@@ -9,6 +9,8 @@ mod agent;
 mod claude_memory;
 mod dock;
 mod file_tree;
+mod git_log;
+mod git_log_view;
 mod git_panel;
 mod hotspot;
 mod json_store;
@@ -209,6 +211,16 @@ enum MainView {
     Git,
     Hotspot,
     History,
+}
+
+/// Git 页内部的子页。对标 JetBrains 的 Git 工具窗口——「提交」和「日志」是同一个
+/// 窗口里的两个视图，不占两个顶层标签。
+#[derive(Clone, Copy, PartialEq)]
+enum GitTab {
+    /// 工作区改动：文件树 + diff + 暂存 / 提交。
+    Changes,
+    /// 提交历史 + 分支图。
+    Log,
 }
 
 /// 会话里 agent 的状态（用于总览页状态徽章）。借鉴 codex 的 ThreadStatus 细分：
@@ -995,6 +1007,18 @@ struct Workspace {
     /// Git 页变更文件树里被折叠的目录（存相对仓库根的路径）。默认全展开——改动
     /// 文件通常没几个，一进来就全看见比让人挨个点开更顺手。
     git_tree_collapsed: HashSet<String>,
+    /// diff 看哪一层改动（全部 / 已暂存 / 未暂存）。默认全部，保持既有观感。
+    diff_scope: git_panel::DiffScope,
+    /// 「日志」页（git 提交历史 + 分支图）的全部状态。
+    git_log: git_log::GitLogState,
+    /// Git 页当前在看哪个子页（改动 / 日志）。
+    git_tab: GitTab,
+    /// 正在推送（按钮显示「推送中…」并禁用，避免连点推两次）。
+    pushing: bool,
+    /// 正在确认删除的分支：(仓库根, 分支名, 是否远端分支)。
+    delete_branch_target: Option<(String, String, bool)>,
+    /// 日志页三栏（分支树 / 提交列表 / 详情）的拖拽状态。窗口窄时靠它腾地方。
+    git_log_resize: Entity<ResizableState>,
     /// 交互式 diff：选中待评论的行号集合（对应 GitDiff.lines 下标），换文件/重开 diff 时清空。
     diff_selected: HashSet<usize>,
     /// 交互式 diff 的评论输入框（懒创建，随 Git 视图渲染出待发送的 diff 时创建）。
@@ -1258,6 +1282,8 @@ impl Workspace {
             cx.subscribe(&file_tree_resize, |this, _state, _e: &ResizablePanelEvent, cx| {
                 this.save_state(cx);
             });
+        // 日志页三栏 resize（不落盘：日志是临时查看，没必要持久化）。
+        let git_log_resize = cx.new(|_| ResizableState::default());
         // Git 页左栏 resize：同上一套，拖完落盘。
         let git_left_resize = cx.new(|_| ResizableState::default());
         let _git_left_resize_sub =
@@ -1285,6 +1311,12 @@ impl Workspace {
             diff_split: false,
             active_hunk: None,
             git_tree_collapsed: HashSet::new(),
+            diff_scope: git_panel::DiffScope::All,
+            git_log: git_log::GitLogState::default(),
+            git_tab: GitTab::Changes,
+            pushing: false,
+            delete_branch_target: None,
+            git_log_resize,
             diff_selected: HashSet::new(),
             diff_comment_input: None,
             commit_msg_input: None,
@@ -5194,7 +5226,11 @@ impl Render for Workspace {
                 }
                 // Git 页 F7 / Shift+F7：在改动块之间跳（对齐 JetBrains 的 next/previous
                 // difference）。不带 Cmd，所以要赶在下面的 platform 判断之前处理。
-                if this.view == MainView::Git && ks.key == "f7" && !ks.modifiers.platform {
+                if this.view == MainView::Git
+                    && this.git_tab == GitTab::Changes
+                    && ks.key == "f7"
+                    && !ks.modifiers.platform
+                {
                     this.jump_hunk(!ks.modifiers.shift, cx);
                     return;
                 }
@@ -5520,47 +5556,179 @@ impl Render for Workspace {
                         }
                         MainView::Git => {
                             let cwd = self.cur().and_then(|s| s.cwd(cx));
-                            let status =
-                                cwd.as_ref().and_then(|r| self.git_status.get(r).map(|(_, d)| d));
-                            let branches =
-                                cwd.as_ref().and_then(|r| self.branches.get(r).map(|(_, d)| d));
-                            // 评论输入框懒创建（需要 window），跟文件树搜索框同一套模式。
-                            if self.git_diff.is_some() && self.diff_comment_input.is_none() {
-                                use gpui_component::input::InputState;
-                                let state = cx.new(|cx| {
-                                    InputState::new(window, cx)
-                                        .placeholder("给选中的行写评论，发送前可以再改改…")
-                                });
-                                self.diff_comment_input = Some(state);
-                            }
-                            // commit message 输入框懒创建，跟上面评论框同一套模式；只要
-                            // 进了 Git 页就常驻（不像评论框依赖已经打开某个 diff）。
-                            if self.commit_msg_input.is_none() {
-                                use gpui_component::input::InputState;
-                                let state = cx.new(|cx| {
-                                    InputState::new(window, cx)
-                                        .placeholder("Commit message（点「生成」用 AI 起草，也可以自己写）")
-                                });
-                                self.commit_msg_input = Some(state);
-                            }
-                            git_view(
-                                cwd.clone(),
-                                status,
-                                branches,
-                                &self.git_diff,
-                                self.diff_split,
-                                &self.diff_selected,
-                                self.diff_comment_input.as_ref(),
-                                self.commit_msg_input.as_ref(),
-                                self.commit_msg_generating,
-                                &self.git_files_scroll,
-                                &self.diff_scroll,
-                                self.active_hunk,
-                                &self.git_left_resize,
-                                self.git_left_w,
-                                &self.git_tree_collapsed,
-                                cx,
-                            )
+                            let c_border = cx.theme().border;
+                            // 「改动 / 日志」子标签。两者同属 Git 工具窗口，不占两个
+                            // 顶层标签（JetBrains 也是这个结构）。
+                            let sub_tabs = {
+                                let (fg, muted, accent) = {
+                                    let t = cx.theme();
+                                    (t.foreground, t.muted_foreground, t.accent)
+                                };
+                                h_flex()
+                                    .gap_1()
+                                    .px_3()
+                                    .py_1()
+                                    .border_b_1()
+                                    .border_color(c_border)
+                                    .children([(GitTab::Changes, "改动"), (GitTab::Log, "日志")].map(
+                                        |(tab, label)| {
+                                            let on = self.git_tab == tab;
+                                            div()
+                                                .id(label)
+                                                .px_2()
+                                                .py(px(1.0))
+                                                .text_sm()
+                                                .rounded_sm()
+                                                .cursor_pointer()
+                                                .text_color(if on { fg } else { muted })
+                                                .when(on, |d| d.bg(accent))
+                                                .hover(|d| d.opacity(0.8))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.git_tab = tab;
+                                                    cx.notify();
+                                                }))
+                                                .child(label)
+                                        },
+                                    ))
+                            };
+
+                            let body = match self.git_tab {
+                                GitTab::Changes => {
+                                    let status = cwd
+                                        .as_ref()
+                                        .and_then(|r| self.git_status.get(r).map(|(_, d)| d));
+                                    let branches = cwd
+                                        .as_ref()
+                                        .and_then(|r| self.branches.get(r).map(|(_, d)| d));
+                                    // 评论输入框懒创建（需要 window），跟文件树搜索框同一套模式。
+                                    if self.git_diff.is_some() && self.diff_comment_input.is_none() {
+                                        use gpui_component::input::InputState;
+                                        let state = cx.new(|cx| {
+                                            InputState::new(window, cx)
+                                                .placeholder("给选中的行写评论，发送前可以再改改…")
+                                        });
+                                        self.diff_comment_input = Some(state);
+                                    }
+                                    // commit message 输入框懒创建，跟上面评论框同一套模式；只要
+                                    // 进了 Git 页就常驻（不像评论框依赖已经打开某个 diff）。
+                                    if self.commit_msg_input.is_none() {
+                                        use gpui_component::input::InputState;
+                                        let state = cx.new(|cx| {
+                                            // 多行 + 自增高：commit message 的规范写法是
+                                            // 「标题空行正文」，单行框根本写不了 body，
+                                            // AI 生成的多段说明也会被挤成一行。
+                                            InputState::new(window, cx)
+                                                .multi_line(true)
+                                                .auto_grow(2, 8)
+                                                .placeholder("Commit message（可多行；点「AI 生成」起草）")
+                                        });
+                                        self.commit_msg_input = Some(state);
+                                    }
+                                    git_view(
+                                        cwd.clone(),
+                                        status,
+                                        branches,
+                                        &self.git_diff,
+                                        self.diff_split,
+                                        &self.diff_selected,
+                                        self.diff_comment_input.as_ref(),
+                                        self.commit_msg_input.as_ref(),
+                                        self.commit_msg_generating,
+                                        self.pushing,
+                                        &self.git_files_scroll,
+                                        &self.diff_scroll,
+                                        self.active_hunk,
+                                        &self.git_left_resize,
+                                        self.git_left_w,
+                                        &self.git_tree_collapsed,
+                                        self.diff_scope,
+                                        cx,
+                                    )
+                                }
+                                GitTab::Log => {
+                                    if let Some(root) = cwd.clone() {
+                                        // 进页面就保证数据在（内部按 root 去重，不会每帧拉）；
+                                        // 分支列表复用 Git 页那份缓存，左侧树才有内容。
+                                        self.ensure_git_log(root.clone(), cx);
+                                        self.ensure_branches(root, cx);
+                                    }
+                                    // 状态在这里取好再传下去：渲染函数内部绝不能 read 自己的
+                                    // entity（render 期间它正被可变借用，重入会直接 abort）。
+                                    let branches = cwd
+                                        .as_ref()
+                                        .and_then(|r| self.branches.get(r))
+                                        .map(|(_, b)| b);
+                                    // 当前检出的分支：日志默认看它，分支树里也要标出来。
+                                    // 复用 Git 页已有的 status 缓存，不另跑一次 git。
+                                    let head_branch = cwd
+                                        .as_ref()
+                                        .and_then(|r| self.git_status.get(r))
+                                        .map(|(_, d)| d.branch_name().to_string())
+                                        .filter(|b| !b.is_empty());
+                                    // 三栏都可拖拽：窗口窄的时候能自己腾地方，写死
+                                    // 宽度的话中间的提交列表会被挤得没法看。
+                                    div().flex_1().min_h_0().flex().child(
+                                        h_resizable("git-log-split")
+                                            .with_state(&self.git_log_resize)
+                                            // 左：分支树
+                                            .child(
+                                                resizable_panel()
+                                                    .size(px(200.))
+                                                    .size_range(px(140.)..px(360.))
+                                                    .child(
+                                                        div()
+                                                            .size_full()
+                                                            .min_h_0()
+                                                            .border_r_1()
+                                                            .border_color(c_border)
+                                                            .child(git_log_view::branch_tree(
+                                                                cwd.clone(),
+                                                                branches,
+                                                                &self.git_log.scope,
+                                                                head_branch.clone(),
+                                                                cx,
+                                                            )),
+                                                    ),
+                                            )
+                                            // 中：分支图 + 提交列表
+                                            .child(resizable_panel().child(
+                                                div()
+                                                    .size_full()
+                                                    .min_w_0()
+                                                    .min_h_0()
+                                                    .border_r_1()
+                                                    .border_color(c_border)
+                                                    .child(git_log_view::git_log_view(
+                                                        cwd.clone(),
+                                                        &self.git_log,
+                                                        head_branch,
+                                                        cx,
+                                                    )),
+                                            ))
+                                            // 右：提交详情
+                                            .child(
+                                                resizable_panel()
+                                                    .size(px(380.))
+                                                    .size_range(px(240.)..px(640.))
+                                                    .child(
+                                                        div()
+                                                            .size_full()
+                                                            .min_w_0()
+                                                            .min_h_0()
+                                                            .child(
+                                                                git_log_view::commit_detail_pane(
+                                                                    cwd,
+                                                                    &self.git_log,
+                                                                    cx,
+                                                                ),
+                                                            ),
+                                                    ),
+                                            ),
+                                    )
+                                }
+                            };
+
+                            v_flex().flex_1().min_h_0().child(sub_tabs).child(body)
                         }
                         MainView::Hotspot => {
                             let cwd = self.cur().and_then(|s| s.cwd(cx));
@@ -5612,6 +5780,7 @@ impl Render for Workspace {
             .children(self.delete_worktree_target.is_some().then(|| self.render_delete_worktree_confirm(cx)))
             .children(self.discard_hunk_target.is_some().then(|| self.render_discard_hunk_confirm(cx)))
             .children(self.discard_file_target.is_some().then(|| self.render_discard_file_confirm(cx)))
+            .children(self.delete_branch_target.is_some().then(|| self.render_delete_branch_confirm(cx)))
             // 删除文件二次确认拦截弹层
             .children(self.delete_file_target.is_some().then(|| self.render_delete_file_confirm(cx)))
             // 重启守护确认弹层改挂在设置窗（SettingsWindow::render），不在主窗口画。
