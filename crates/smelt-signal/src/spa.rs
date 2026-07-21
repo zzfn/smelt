@@ -9,18 +9,39 @@ use rust_embed::RustEmbed;
 #[folder = "../../remote-web/dist/"]
 struct EmbeddedSpa;
 
-fn spa_read(rel: &str) -> Option<Vec<u8>> {
+/// 拒绝 `..` / 绝对路径，避免 SMELT_REMOTE_WEB 磁盘覆盖时路径穿越。
+fn safe_rel(rel: &str) -> Option<String> {
     let rel = rel.trim_start_matches('/');
+    if rel.is_empty() || rel.contains("..") || rel.starts_with('/') || rel.contains('\\') {
+        return None;
+    }
+    // 仅允许相对段
+    if rel.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+        return None;
+    }
+    Some(rel.to_string())
+}
+
+fn spa_read(rel: &str) -> Option<Vec<u8>> {
+    let rel = safe_rel(rel)?;
     // 开发：环境变量可指向磁盘 dist
     if let Ok(dir) = std::env::var("SMELT_REMOTE_WEB") {
-        let p = std::path::Path::new(&dir).join(rel);
-        if p.is_file() {
-            if let Ok(b) = std::fs::read(p) {
+        let base = std::path::PathBuf::from(&dir);
+        let p = base.join(&rel);
+        if let (Ok(base_c), Ok(p_c)) = (base.canonicalize(), p.canonicalize()) {
+            if p_c.starts_with(&base_c) && p_c.is_file() {
+                if let Ok(b) = std::fs::read(p_c) {
+                    return Some(b);
+                }
+            }
+        } else if p.is_file() {
+            // 文件尚未 canonicalize 时（极少）仍要求绝对不越界
+            if let Ok(b) = std::fs::read(&p) {
                 return Some(b);
             }
         }
     }
-    EmbeddedSpa::get(rel).map(|f| f.data.into_owned())
+    EmbeddedSpa::get(&rel).map(|f| f.data.into_owned())
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -37,8 +58,7 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-/// SPA 入口：/ 与客户端路由 /s/... 都回 index.html  
-/// 跨网页默认 write meta=true（真实写权限由 bridge hello_ok 再约束）
+/// SPA 入口：/ 与客户端路由 /s/... 都回 index.html
 pub async fn spa_index() -> Response {
     let Some(bytes) = spa_read("index.html") else {
         return (
@@ -64,6 +84,9 @@ pub async fn spa_index() -> Response {
 }
 
 pub async fn spa_asset(Path(path): Path<String>) -> Response {
+    if path.contains("..") || path.starts_with('/') {
+        return (StatusCode::BAD_REQUEST, "bad path").into_response();
+    }
     let rel = format!("assets/{path}");
     let Some(bytes) = spa_read(&rel) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -73,7 +96,6 @@ pub async fn spa_asset(Path(path): Path<String>) -> Response {
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, ct),
-            // 带 hash 的 vite 资源可长缓存
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
         bytes,

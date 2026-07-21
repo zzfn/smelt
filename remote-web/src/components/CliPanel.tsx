@@ -38,8 +38,16 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
       : writeEnabled;
 
   useEffect(() => {
-    // RTC 路径暂无独立 state-stream（状态靠列表刷新）；HTTP 仍走 WS
-    if (transport.mode === "rtc") return;
+    // RTC：走 bridge 的 state 帧；HTTP：state-stream WS
+    if (transport.mode === "rtc" && transport.rtc) {
+      return transport.rtc.subscribeState(sessionId, (s) => {
+        setState((prev) => ({
+          ...prev,
+          phase: s.phase ?? prev.phase,
+          pending_question: s.pending_question ?? prev.pending_question,
+        }));
+      });
+    }
     let retry = 1000;
     let closed = false;
     let ws: WebSocket | null = null;
@@ -68,17 +76,18 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
       closed = true;
       ws?.close();
     };
-  }, [sessionId, transport.mode]);
+  }, [sessionId, transport.mode, transport.rtc]);
 
-  // 菜单不在前端解析——解析器只有 Rust 那一份（crates/smelt-core/src/permission_menu.rs，GUI 与 smeltd
-  // 共用），这里拉守护现场解析的结果。画面何时变只有本端最清楚（它在渲染 xterm），
-  // 所以由本端 debounce 后拉一次；服务端因此不必在 PTY 泵那条每字节都过的热路径上
-  // 挂解析，也不受「state 广播只由 hook 驱动、没接 hook 的 agent 永不广播」所限。
+  // 菜单：HTTP 走 gateway；RTC 走 DC menu 帧（勿 fetch 到 signal 域名 SPA）
   const [menu, setMenu] = useState<PermissionMenu | null>(null);
   useEffect(() => {
     let alive = true;
     const timer = window.setTimeout(() => {
-      void fetchMenu(sessionId).then((m) => {
+      const p =
+        transport.mode === "rtc" && transport.rtc
+          ? transport.rtc.fetchMenu(sessionId)
+          : fetchMenu(sessionId);
+      void p.then((m) => {
         if (alive) setMenu(m);
       });
     }, 250);
@@ -86,8 +95,7 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
       alive = false;
       window.clearTimeout(timer);
     };
-    // bufferText/phase 一变就重排这个 timer：画面还在刷时不断推迟，稳定 250ms 才拉。
-  }, [sessionId, bufferText, state.phase]);
+  }, [sessionId, bufferText, state.phase, transport.mode, transport.rtc]);
 
   // 菜单身份：标题+选项标签，变了才自动再弹出
   const menuKey = useMemo(() => {
@@ -116,9 +124,13 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
       setStatus({ text: "发送中…" });
       try {
         if (transport.mode === "rtc" && transport.rtc) {
-          transport.rtc.postInput(sessionId, data);
-          setStatus({ text: okMsg, kind: "ok" });
-          setSheetDismissed(true);
+          const r = await transport.rtc.postInput(sessionId, data);
+          if (r.ok) {
+            setStatus({ text: okMsg, kind: "ok" });
+            setSheetDismissed(true);
+          } else {
+            setStatus({ text: r.err || "未送达", kind: "err" });
+          }
         } else {
           const r = await postInput(sessionId, data);
           if (r.ok) {
@@ -218,8 +230,10 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
             onClick={async () => {
               setPending(true);
               if (transport.mode === "rtc" && transport.rtc) {
-                transport.rtc.postAction(sessionId, "approve");
-                setStatus({ text: "已批准", kind: "ok" });
+                const r = await transport.rtc.postAction(sessionId, "approve");
+                setStatus(
+                  r.ok ? { text: "已批准", kind: "ok" } : { text: r.err || "未送达", kind: "err" },
+                );
               } else {
                 const r = await postAction(sessionId, "approve");
                 setStatus(
@@ -238,8 +252,10 @@ export function CliPanel({ sessionId, name, subtitle, writeEnabled, onBack }: Pr
             onClick={async () => {
               setPending(true);
               if (transport.mode === "rtc" && transport.rtc) {
-                transport.rtc.postAction(sessionId, "deny");
-                setStatus({ text: "已拒绝", kind: "ok" });
+                const r = await transport.rtc.postAction(sessionId, "deny");
+                setStatus(
+                  r.ok ? { text: "已拒绝", kind: "ok" } : { text: r.err || "未送达", kind: "err" },
+                );
               } else {
                 const r = await postAction(sessionId, "deny");
                 setStatus(

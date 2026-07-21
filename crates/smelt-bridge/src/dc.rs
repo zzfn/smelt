@@ -1,4 +1,6 @@
 //! DataChannel 业务帧 ↔ 本机 gateway。
+//!
+//! 每个 DC 连接一份 [`DcSession`]：必须先 hello 鉴权，否则拒绝业务帧。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,14 +16,40 @@ use webrtc::data_channel::RTCDataChannel;
 use crate::gateway::{self, PtyFrame};
 use crate::Config;
 
-/// 每个 DC 连接一份：已 open 的 session watch 任务
-type WatchMap = Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>;
+/// 单条 DataChannel 上的连接态（鉴权 + 任务句柄）。
+pub struct DcSession {
+    pub authed: bool,
+    pub write: bool,
+    /// session_id → PTY watch task
+    watches: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// session_id → state-stream task
+    state_watches: HashMap<String, tokio::task::JoinHandle<()>>,
+}
 
-fn watches() -> WatchMap {
-    use std::sync::OnceLock;
-    static W: OnceLock<WatchMap> = OnceLock::new();
-    W.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
-        .clone()
+impl DcSession {
+    pub fn new() -> Self {
+        Self {
+            authed: false,
+            write: false,
+            watches: HashMap::new(),
+            state_watches: HashMap::new(),
+        }
+    }
+
+    pub fn abort_all(&mut self) {
+        for (_, h) in self.watches.drain() {
+            h.abort();
+        }
+        for (_, h) in self.state_watches.drain() {
+            h.abort();
+        }
+    }
+}
+
+impl Default for DcSession {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,7 +77,12 @@ struct Frame {
     cell_h: Option<u16>,
 }
 
-pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) -> Result<()> {
+pub async fn handle_frame(
+    cfg: Arc<Config>,
+    dc: Arc<RTCDataChannel>,
+    sess: Arc<Mutex<DcSession>>,
+    raw: &str,
+) -> Result<()> {
     let f: Frame = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
@@ -61,6 +94,23 @@ pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) 
             return Ok(());
         }
     };
+
+    // 未 hello 只允许 hello
+    if f.t != "hello" {
+        let ok = sess.lock().await.authed;
+        if !ok {
+            send_json(
+                &dc,
+                &serde_json::json!({
+                    "t": "err",
+                    "msg": "not authenticated; send hello first",
+                    "code": "auth"
+                }),
+            )
+            .await;
+            return Ok(());
+        }
+    }
 
     match f.t.as_str() {
         "hello" => {
@@ -74,6 +124,11 @@ pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) 
                 return Ok(());
             }
             let write = cfg.write && f.write.unwrap_or(true);
+            {
+                let mut s = sess.lock().await;
+                s.authed = true;
+                s.write = write;
+            }
             send_json(
                 &dc,
                 &serde_json::json!({ "t": "hello_ok", "write": write }),
@@ -103,16 +158,19 @@ pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) 
                 send_json(&dc, &serde_json::json!({ "t": "err", "msg": "open needs id" })).await;
                 return Ok(());
             };
-            // 停旧 watch
+            // 停旧 PTY + state watch
             {
-                let w = watches();
-                let mut map = w.lock().await;
-                if let Some(h) = map.remove(&id) {
+                let mut s = sess.lock().await;
+                if let Some(h) = s.watches.remove(&id) {
+                    h.abort();
+                }
+                if let Some(h) = s.state_watches.remove(&id) {
                     h.abort();
                 }
             }
             send_json(&dc, &serde_json::json!({ "t": "open_ok", "id": id })).await;
 
+            // PTY 字节流
             let cfg_w = cfg.clone();
             let dc_w = Arc::clone(&dc);
             let id_w = id.clone();
@@ -123,7 +181,6 @@ pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) 
                     async move {
                         match frame {
                             PtyFrame::Header { cols, rows } => {
-                                // 用 state 附带尺寸可选；帧协议无 header，先忽略或 err 旁路
                                 let _ = (cols, rows);
                             }
                             PtyFrame::Bytes(b) => {
@@ -147,17 +204,73 @@ pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) 
                     .await;
                 }
             });
-            watches().lock().await.insert(id, handle);
+            sess.lock().await.watches.insert(id.clone(), handle);
+
+            // 状态流 → state 帧（phase / pending_question）
+            let cfg_s = cfg.clone();
+            let dc_s = Arc::clone(&dc);
+            let id_s = id.clone();
+            let state_h = tokio::spawn(async move {
+                let r = gateway::watch_state(&cfg_s, &id_s, |v| {
+                    let dc = Arc::clone(&dc_s);
+                    let id = id_s.clone();
+                    async move {
+                        let phase = v.get("phase").cloned().unwrap_or(Value::Null);
+                        let pending = v.get("pending_question").cloned().unwrap_or(Value::Null);
+                        send_json(
+                            &dc,
+                            &serde_json::json!({
+                                "t": "state",
+                                "id": id,
+                                "phase": phase,
+                                "pending_question": pending,
+                            }),
+                        )
+                        .await;
+                    }
+                })
+                .await;
+                if let Err(e) = r {
+                    warn!(%e, id = %id_s, "state watch ended");
+                }
+            });
+            sess.lock().await.state_watches.insert(id, state_h);
         }
         "close" => {
             if let Some(id) = f.id {
-                if let Some(h) = watches().lock().await.remove(&id) {
+                let mut s = sess.lock().await;
+                if let Some(h) = s.watches.remove(&id) {
+                    h.abort();
+                }
+                if let Some(h) = s.state_watches.remove(&id) {
                     h.abort();
                 }
             }
         }
+        "menu" => {
+            let Some(id) = f.id else {
+                send_json(&dc, &serde_json::json!({ "t": "err", "msg": "menu needs id" })).await;
+                return Ok(());
+            };
+            match gateway::fetch_menu(&cfg, &id).await {
+                Ok(menu) => {
+                    send_json(
+                        &dc,
+                        &serde_json::json!({ "t": "menu_ok", "id": id, "menu": menu }),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    send_json(
+                        &dc,
+                        &serde_json::json!({ "t": "err", "msg": format!("menu: {e}") }),
+                    )
+                    .await;
+                }
+            }
+        }
         "input" => {
-            if !cfg.write {
+            if !sess.lock().await.write {
                 send_json(
                     &dc,
                     &serde_json::json!({ "t": "err", "msg": "read-only", "code": "readonly" }),
@@ -169,13 +282,26 @@ pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) 
                 return Ok(());
             };
             let path = format!("/s/{id}/input");
-            if let Err(e) = gateway::post_json(&cfg, &path, serde_json::json!({ "data": data })).await
-            {
-                warn!(%e, "input");
+            match gateway::post_json(&cfg, &path, serde_json::json!({ "data": data })).await {
+                Ok(_) => {
+                    send_json(
+                        &dc,
+                        &serde_json::json!({ "t": "ack", "op": "input", "id": id, "ok": true }),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(%e, "input");
+                    send_json(
+                        &dc,
+                        &serde_json::json!({ "t": "ack", "op": "input", "id": id, "ok": false, "err": e.to_string() }),
+                    )
+                    .await;
+                }
             }
         }
         "action" => {
-            if !cfg.write {
+            if !sess.lock().await.write {
                 send_json(
                     &dc,
                     &serde_json::json!({ "t": "err", "msg": "read-only", "code": "readonly" }),
@@ -188,11 +314,34 @@ pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) 
             };
             let path = format!("/s/{id}/action");
             let body = serde_json::json!({ "kind": kind, "text": f.text });
-            if let Err(e) = gateway::post_json(&cfg, &path, body).await {
-                warn!(%e, "action");
+            match gateway::post_json(&cfg, &path, body).await {
+                Ok(_) => {
+                    send_json(
+                        &dc,
+                        &serde_json::json!({ "t": "ack", "op": "action", "id": id, "ok": true }),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(%e, "action");
+                    send_json(
+                        &dc,
+                        &serde_json::json!({ "t": "ack", "op": "action", "id": id, "ok": false, "err": e.to_string() }),
+                    )
+                    .await;
+                }
             }
         }
         "resize" => {
+            // 与 input/action 一致：只读连接不可改共享 PTY 尺寸
+            if !sess.lock().await.write {
+                send_json(
+                    &dc,
+                    &serde_json::json!({ "t": "err", "msg": "read-only", "code": "readonly" }),
+                )
+                .await;
+                return Ok(());
+            }
             let (Some(id), Some(cols), Some(rows)) = (f.id, f.cols, f.rows) else {
                 return Ok(());
             };
@@ -214,7 +363,13 @@ pub async fn handle_frame(cfg: Arc<Config>, dc: Arc<RTCDataChannel>, raw: &str) 
     Ok(())
 }
 
-async fn send_json(dc: &RTCDataChannel, v: &Value) {
+/// DC 关闭时清理该连接上所有 watch 任务。
+pub async fn on_dc_closed(sess: Arc<Mutex<DcSession>>) {
+    sess.lock().await.abort_all();
+    info!("dc closed, watches aborted");
+}
+
+pub async fn send_json(dc: &RTCDataChannel, v: &Value) {
     let s = v.to_string();
     if let Err(e) = dc.send_text(s).await {
         warn!(%e, "dc send");

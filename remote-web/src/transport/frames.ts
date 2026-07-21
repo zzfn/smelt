@@ -34,6 +34,9 @@ export type DcFrame =
       cell_h?: number;
     }
   | { t: "state"; id: string; phase?: string; pending_question?: string | null }
+  | { t: "menu"; id: string }
+  | { t: "menu_ok"; id: string; menu: unknown }
+  | { t: "ack"; op: string; id?: string; ok: boolean; err?: string }
   | { t: "err"; msg: string; code?: string };
 
 export function encodeFrame(frame: DcFrame): string {

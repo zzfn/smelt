@@ -145,7 +145,15 @@ async fn create_room(
     let ttl = body
         .and_then(|b| b.ttl_secs)
         .map(|s| s.min(86_400).max(60));
-    let created = state.create_room(ttl.map(Duration::from_secs));
+    let created = state
+        .create_room(ttl.map(Duration::from_secs))
+        .map_err(|e| {
+            let code = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            (
+                code,
+                Json(serde_json::json!({ "error": e.msg() })),
+            )
+        })?;
     Ok(Json(CreateRoomResp {
         room: created.room,
         secret: created.secret,

@@ -25,6 +25,26 @@ pub async fn fetch_sessions(cfg: &Config) -> Result<Value> {
     Ok(resp.json().await?)
 }
 
+pub async fn fetch_menu(cfg: &Config, id: &str) -> Result<Value> {
+    let url = format!(
+        "{}/s/{}/menu?token={}",
+        cfg.gateway_base,
+        id,
+        urlencoding_token(&cfg.gateway_token)
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("menu HTTP {}", resp.status());
+    }
+    let body: Value = resp.json().await?;
+    // gateway 返回 { menu: ... | null }
+    Ok(body.get("menu").cloned().unwrap_or(Value::Null))
+}
+
 pub async fn post_json(cfg: &Config, path: &str, body: Value) -> Result<Value> {
     let url = format!(
         "{}{}{}token={}",
@@ -99,6 +119,46 @@ where
 pub enum PtyFrame {
     Header { cols: u16, rows: u16 },
     Bytes(Vec<u8>),
+}
+
+/// 订阅会话 state-stream（phase / pending_question）。
+pub async fn watch_state<F, Fut>(cfg: &Config, id: &str, mut on_state: F) -> Result<()>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let base = cfg
+        .gateway_base
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1);
+    let url = format!(
+        "{base}/s/{id}/state-stream?token={}",
+        urlencoding_token(&cfg.gateway_token)
+    );
+    let (ws, _) = connect_async(&url)
+        .await
+        .with_context(|| format!("state-stream {url}"))?;
+    let (mut _sink, mut stream) = ws.split();
+    while let Some(msg) = stream.next().await {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(%e, "state ws");
+                break;
+            }
+        };
+        match msg {
+            Message::Text(t) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    on_state(v).await;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    let _ = _sink.close().await;
+    Ok(())
 }
 
 fn urlencoding_token(s: &str) -> String {

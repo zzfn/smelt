@@ -1,18 +1,20 @@
 /**
- * 跨网 RTC 后端：DataChannel 帧映射 + 换网自动重连。
+ * 跨网 RTC 后端：DataChannel 帧映射 + 换网自动重连 + 送达确认。
  */
 
 import { connectRtc, parseRtcQuery, type RtcSession } from "./rtc-peer";
 import type { RtcConnPhase } from "./types";
 import { decodeFrame, encodeFrame, b64ToBytes, type DcFrame } from "./frames";
-import type { SessionInfo } from "../api";
+import type { PermissionMenu, SessionInfo } from "../api";
 
 export type RtcBackend = {
   phase: () => RtcConnPhase;
   waitReady: () => Promise<void>;
   fetchSessions: () => Promise<SessionInfo[]>;
+  fetchMenu: (id: string) => Promise<PermissionMenu | null>;
   openPty: (id: string, onBytes: (data: Uint8Array) => void) => () => void;
-  postInput: (id: string, data: string) => void;
+  /** 成功送达并收到 bridge ack 才 resolve ok */
+  postInput: (id: string, data: string) => Promise<{ ok: boolean; err?: string }>;
   postResize: (
     id: string,
     cols: number,
@@ -20,7 +22,16 @@ export type RtcBackend = {
     cellW?: number,
     cellH?: number,
   ) => void;
-  postAction: (id: string, kind: string, text?: string) => void;
+  postAction: (
+    id: string,
+    kind: string,
+    text?: string,
+  ) => Promise<{ ok: boolean; err?: string }>;
+  /** 订阅某会话 phase 更新 */
+  subscribeState: (
+    id: string,
+    onState: (s: { phase?: string; pending_question?: string | null }) => void,
+  ) => () => void;
   writeEnabled: () => boolean;
   close: () => void;
 };
@@ -28,6 +39,11 @@ export type RtcBackend = {
 type Pending = {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
+};
+
+type AckPending = {
+  resolve: (v: { ok: boolean; err?: string }) => void;
+  timer: number;
 };
 
 const MAX_BACKOFF_MS = 12_000;
@@ -53,8 +69,13 @@ export async function startRtcBackend(
   let lastPhase: RtcConnPhase = "idle";
 
   const pendingSessions: Pending[] = [];
-  /** 仍打开的 PTY 订阅：重连后自动 open 恢复 */
+  const pendingMenus = new Map<string, Pending>();
+  const pendingAcks: AckPending[] = [];
   const ptyHandlers = new Map<string, (data: Uint8Array) => void>();
+  const stateHandlers = new Map<
+    string,
+    Set<(s: { phase?: string; pending_question?: string | null }) => void>
+  >();
 
   let firstReadyResolve: (() => void) | null = null;
   let firstReadyDone = false;
@@ -71,6 +92,42 @@ export async function startRtcBackend(
     for (const p of pendingSessions.splice(0)) {
       p.reject(new Error(reason));
     }
+    for (const [, p] of pendingMenus) {
+      p.reject(new Error(reason));
+    }
+    pendingMenus.clear();
+    for (const a of pendingAcks.splice(0)) {
+      window.clearTimeout(a.timer);
+      a.resolve({ ok: false, err: reason });
+    }
+  }
+
+  function trySend(frame: DcFrame): boolean {
+    if (!session) return false;
+    const ph = session.getPhase();
+    if (ph !== "connected" && ph !== "ice") {
+      // ice 时 DC 可能尚未 open
+    }
+    return session.sendFrame(frame);
+  }
+
+  function sendWithAck(
+    frame: DcFrame,
+    timeoutMs = 8000,
+  ): Promise<{ ok: boolean; err?: string }> {
+    return new Promise((resolve) => {
+      if (!trySend(frame)) {
+        resolve({ ok: false, err: "not connected" });
+        return;
+      }
+      const timer = window.setTimeout(() => {
+        const i = pendingAcks.indexOf(entry);
+        if (i >= 0) pendingAcks.splice(i, 1);
+        resolve({ ok: false, err: "ack timeout" });
+      }, timeoutMs);
+      const entry: AckPending = { resolve, timer };
+      pendingAcks.push(entry);
+    });
   }
 
   function handleFrame(frame: DcFrame) {
@@ -79,9 +136,8 @@ export async function startRtcBackend(
         write = frame.write;
         reconnectAttempt = 0;
         reportPhase("connected", "hello_ok");
-        // 恢复已打开的终端流
         for (const id of ptyHandlers.keys()) {
-          session?.sendFrame({ t: "open", id });
+          trySend({ t: "open", id });
         }
         if (!firstReadyDone) {
           firstReadyDone = true;
@@ -105,10 +161,44 @@ export async function startRtcBackend(
         }
         break;
       }
+      case "state": {
+        const handlers = stateHandlers.get(frame.id);
+        if (handlers) {
+          const s = {
+            phase: frame.phase,
+            pending_question: frame.pending_question,
+          };
+          for (const fn of handlers) fn(s);
+        }
+        break;
+      }
+      case "menu_ok": {
+        const p = pendingMenus.get(frame.id);
+        if (p) {
+          pendingMenus.delete(frame.id);
+          p.resolve(frame.menu);
+        }
+        break;
+      }
+      case "ack": {
+        const a = pendingAcks.shift();
+        if (a) {
+          window.clearTimeout(a.timer);
+          a.resolve({ ok: frame.ok, err: frame.err });
+        }
+        break;
+      }
       case "err": {
         const p = pendingSessions.shift();
         p?.reject(new Error(frame.msg));
-        // auth 错误不重连
+        // 失败的 menu
+        if (pendingMenus.size) {
+          const first = pendingMenus.keys().next().value;
+          if (first) {
+            pendingMenus.get(first)?.reject(new Error(frame.msg));
+            pendingMenus.delete(first);
+          }
+        }
         if (frame.code === "auth") {
           reportPhase("failed", frame.msg);
           stopped = true;
@@ -126,7 +216,6 @@ export async function startRtcBackend(
     if (stopped || connecting) return;
     connecting = true;
     try {
-      // 关掉旧会话（不触发无限 onClose 环：close 为 intentional）
       if (session) {
         try {
           session.close();
@@ -149,7 +238,6 @@ export async function startRtcBackend(
         write: true,
         onPhase(p, detail) {
           if (stopped) return;
-          // 重连过程中的 failed 由 onClose 统一调度，避免双报
           if (p === "failed") return;
           reportPhase(p, detail);
         },
@@ -190,36 +278,52 @@ export async function startRtcBackend(
     }, delay);
   }
 
-  // 浏览器 online：立刻重连（换网回来）
-  const onOnline = () => {
+  /** 强制排队重连（busy 时仍保证稍后会再试） */
+  function forceReconnect(reason: string) {
     if (stopped) return;
-    if (lastPhase === "connected") return;
     if (reconnectTimer != null) {
       window.clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    if (connecting) {
+      // 当前连接结束后再来一轮
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        if (!stopped && lastPhase !== "connected") {
+          reconnectAttempt = Math.max(1, reconnectAttempt);
+          void connectOnce();
+        }
+      }, 500);
+      reportPhase("reconnecting", reason);
+      return;
+    }
     reconnectAttempt = Math.max(1, reconnectAttempt);
-    reportPhase("reconnecting", "网络已恢复，正在重连…");
+    reportPhase("reconnecting", reason);
     void connectOnce();
+  }
+
+  const onOnline = () => {
+    if (stopped) return;
+    if (lastPhase === "connected") return;
+    forceReconnect("网络已恢复，正在重连…");
   };
   window.addEventListener("online", onOnline);
 
-  // 页面从后台回前台且已断：补一刀
   const onVis = () => {
     if (stopped || document.visibilityState !== "visible") return;
-    if (lastPhase === "failed" || lastPhase === "reconnecting" || lastPhase === "closed") {
-      if (reconnectTimer != null) {
-        window.clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      void connectOnce();
+    if (
+      lastPhase === "failed" ||
+      lastPhase === "reconnecting" ||
+      lastPhase === "closed" ||
+      lastPhase === "idle"
+    ) {
+      forceReconnect("页面回到前台，正在重连…");
     }
   };
   document.addEventListener("visibilitychange", onVis);
 
   await connectOnce();
 
-  // 首次等 hello_ok（最多 20s）
   await Promise.race([
     firstReady,
     new Promise<void>((r) => window.setTimeout(r, 20_000)),
@@ -231,7 +335,7 @@ export async function startRtcBackend(
     writeEnabled: () => write,
     fetchSessions: () =>
       new Promise<SessionInfo[]>((resolve, reject) => {
-        if (!session || session.getPhase() === "failed") {
+        if (!trySend({ t: "sessions" })) {
           reject(new Error("not connected"));
           return;
         }
@@ -239,7 +343,6 @@ export async function startRtcBackend(
           resolve: (v) => resolve(v as SessionInfo[]),
           reject,
         });
-        session.sendFrame({ t: "sessions" });
         window.setTimeout(() => {
           const idx = pendingSessions.findIndex((p) => p.reject === reject);
           if (idx >= 0) {
@@ -247,19 +350,37 @@ export async function startRtcBackend(
           }
         }, 12_000);
       }),
+    fetchMenu: (id) =>
+      new Promise<PermissionMenu | null>((resolve, reject) => {
+        if (!trySend({ t: "menu", id })) {
+          resolve(null);
+          return;
+        }
+        pendingMenus.set(id, {
+          resolve: (v) => {
+            if (v == null) resolve(null);
+            else resolve(v as PermissionMenu);
+          },
+          reject,
+        });
+        window.setTimeout(() => {
+          if (pendingMenus.has(id)) {
+            pendingMenus.delete(id);
+            resolve(null);
+          }
+        }, 8_000);
+      }),
     openPty(id, onBytes) {
       ptyHandlers.set(id, onBytes);
-      session?.sendFrame({ t: "open", id });
+      trySend({ t: "open", id });
       return () => {
         ptyHandlers.delete(id);
-        session?.sendFrame({ t: "close", id });
+        trySend({ t: "close", id });
       };
     },
-    postInput(id, data) {
-      session?.sendFrame({ t: "input", id, data });
-    },
+    postInput: (id, data) => sendWithAck({ t: "input", id, data }),
     postResize(id, cols, rows, cellW, cellH) {
-      session?.sendFrame({
+      trySend({
         t: "resize",
         id,
         cols,
@@ -268,8 +389,23 @@ export async function startRtcBackend(
         cell_h: cellH,
       });
     },
-    postAction(id, kind, text) {
-      session?.sendFrame({ t: "action", id, kind, text });
+    postAction: (id, kind, text) =>
+      sendWithAck({ t: "action", id, kind, text }),
+    subscribeState(id, onState) {
+      let set = stateHandlers.get(id);
+      if (!set) {
+        set = new Set();
+        stateHandlers.set(id, set);
+      }
+      set.add(onState);
+      // 确保已 open（会带 state watch）
+      if (!ptyHandlers.has(id)) {
+        trySend({ t: "open", id });
+      }
+      return () => {
+        set?.delete(onState);
+        if (set && set.size === 0) stateHandlers.delete(id);
+      };
     },
     close() {
       stopped = true;

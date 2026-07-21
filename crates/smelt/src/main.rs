@@ -5950,12 +5950,14 @@ fn main() {
         // 隧道依赖本机网关；配置里 tunnel_enabled=true 时 enabled 理应也是 true
         // （apply_tunnel_toggle 存盘时就是这么同步的），但独立判断一次更保险。
         let want_tunnel = remote_config.tunnel_enabled;
+        let want_webrtc = remote_config.webrtc_enabled;
         let want_write = remote_config.write_enabled;
         cx.set_global(remote_config);
         cx.set_global(settings::RemoteRuntimeState::default());
         cx.set_global(settings::TunnelRuntimeState::default());
         cx.set_global(settings::WebrtcRuntimeState::default());
-        if want_remote || want_tunnel {
+        // 恢复跨网：隧道仍走下面 spawn；WebRTC 在网关 hydrate 后再拉 bridge
+        if want_remote || want_tunnel || want_webrtc {
             if want_tunnel {
                 cx.set_global(settings::TunnelRuntimeState {
                     connecting: true,
@@ -5965,13 +5967,14 @@ fn main() {
                 });
             }
             cx.spawn(async move |cx| {
-                let (remote_rt, tunnel_rt) = cx
+                let (remote_rt, tunnel_rt, want_webrtc) = cx
                     .background_executor()
                     .spawn(async move {
                         terminal::ensure_daemon_running();
 
                         // 1) 本机网关：已在跑就复用 token，否则按配置 start
-                        let remote_rt = if want_remote || want_tunnel {
+                        // WebRTC 也需要本机网关 token
+                        let remote_rt = if want_remote || want_tunnel || want_webrtc {
                             let existing = terminal::remote_status();
                             if existing.running
                                 && existing.token.as_ref().is_some_and(|t| !t.is_empty())
@@ -6046,7 +6049,7 @@ fn main() {
                         };
 
                         // 隧道 start 可能顺带（重）开了网关：再读一次 token，避免 UI 仍空
-                        let remote_rt = if want_remote || want_tunnel {
+                        let remote_rt = if want_remote || want_tunnel || want_webrtc {
                             let again = terminal::remote_status();
                             if again.running && again.token.as_ref().is_some_and(|t| !t.is_empty())
                             {
@@ -6079,12 +6082,16 @@ fn main() {
                             tunnel_rt
                         };
 
-                        (remote_rt, tunnel_rt)
+                        (remote_rt, tunnel_rt, want_webrtc)
                     })
                     .await;
                 let _ = cx.update(|cx| {
                     cx.set_global(remote_rt);
                     cx.set_global(tunnel_rt);
+                    // 网关 token 就绪后再恢复 WebRTC bridge（否则建房有 token 却无本机网关）
+                    if want_webrtc {
+                        settings::spawn_webrtc_start_public(cx);
+                    }
                 });
             })
             .detach();

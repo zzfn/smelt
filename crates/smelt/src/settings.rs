@@ -725,6 +725,11 @@ pub fn apply_webrtc_toggle(enabled: bool, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// 供 main 启动恢复调用（网关 hydrate 之后）。
+pub fn spawn_webrtc_start_public(cx: &mut App) {
+    spawn_webrtc_start(cx);
+}
+
 fn spawn_webrtc_start(cx: &mut App) {
     // 先停旧 bridge（清 pid）
     if let Some(old) = cx.try_global::<WebrtcRuntimeState>().cloned() {
@@ -1026,22 +1031,23 @@ pub fn apply_write_toggle(enabled: bool, cx: &mut App) {
         return;
     }
 
-    if c.webrtc_enabled {
-        stop_webrtc_bridge(cx);
+    // 可同时开 WebRTC + CF：两边都要跟着换 token，不能 if/else 只走一路
+    let need_restart = c.webrtc_enabled || c.tunnel_enabled;
+    if need_restart {
+        if c.webrtc_enabled {
+            stop_webrtc_bridge(cx);
+        }
+        if c.tunnel_enabled {
+            terminal::tunnel_stop();
+        }
         terminal::remote_stop();
         set_remote_from_start_result(terminal::remote_start("127.0.0.1", enabled), cx);
-        spawn_webrtc_start(cx);
-    } else if c.tunnel_enabled {
-        terminal::tunnel_stop();
-        terminal::remote_stop();
-        cx.set_global(RemoteRuntimeState {
-            token: None,
-            addr: None,
-            write: false,
-            error: None,
-        });
-        // connecting 态让分享卡片显示「正在按新权限更新链接…」
-        spawn_tunnel_start(enabled, cx);
+        if c.tunnel_enabled {
+            spawn_tunnel_start(enabled, cx);
+        }
+        if c.webrtc_enabled {
+            spawn_webrtc_start(cx);
+        }
     } else {
         terminal::remote_stop();
         set_remote_from_start_result(terminal::remote_start("127.0.0.1", enabled), cx);

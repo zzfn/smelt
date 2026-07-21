@@ -264,6 +264,10 @@ fn bail_offer_reuse() -> Result<()> {
 fn wire_dc(cfg: Arc<Config>, d: Arc<RTCDataChannel>) {
     let cfg2 = cfg.clone();
     let d2 = Arc::clone(&d);
+    let sess = Arc::new(tokio::sync::Mutex::new(dc::DcSession::new()));
+    let sess_msg = Arc::clone(&sess);
+    let sess_close = Arc::clone(&sess);
+
     d.on_open(Box::new(move || {
         info!("dc open");
         Box::pin(async {})
@@ -272,11 +276,19 @@ fn wire_dc(cfg: Arc<Config>, d: Arc<RTCDataChannel>) {
     d.on_message(Box::new(move |msg: DataChannelMessage| {
         let cfg = cfg2.clone();
         let d = Arc::clone(&d2);
+        let sess = Arc::clone(&sess_msg);
         Box::pin(async move {
             let text = String::from_utf8_lossy(&msg.data).to_string();
-            if let Err(e) = dc::handle_frame(cfg, d, &text).await {
+            if let Err(e) = dc::handle_frame(cfg, d, sess, &text).await {
                 warn!(%e, "dc frame");
             }
+        })
+    }));
+
+    d.on_close(Box::new(move || {
+        let sess = Arc::clone(&sess_close);
+        Box::pin(async move {
+            dc::on_dc_closed(sess).await;
         })
     }));
 }

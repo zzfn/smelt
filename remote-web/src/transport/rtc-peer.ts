@@ -12,8 +12,9 @@ import { encodeFrame, type DcFrame } from "./frames";
 const DC_LABEL = "smelt";
 
 export type RtcSession = {
-  sendFrame: (frame: DcFrame) => void;
-  sendRaw: (raw: string) => void;
+  /** 成功入队发送返回 true；DC 未 open 返回 false */
+  sendFrame: (frame: DcFrame) => boolean;
+  sendRaw: (raw: string) => boolean;
   close: () => void;
   getPhase: () => RtcConnPhase;
 };
@@ -251,14 +252,20 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     }
   }
 
-  function sendRaw(raw: string) {
+  function sendRaw(raw: string): boolean {
     if (dc && dc.readyState === "open") {
-      dc.send(raw);
+      try {
+        dc.send(raw);
+        return true;
+      } catch {
+        return false;
+      }
     }
+    return false;
   }
 
-  function sendFrame(frame: DcFrame) {
-    sendRaw(encodeFrame(frame));
+  function sendFrame(frame: DcFrame): boolean {
+    return sendRaw(encodeFrame(frame));
   }
 
   function close() {
