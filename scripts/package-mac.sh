@@ -11,7 +11,7 @@
 set -euo pipefail
 
 APP_NAME="Smelt"
-BIN_NAME="workspace"          # cargo 产物名
+BIN_NAME="smelt"              # cargo 产物名
 EXEC_NAME="smelt"             # .app 内可执行文件名
 BUNDLE_ID="com.zzfn.smelt"
 

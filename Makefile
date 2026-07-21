@@ -1,7 +1,7 @@
 # Smelt 打包与开发入口。打包重活在 scripts/package-mac.sh 里。
-# GUI 会拉起同目录的 smeltd；只编 workspace 会留下过期/缺失的守护，表现为
+# GUI 会拉起同目录的 smeltd；只编 GUI 会留下过期/缺失的守护，表现为
 # 「新建终端 / 打开项目没反应」。
-BIN := workspace
+BIN := smelt
 DAEMON := smeltd
 
 .PHONY: help build run icon dist dist-build clean remote-web remote-web-dev

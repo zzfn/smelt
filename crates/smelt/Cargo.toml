@@ -1,15 +1,12 @@
+# GUI 主程序。package 名即产物名 smelt——与 app 包内可执行名、产品名统一
+# （Makefile / package-mac.sh / smeltd 菜单栏的同目录寻址都按这个名字取）。
 [package]
-name = "smelt-workspace"
+name = "smelt"
 version.workspace = true
 edition.workspace = true
 
 [lints]
 workspace = true
-
-# GUI 主程序。产物名固定为 workspace（Makefile / package-mac.sh 都按这个名字取）。
-[[bin]]
-name = "workspace"
-path = "src/main.rs"
 
 [dependencies]
 # GUI/守护共用的无 UI 逻辑（终端文本、OSC 扫描、权限菜单解析、远程网关）。

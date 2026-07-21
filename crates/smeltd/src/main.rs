@@ -1029,12 +1029,12 @@ mod menubar {
         height: f64,
     }
 
-    /// 点「打开 smelt」：拉起同目录的 workspace GUI。已在跑的话，由 workspace 自己的
-    /// 单实例逻辑负责前置窗口，这里只管发起。
+    /// 点「打开 smelt」：拉起同目录的 GUI（dev 的 target 目录和 app 包内都叫 smelt）。
+    /// 已在跑的话，由 GUI 自己的单实例逻辑负责前置窗口，这里只管发起。
     extern "C" fn on_open(_this: &Object, _cmd: Sel, _sender: *mut Object) {
         if let Ok(exe) = std::env::current_exe() {
             use std::process::Stdio;
-            let gui = exe.with_file_name("workspace");
+            let gui = exe.with_file_name("smelt");
             let _ = std::process::Command::new(gui)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

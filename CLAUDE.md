@@ -13,7 +13,7 @@ Mac 上的 AI coding 驾驶舱：一个专为「同时指挥多个 CLI coding ag
   只有 `session_history.rs` 一份，别再复制。
 
 ## 二进制
-- `workspace`（`crates/workspace/`）—— GUI 主程序，`cargo run --bin workspace`
+- `smelt`（`crates/smelt/`）—— GUI 主程序，`cargo run --bin smelt`
 - `smeltd`（`crates/smeltd/src/main.rs`）—— 终端持久化守护进程（类 tmux）：GUI 退出/
   崩溃不影响 shell 存活，重开 GUI 按会话 id reattach
 
@@ -27,7 +27,7 @@ Mac 上的 AI coding 驾驶舱：一个专为「同时指挥多个 CLI coding ag
 ## 目录
 - `crates/smelt-core/` —— GUI 与守护共用的无 UI 逻辑（终端文本提取、OSC 扫描、
   权限菜单解析、远程网关）。**这个 crate 不许引 GPUI**，守护侧编译速度靠这条底线
-- `crates/workspace/` —— GUI：多标签终端、文件树、git diff 视图、桌面宠物
+- `crates/smelt/` —— GUI：多标签终端、文件树、git diff 视图、桌面宠物
 - `crates/smeltd/` —— 守护侧三个无 GUI 二进制（smeltd / gateway / smelt-notify），
   依赖树不含 GPUI，改守护不用等 GUI 依赖编译
 - `docs/workspace.md` —— GUI 已实现功能与架构

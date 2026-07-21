@@ -1,9 +1,9 @@
 # 虚拟 workspace：所有代码住 crates/ 下，根不再有 package。
 # - crates/smelt-core   —— GUI 与守护共用的无 UI 逻辑（不许引 GPUI）
 # - crates/smeltd       —— 守护侧三个二进制（smeltd / gateway / smelt-notify）
-# - crates/workspace    —— GUI 主程序（bin 名 workspace）
+# - crates/smelt        —— GUI 主程序（bin 名 smelt，与产品名统一）
 [workspace]
-members = ["crates/smelt-core", "crates/smeltd", "crates/workspace"]
+members = ["crates/smelt-core", "crates/smeltd", "crates/smelt"]
 resolver = "3"
 
 # 版本号唯一真源：发版只改这里（scripts/package-mac.sh 与 release CI 都

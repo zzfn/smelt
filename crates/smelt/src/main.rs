@@ -3,7 +3,7 @@
 //! Workspace 管理多个终端标签（TerminalView）：顶部标签栏切换 / 新建 / 关闭，
 //! 下方渲染当前活动终端。每个终端各自独立（PTY、IME、滚动、resize）。
 //!
-//! 运行： cargo run --bin workspace
+//! 运行： cargo run --bin smelt
 
 mod agent;
 mod claude_memory;
