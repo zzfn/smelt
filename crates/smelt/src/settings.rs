@@ -905,6 +905,19 @@ pub fn spawn_webrtc_start_public(cx: &mut App) {
 }
 
 fn spawn_webrtc_start(cx: &mut App) {
+    // 重入防护：上一轮还在 connecting（后台 remote_start/建房/spawn bridge 没
+    // 完成）时再来一次，不能再起一条独立的异步链——两条链各自读 existing_token
+    // 时都可能看到"还没有"，各自去 remote_start，实测真的会各建一个网关、各拉
+    // 一个 bridge，两边互相踩，表现为间歇性连不上本机网关。开关连点两下、或
+    // app 启动恢复跟用户手动开关撞一起都可能触发。
+    if cx
+        .try_global::<WebrtcRuntimeState>()
+        .is_some_and(|s| s.connecting)
+    {
+        eprintln!("[webrtc] spawn_webrtc_start: already connecting, skip duplicate call");
+        return;
+    }
+
     // 先停旧 bridge（清 pid）
     if let Some(old) = cx.try_global::<WebrtcRuntimeState>().cloned() {
         if let Some(pid) = old.bridge_pid {
