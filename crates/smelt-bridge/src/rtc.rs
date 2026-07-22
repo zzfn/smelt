@@ -299,12 +299,19 @@ fn wire_dc(cfg: Arc<Config>, d: Arc<RTCDataChannel>) {
         let cfg = cfg2.clone();
         let d = Arc::clone(&d2);
         let sess = Arc::clone(&sess_msg);
-        Box::pin(async move {
+        // webrtc-rs 的 read_loop 会把这个 handler 返回的 future await 完才读下一条
+        // 消息（源码里就是这么写的，不是猜的）。handle_frame 里 input/action/resize
+        // 都要打一次网关 HTTP 往返；滚动时这类帧密集地连续发，如果这里直接 inline
+        // await，会把整条 DataChannel 的收消息队头堵死——后面排队的 "sessions"
+        // 这类帧不管多简单，也得等前面一串 input 全部处理完才轮得到，实测滚动几下
+        // 就能把 12 秒的客户端超时吃满。丢进独立 task，读循环立刻能读下一条。
+        tokio::spawn(async move {
             let text = String::from_utf8_lossy(&msg.data).to_string();
             if let Err(e) = dc::handle_frame(cfg, d, sess, &text).await {
                 warn!(%e, "dc frame");
             }
-        })
+        });
+        Box::pin(async {})
     }));
 
     d.on_close(Box::new(move || {
