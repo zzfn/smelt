@@ -82,8 +82,32 @@ impl Config {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // GUI 拉起这个子进程时，spawn 发生在它后台执行器的某个线程上；POSIX 的
+    // execve() 只重置信号 handler，不重置信号掩码（pthread_sigmask 里被
+    // block 的信号照样传给子进程），如果那条线程恰好把 SIGTERM 挡住了，这个
+    // 子进程就会继承同样的掩码——GUI 那边 kill(pid, SIGTERM) 发是发出去了，
+    // 但这个进程永远收不到，只能 SIGKILL 才杀得掉（实测确认过：GUI 拉起的
+    // 子进程对 SIGTERM 完全没反应，同一个二进制自己在普通 shell 里跑则完全
+    // 正常）。在起 tokio 运行时（会创建 worker 线程，线程创建按 POSIX 语义
+    // 继承掩码）之前先解锁，不管父进程那边线程掩码什么样，自己先正常。
+    #[cfg(unix)]
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

@@ -640,7 +640,8 @@ pub struct WebrtcRuntimeState {
     pub connecting: bool,
     pub share_url: Option<String>,
     pub error: Option<String>,
-    /// bridge 进程 pid，关掉开关时 SIGTERM
+    /// bridge 进程 pid，关掉开关时 SIGKILL（GUI 拉起的子进程实测不响应
+    /// SIGTERM，大概率继承了后台执行器线程的阻塞信号掩码；SIGKILL 谁都挡不住）
     pub bridge_pid: Option<u32>,
     /// 分享链接的 QR（PNG 字节），URL 变了才重算
     pub qr_png: Option<Vec<u8>>,
@@ -862,7 +863,7 @@ fn stop_webrtc_bridge(cx: &mut App) {
         if pid != 0 && pid != self_pid {
             #[cfg(unix)]
             unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
+                libc::kill(pid as i32, libc::SIGKILL);
             }
         }
     }
@@ -945,7 +946,7 @@ fn spawn_webrtc_start(cx: &mut App) {
             if pid != 0 && pid != self_pid {
                 #[cfg(unix)]
                 unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
+                    libc::kill(pid as i32, libc::SIGKILL);
                 }
             }
         }
@@ -1024,7 +1025,7 @@ fn spawn_webrtc_start(cx: &mut App) {
                     if *pid != 0 && *pid != self_pid {
                         #[cfg(unix)]
                         unsafe {
-                            libc::kill(*pid as i32, libc::SIGTERM);
+                            libc::kill(*pid as i32, libc::SIGKILL);
                         }
                     }
                 }
