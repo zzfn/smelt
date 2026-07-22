@@ -83,16 +83,20 @@ impl Config {
 }
 
 fn main() -> Result<()> {
-    // GUI 拉起这个子进程时，spawn 发生在它后台执行器的某个线程上；POSIX 的
-    // execve() 只重置信号 handler，不重置信号掩码（pthread_sigmask 里被
-    // block 的信号照样传给子进程），如果那条线程恰好把 SIGTERM 挡住了，这个
-    // 子进程就会继承同样的掩码——GUI 那边 kill(pid, SIGTERM) 发是发出去了，
-    // 但这个进程永远收不到，只能 SIGKILL 才杀得掉（实测确认过：GUI 拉起的
-    // 子进程对 SIGTERM 完全没反应，同一个二进制自己在普通 shell 里跑则完全
-    // 正常）。在起 tokio 运行时（会创建 worker 线程，线程创建按 POSIX 语义
-    // 继承掩码）之前先解锁，不管父进程那边线程掩码什么样，自己先正常。
+    // GUI 拉起这个子进程时，spawn 发生在它后台执行器的某个线程上。之前只
+    // unblock 了信号掩码，重装后实测 GUI 拉起的子进程对 SIGTERM 还是没反应
+    // ——说明真正原因不是"掩码里被 block"，是 disposition 本身被设成了
+    // SIG_IGN（忽略）：POSIX execve() 对自定义 handler 会重置成默认，但对
+    // SIG_IGN 是原样保留的（这条经常被忽略）。GPUI/AppKit 这类多线程 GUI
+    // 框架为了自己接管终止流程，很可能在某处把 SIGTERM/SIGINT 设成了忽略，
+    // exec 之后这个子进程就原样继承了"忽略"这个状态。两道都补上：先把
+    // disposition 显式改回默认（对付 SIG_IGN 继承），再 unblock 掩码（对付
+    // 掩码继承），双保险，不用猜父进程那边到底是哪种机制。都要在起 tokio
+    // 运行时（会创建 worker 线程，线程创建继承调用线程的信号状态）之前做。
     #[cfg(unix)]
     unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
