@@ -158,6 +158,21 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     }
   }
 
+  /**
+   * DataChannel 关闭（channel.onclose）或其它触发点：能原地重协商就重协商，
+   * 不能就直接走完整重连。iceRestarting 已经在飞时什么都不做——那轮自己的
+   * 8 秒超时会决定成败，这里再插一脚只会打断它。
+   */
+  function restartOrFail(reason: string) {
+    if (intentionalClose) return;
+    if (iceRestarting) return;
+    if (pc && pc.signalingState === "stable") {
+      void attemptIceRestart(reason);
+    } else {
+      fail(reason);
+    }
+  }
+
   function ensurePc() {
     if (pc) return;
     setPhase("ice");
@@ -175,14 +190,14 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       if (intentionalClose) return;
       const s = pc?.connectionState;
       if (s === "connected") setPhase("connected");
-      else if (s === "failed") void attemptIceRestart("peer connection failed");
+      else if (s === "failed") restartOrFail("peer connection failed");
       else if (s === "disconnected") {
         // 换网常见：先 disconnected，稍后可能 failed 或自己恢复；给宽限
         setPhase("ice", "disconnected");
         window.setTimeout(() => {
           if (intentionalClose) return;
           if (pc?.connectionState === "disconnected" || pc?.connectionState === "failed") {
-            void attemptIceRestart("peer disconnected");
+            restartOrFail("peer disconnected");
           }
         }, 4000);
       }
@@ -191,7 +206,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     pc.oniceconnectionstatechange = () => {
       if (intentionalClose) return;
       const s = pc?.iceConnectionState;
-      if (s === "failed") void attemptIceRestart("ice failed");
+      if (s === "failed") restartOrFail("ice failed");
     };
 
     pc.ondatachannel = (ev) => {
@@ -227,8 +242,11 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       }
     };
     channel.onclose = () => {
+      // dc 关闭常常是 pc 传输层已经出问题的下游症状（有时比
+      // onconnectionstatechange/oniceconnectionstatechange 先触发），走同一套
+      // 「能重协商就重协商」逻辑，别一上来就整链路重连。
       if (!intentionalClose && phase !== "closed") {
-        fail("datachannel closed");
+        restartOrFail("datachannel closed");
       }
     };
   }
