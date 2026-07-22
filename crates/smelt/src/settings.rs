@@ -644,6 +644,11 @@ pub struct WebrtcRuntimeState {
     pub bridge_pid: Option<u32>,
     /// 分享链接的 QR（PNG 字节），URL 变了才重算
     pub qr_png: Option<Vec<u8>>,
+    /// 每次 spawn_webrtc_start/stop_webrtc_bridge 递增。后台任务落地结果前先
+    /// 核对自己出发时捕获的世代还是不是当前——不是就说明中途被另一次调用取代
+    /// 了（比如 stop 提前把 connecting 清成 false，重入锁没拦住），这次的结果
+    /// （包括刚拉起来的 bridge 子进程）要整个丢弃，不能再注册成"当前"状态。
+    pub generation: u64,
 }
 
 impl Global for WebrtcRuntimeState {}
@@ -838,7 +843,16 @@ fn qr_png_for_url(url: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// 下一个世代号：任何要让"正在飞的 spawn_webrtc_start"作废的地方都调这个。
+fn next_webrtc_generation(cx: &App) -> u64 {
+    cx.try_global::<WebrtcRuntimeState>()
+        .map(|s| s.generation)
+        .unwrap_or(0)
+        .wrapping_add(1)
+}
+
 fn stop_webrtc_bridge(cx: &mut App) {
+    let next_gen = next_webrtc_generation(cx);
     if let Some(pid) = cx
         .try_global::<WebrtcRuntimeState>()
         .and_then(|s| s.bridge_pid)
@@ -852,7 +866,13 @@ fn stop_webrtc_bridge(cx: &mut App) {
             }
         }
     }
-    cx.set_global(WebrtcRuntimeState::default());
+    // 世代 +1：正在飞的 spawn_webrtc_start（如果有）落地时会发现自己的世代
+    // 过期，把结果（包括它刚拉起来的 bridge 进程）整个丢弃，不会跟这次 stop
+    // 打架。
+    cx.set_global(WebrtcRuntimeState {
+        generation: next_gen,
+        ..Default::default()
+    });
 }
 
 /// 开关「跨网 WebRTC」：只改配置 + 异步拉 bridge（不在 UI 线程阻塞/建房）。
@@ -866,15 +886,15 @@ pub fn apply_webrtc_toggle(enabled: bool, cx: &mut App) {
             c.webrtc_enabled = false;
             save_remote_config(&c);
             cx.set_global(c);
+            let next_gen = next_webrtc_generation(cx);
             cx.set_global(WebrtcRuntimeState {
                 connecting: false,
-                share_url: None,
                 error: Some(
                     "请先填写「信令服务地址」（你部署的 smelt-signal，如 https://signal.example.com）"
                         .into(),
                 ),
-                bridge_pid: None,
-                qr_png: None,
+                generation: next_gen,
+                ..Default::default()
             });
             cx.refresh_windows();
             return;
@@ -944,24 +964,23 @@ fn spawn_webrtc_start(cx: &mut App) {
     let bridge_bin = resolve_smelt_bridge();
 
     if !signal_http_ok(&signal_http) {
+        let next_gen = next_webrtc_generation(cx);
         cx.set_global(WebrtcRuntimeState {
             connecting: false,
-            share_url: None,
             error: Some(
                 "未配置信令服务地址。请在设置 → 远程 填写你的 smelt-signal URL。".into(),
             ),
-            bridge_pid: None,
-            qr_png: None,
+            generation: next_gen,
+            ..Default::default()
         });
         return;
     }
 
+    let my_gen = next_webrtc_generation(cx);
     cx.set_global(WebrtcRuntimeState {
         connecting: true,
-        share_url: None,
-        error: None,
-        bridge_pid: None,
-        qr_png: None,
+        generation: my_gen,
+        ..Default::default()
     });
 
     cx.spawn(async move |cx| {
@@ -993,6 +1012,24 @@ fn spawn_webrtc_start(cx: &mut App) {
             .await;
 
         let _ = cx.update(|cx| {
+            // 落地前先核对世代：这段后台任务跑的这几秒里，如果又有人调用过
+            // spawn_webrtc_start/stop_webrtc_bridge，世代会被推进，说明这次
+            // 的结果已经过期，不能再当"当前状态"写回去——尤其是 Ok 分支，
+            // 刚拉起来的 bridge 子进程也得直接杀掉，不然就是又一个孤儿进程、
+            // 又一个没人管的本机网关。
+            let current_gen = cx.global::<WebrtcRuntimeState>().generation;
+            if current_gen != my_gen {
+                if let Ok((_, pid, ..)) = &result {
+                    let self_pid = std::process::id();
+                    if *pid != 0 && *pid != self_pid {
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::kill(*pid as i32, libc::SIGTERM);
+                        }
+                    }
+                }
+                return;
+            }
             match result {
                 Ok((share, pid, qr, token, addr, write)) => {
                     // 回填网关状态（可能是这次才 remote_start 的）
@@ -1008,6 +1045,7 @@ fn spawn_webrtc_start(cx: &mut App) {
                         error: None,
                         bridge_pid: Some(pid),
                         qr_png: qr,
+                        generation: my_gen,
                     });
                 }
                 Err(e) => {
@@ -1017,6 +1055,7 @@ fn spawn_webrtc_start(cx: &mut App) {
                         error: Some(e),
                         bridge_pid: None,
                         qr_png: None,
+                        generation: my_gen,
                     });
                 }
             }
