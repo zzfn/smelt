@@ -1,5 +1,7 @@
 //! 本机 remote_gateway HTTP/WS 客户端。
 
+use std::sync::OnceLock;
+
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -8,13 +10,32 @@ use tracing::warn;
 
 use crate::Config;
 
+/// 共享 client，且显式关掉系统代理。
+///
+/// gateway_base 永远是 127.0.0.1 回环地址，没有任何理由走代理；但 reqwest
+/// 默认会读系统代理设置（macOS 上经 scutil），如果代理软件（Stash/Clash 类）
+/// 的直连例外表里只写了 "localhost" 这个主机名、没写 127.0.0.1/8 这个网段，
+/// 发往 127.0.0.1 的请求就会被那条代理接管——代理再回环连自己这一跳一旦不稳
+/// 定，表现为间歇性 502 Bad Gateway，实测滚动时密集发 input 帧会成片触发。
+/// 用 .no_proxy() 从根上避免流量绕道；顺带用共享 client 替掉每次新建（避免
+/// 每条消息都重建连接池）。
+fn client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build local gateway http client")
+    })
+}
+
 pub async fn fetch_sessions(cfg: &Config) -> Result<Value> {
     let url = format!(
         "{}/sessions?token={}",
         cfg.gateway_base,
         urlencoding_token(&cfg.gateway_token)
     );
-    let resp = reqwest::Client::new()
+    let resp = client()
         .get(&url)
         .send()
         .await
@@ -32,7 +53,7 @@ pub async fn fetch_menu(cfg: &Config, id: &str) -> Result<Value> {
         id,
         urlencoding_token(&cfg.gateway_token)
     );
-    let resp = reqwest::Client::new()
+    let resp = client()
         .get(&url)
         .send()
         .await
@@ -53,7 +74,7 @@ pub async fn post_json(cfg: &Config, path: &str, body: Value) -> Result<Value> {
         if path.contains('?') { "&" } else { "?" },
         urlencoding_token(&cfg.gateway_token)
     );
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(&url)
         .json(&body)
         .send()
