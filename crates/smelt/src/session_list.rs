@@ -195,7 +195,9 @@ impl Workspace {
                     .py(px(4.))
                     // 通栏满宽色带 + 下沿细线：读作「区段分隔」而不是「又一行内容」。
                     // 内嵌小圆角块跟会话行太像，这才是层级最强的信号（且不动字号）。
-                    .bg(ui_theme::tint(0xffffff, 0x12))
+                    // 活动项目的色带亮一档：+Agent/+Term 就是新建到这个项目里，
+                    // 得看得出是哪个。
+                    .bg(ui_theme::tint(0xffffff, if is_active_group { 0x1e } else { 0x12 }))
                     .border_b_1()
                     .border_color(rgb(ui_theme::BORDER_DIM))
                     .cursor_pointer()
