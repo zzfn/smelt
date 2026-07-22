@@ -156,8 +156,15 @@ pub async fn run_host(cfg: Arc<Config>, room: String, secret: String) -> Result<
                     .and_then(|k| k.as_str())
                     .unwrap_or("")
                     .to_string();
-                // 新 offer：永远新建 PeerConnection（WebRTC 单轮协商）
-                if kind == "offer" {
+                let is_restart = payload
+                    .get("restart")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // 新 offer：默认永远新建 PeerConnection（WebRTC 单轮协商）；
+                // 但 restart=true（网络抖动后客户端原地 ICE restart）要在同一个
+                // pc/DataChannel 上重协商，不能重建——否则正在用的会话直接断线，
+                // 跟只是想续上连接的初衷矛盾。
+                if kind == "offer" && !(is_restart && peer.is_some()) {
                     peer = recreate_peer(
                         peer,
                         cfg.clone(),

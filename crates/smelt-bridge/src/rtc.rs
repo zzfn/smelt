@@ -159,8 +159,11 @@ impl HostPeer {
         })
     }
 
-    pub fn needs_fresh_pc_for_offer(&self) -> bool {
-        self.negotiated || self.remote_set
+    pub fn needs_fresh_pc_for_offer(&self, is_restart: bool) -> bool {
+        // ICE restart 就是要在同一个 pc/DataChannel 上重新走一轮 offer/answer
+        // （SDP 里 ice-ufrag/pwd 变了，webrtc-rs 的标准 O/A 流程会据此重启 ICE
+        // agent），不受"只能协商一轮"限制。
+        !is_restart && (self.negotiated || self.remote_set)
     }
 
     pub async fn close(self) {
@@ -175,7 +178,11 @@ impl HostPeer {
             .unwrap_or("");
         match kind {
             "offer" => {
-                if self.needs_fresh_pc_for_offer() {
+                let is_restart = payload
+                    .get("restart")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if self.needs_fresh_pc_for_offer(is_restart) {
                     // 调用方应先 close 再建新 PC；这里仅防御
                     bail_offer_reuse()?;
                 }

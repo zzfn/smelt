@@ -34,7 +34,8 @@ export type SignalingMessage =
   | { op: "pong" };
 
 export type SignalPayload =
-  | { kind: "offer"; sdp: string }
+  /** restart=true：同一 PeerConnection 上的 ICE 重协商，host 侧不重建 PC/DataChannel */
+  | { kind: "offer"; sdp: string; restart?: boolean }
   | { kind: "answer"; sdp: string }
   | { kind: "ice"; candidate: RTCIceCandidateInit | null };
 

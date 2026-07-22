@@ -124,6 +124,40 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     pendingIce.length = 0;
   }
 
+  let iceRestarting = false;
+
+  /**
+   * 网络短暂抖动（弱 WiFi、蜂窝切基站）时优先原地 ICE restart，而不是整个
+   * PeerConnection 推倒重建——同一个 pc/DataChannel 都留着，只重新走一轮
+   * candidate 收集，代价小、恢复快。8 秒内没连上才退回完整重连（resetPc）。
+   */
+  async function attemptIceRestart(reason: string) {
+    if (intentionalClose || !pc || iceRestarting) return;
+    if (pc.signalingState !== "stable") return; // 协商中，等这轮结束再看
+    iceRestarting = true;
+    setPhase("ice", `restart · ${reason}`);
+    try {
+      pc.restartIce();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      signal.send({
+        op: "signal",
+        from: "client",
+        payload: { kind: "offer", sdp: offer.sdp || "", restart: true },
+      });
+      window.setTimeout(() => {
+        if (intentionalClose) return;
+        if (pc?.connectionState !== "connected") {
+          fail(`ice restart timeout · ${reason}`);
+        }
+      }, 8000);
+    } catch {
+      fail(`ice restart failed · ${reason}`);
+    } finally {
+      iceRestarting = false;
+    }
+  }
+
   function ensurePc() {
     if (pc) return;
     setPhase("ice");
@@ -141,14 +175,14 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       if (intentionalClose) return;
       const s = pc?.connectionState;
       if (s === "connected") setPhase("connected");
-      else if (s === "failed") fail("peer connection failed");
+      else if (s === "failed") void attemptIceRestart("peer connection failed");
       else if (s === "disconnected") {
         // 换网常见：先 disconnected，稍后可能 failed 或自己恢复；给宽限
         setPhase("ice", "disconnected");
         window.setTimeout(() => {
           if (intentionalClose) return;
           if (pc?.connectionState === "disconnected" || pc?.connectionState === "failed") {
-            fail("peer disconnected");
+            void attemptIceRestart("peer disconnected");
           }
         }, 4000);
       }
@@ -157,7 +191,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     pc.oniceconnectionstatechange = () => {
       if (intentionalClose) return;
       const s = pc?.iceConnectionState;
-      if (s === "failed") fail("ice failed");
+      if (s === "failed") void attemptIceRestart("ice failed");
     };
 
     pc.ondatachannel = (ev) => {
