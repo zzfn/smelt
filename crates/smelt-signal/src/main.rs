@@ -7,8 +7,8 @@
 //! - `SMELT_SIGNAL_BIND` — 默认 `127.0.0.1:7878`
 //! - `SMELT_ROOM_TTL_SECS` — 房间默认存活秒数，默认 `3600`
 //! - `SMELT_ICE_SERVERS` — JSON 数组，形如
-//!   `[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:...","username":"u","credential":"p"}]`
-//!   缺省仅 Google 公共 STUN（本地 dev）
+//!   `[{"urls":"stun:stun.qq.com:3478"},{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]`
+//!   缺省：腾讯 / 小米 / Cloudflare / Google 公共 STUN；生产 coturn 见 `deploy/signal/coturn.md`
 //!
 //! ## HTTP
 //! - `GET  /health` → `{ ok, rooms }`
@@ -101,11 +101,26 @@ fn load_ice_servers() -> Vec<IceServerConfig> {
             Err(e) => warn!(%e, "SMELT_ICE_SERVERS parse failed, using default STUN"),
         }
     }
-    vec![IceServerConfig {
-        urls: IceUrls::One("stun:stun.l.google.com:19302".into()),
-        username: None,
-        credential: None,
-    }]
+    // 多源公共 STUN：国内优先 + 全球兜底。生产应挂 coturn TURN（SMELT_ICE_SERVERS）。
+    // 顺序：腾讯 → 小米 → Cloudflare（免费无限 STUN）→ Google。
+    default_public_stun_servers()
+}
+
+/// 与 SPA / bridge 回退列表保持一致。
+fn default_public_stun_servers() -> Vec<IceServerConfig> {
+    const URLS: &[&str] = &[
+        "stun:stun.qq.com:3478",
+        "stun:stun.miwifi.com:3478",
+        "stun:stun.cloudflare.com:3478",
+        "stun:stun.l.google.com:19302",
+    ];
+    URLS.iter()
+        .map(|u| IceServerConfig {
+            urls: IceUrls::One((*u).into()),
+            username: None,
+            credential: None,
+        })
+        .collect()
 }
 
 #[derive(Serialize)]

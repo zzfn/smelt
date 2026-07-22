@@ -1064,6 +1064,8 @@ struct Workspace {
     llm_inputs: Option<LlmInputs>,
     /// 上面几个输入框的变更订阅（保活；随视图存活）。
     llm_subs: Vec<Subscription>,
+    /// 远程：信令服务地址输入框（用户自部署 smelt-signal，无内置默认）。
+    signal_http_input: Option<Entity<gpui_component::input::InputState>>,
     /// 启动项列表编辑器（设置页「启动」分组懒创建）。
     launch_inputs: Option<settings::LaunchInputs>,
     /// 设置面板的有状态组件（懒创建）：不透明度滑块 + 字体大小滑块 + 背景色 / 宠物色取色器。
@@ -1314,6 +1316,7 @@ impl Workspace {
             memory_selected: None,
             llm_inputs: None,
             llm_subs: Vec::new(),
+            signal_http_input: None,
             launch_inputs: None,
             opacity_slider: None,
             font_size_slider: None,
@@ -2265,10 +2268,7 @@ impl Workspace {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(updater::fetch_latest())
+                    smelt_core::block_on::block_on_tokio(updater::fetch_latest()).and_then(|r| r)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -2300,12 +2300,10 @@ impl Workspace {
             let (tx, rx) = smol::channel::unbounded::<updater::DownloadProgress>();
             let v = version.clone();
             let task = cx.background_executor().spawn(async move {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(updater::download_and_stage(&url, &v, |p| {
-                        let _ = tx.try_send(p);
-                    }))
+                smelt_core::block_on::block_on_tokio(updater::download_and_stage(&url, &v, |p| {
+                    let _ = tx.try_send(p);
+                }))
+                .and_then(|r| r)
             });
 
             while let Ok(progress) = rx.recv().await {
@@ -5956,6 +5954,7 @@ fn main() {
         cx.set_global(settings::RemoteRuntimeState::default());
         cx.set_global(settings::TunnelRuntimeState::default());
         cx.set_global(settings::WebrtcRuntimeState::default());
+        cx.set_global(settings::SignalProbeState::default());
         // 恢复跨网：隧道仍走下面 spawn；WebRTC 在网关 hydrate 后再拉 bridge
         if want_remote || want_tunnel || want_webrtc {
             if want_tunnel {

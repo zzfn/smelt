@@ -65,10 +65,25 @@ impl HostPeer {
 
         let config = RTCConfiguration {
             ice_servers: if ice.is_empty() {
-                vec![RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".into()],
-                    ..Default::default()
-                }]
+                // 与 smelt-signal / SPA 缺省一致（hello_ok 正常时不会走到这里）
+                vec![
+                    RTCIceServer {
+                        urls: vec!["stun:stun.qq.com:3478".into()],
+                        ..Default::default()
+                    },
+                    RTCIceServer {
+                        urls: vec!["stun:stun.miwifi.com:3478".into()],
+                        ..Default::default()
+                    },
+                    RTCIceServer {
+                        urls: vec!["stun:stun.cloudflare.com:3478".into()],
+                        ..Default::default()
+                    },
+                    RTCIceServer {
+                        urls: vec!["stun:stun.l.google.com:19302".into()],
+                        ..Default::default()
+                    },
+                ]
             } else {
                 ice
             },

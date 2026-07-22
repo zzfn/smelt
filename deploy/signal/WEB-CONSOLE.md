@@ -175,6 +175,26 @@ nginx 继续整站反代 `signal` → `127.0.0.1:7878` 即可（`/ws` `/v1` `/he
 
 ---
 
+## 可选：coturn（手机蜂窝也能连）
+
+安全组先放行：**UDP/TCP 3478**、**UDP 49152–49251**。
+
+```bash
+# 镜像拉脚本
+curl -fL --connect-timeout 15 --max-time 60 \
+  -o /tmp/install-coturn.sh \
+  "https://ghfast.top/https://raw.githubusercontent.com/smelt-ai/smelt/feat/webrtc-edge/deploy/signal/install-coturn.sh"
+
+sudo PUBLIC_IP=你的弹性公网IP \
+  DOMAIN=signal.你的域名.com \
+  bash /tmp/install-coturn.sh
+# 结束会打印 TURN 密码，请保存
+```
+
+细节与排错：仓库 [`coturn.md`](./coturn.md)。
+
+---
+
 ## 排错
 
 | 现象 | 处理 |

@@ -485,16 +485,13 @@ impl PetView {
         let r#gen = self.req_gen;
         self.say("…"); // 思考中
         cx.spawn(async move |this, cx| {
-            // 网络请求放后台执行器，别卡 UI。注意：reqwest 依赖 tokio 运行时，而 GPUI 的
-            // executor 不是 tokio，直接跑会 panic「no reactor running」。故在后台线程里起一个
-            // 临时 current-thread 运行时 block_on 跑请求。
+            // 网络请求放后台执行器，别卡 UI；block_on_tokio 负责给 reqwest 一个 reactor，
+            // 顺带兜住内部 panic。
             let reply = cx
                 .background_executor()
                 .spawn(async move {
-                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                        Ok(rt) => rt.block_on(crate::agent::complete(cfg, user)),
-                        Err(e) => Err(anyhow::Error::from(e)),
-                    }
+                    smelt_core::block_on::block_on_tokio(crate::agent::complete(cfg, user))
+                        .and_then(|r| r)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {

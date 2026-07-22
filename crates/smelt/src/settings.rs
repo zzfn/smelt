@@ -463,8 +463,9 @@ pub struct RemoteConfig {
     /// 跨网主路径：WebRTC + 自营信令（docs/webrtc-edge.md）。
     #[serde(default)]
     pub webrtc_enabled: bool,
-    /// 公网信令 HTTP 根（SPA 同域），如 https://signal.example.com
-    #[serde(default = "default_signal_http")]
+    /// 公网信令 HTTP 根（SPA 同域），如 `https://signal.example.com`。
+    /// **无内置默认域名**——须用户在设置里填写自己部署的 smelt-signal。
+    #[serde(default)]
     pub signal_http: String,
     /// 这条链接是否允许 approve/deny/reply（Phase 6，见 smeltd.rs「远程操控」）。
     /// `#[serde(default)]`：比前两个字段更晚加，旧配置缺省按只读处理——不能让
@@ -474,20 +475,27 @@ pub struct RemoteConfig {
     pub write_enabled: bool,
 }
 
-fn default_signal_http() -> String {
-    "https://signal.zhyqhxb.fun".into()
-}
-
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             tunnel_enabled: false,
             webrtc_enabled: false,
-            signal_http: default_signal_http(),
+            signal_http: String::new(),
             write_enabled: false,
         }
     }
+}
+
+/// 规范化用户填的信令地址：去空白、去尾 `/`。空字符串表示未配置。
+pub fn normalize_signal_http(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+/// 是否是可用来建房的 http(s) 信令根。
+fn signal_http_ok(url: &str) -> bool {
+    let u = normalize_signal_http(url);
+    !u.is_empty() && (u.starts_with("https://") || u.starts_with("http://"))
 }
 
 impl Global for RemoteConfig {}
@@ -640,6 +648,139 @@ pub struct WebrtcRuntimeState {
 
 impl Global for WebrtcRuntimeState {}
 
+/// 信令地址「探测连通」结果（不落盘，设置页展示）。
+#[derive(Clone, Default)]
+pub struct SignalProbeState {
+    pub probing: bool,
+    /// 最近一次探测的目标 URL（与当前输入对比时可提示）
+    #[allow(dead_code)]
+    pub url: Option<String>,
+    pub ok: Option<bool>,
+    pub message: Option<String>,
+}
+
+impl Global for SignalProbeState {}
+
+/// 从输入框读出并规范化信令地址；空则 `None`。
+fn signal_http_from_input(
+    input: Option<&Entity<gpui_component::input::InputState>>,
+    cx: &App,
+) -> String {
+    if let Some(s) = input {
+        return normalize_signal_http(&s.read(cx).value());
+    }
+    normalize_signal_http(
+        &cx.try_global::<RemoteConfig>()
+            .map(|c| c.signal_http.clone())
+            .unwrap_or_default(),
+    )
+}
+
+/// 保存信令地址到配置；若跨网已开且地址变化，可选重启 bridge。
+fn apply_signal_http(url: String, restart_if_webrtc: bool, cx: &mut App) {
+    let url = normalize_signal_http(&url);
+    let mut c = cx.global::<RemoteConfig>().clone();
+    let changed = c.signal_http != url;
+    c.signal_http = url.clone();
+    save_remote_config(&c);
+    cx.set_global(c.clone());
+    // 清掉旧探测结果（目标变了）
+    if changed {
+        cx.set_global(SignalProbeState::default());
+    }
+    if restart_if_webrtc && changed && c.webrtc_enabled && signal_http_ok(&url) {
+        stop_webrtc_bridge(cx);
+        spawn_webrtc_start(cx);
+    }
+    cx.refresh_windows();
+}
+
+/// 后台 GET `{url}/health`，更新 [`SignalProbeState`]。
+fn probe_signal_http(url: String, cx: &mut App) {
+    let url = normalize_signal_http(&url);
+    if !signal_http_ok(&url) {
+        cx.set_global(SignalProbeState {
+            probing: false,
+            url: Some(url),
+            ok: Some(false),
+            message: Some("请填写以 http:// 或 https:// 开头的地址".into()),
+        });
+        cx.refresh_windows();
+        return;
+    }
+    cx.set_global(SignalProbeState {
+        probing: true,
+        url: Some(url.clone()),
+        ok: None,
+        message: Some("探测中…".into()),
+    });
+    cx.refresh_windows();
+    cx.spawn(async move |cx| {
+        let probe_url = url.clone();
+        let result: Result<String, String> = cx
+            .background_executor()
+            .spawn(async move {
+                // block_on_tokio 的 T 是 Future::Output；若 Output 本身是 Result 会套两层。
+                match smelt_core::block_on::block_on_tokio(async move {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(8))
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let health = format!("{probe_url}/health");
+                    let resp = client
+                        .get(&health)
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("连不上：{e}"))?;
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        anyhow::bail!(
+                            "HTTP {status}：{}",
+                            body.chars().take(80).collect::<String>()
+                        );
+                    }
+                    // 兼容 { ok: true, rooms: n }
+                    if body.contains("\"ok\"") && body.contains("true") {
+                        Ok::<String, anyhow::Error>(format!("连通正常 · {body}"))
+                    } else {
+                        Ok(format!(
+                            "已响应 HTTP {status} · {}",
+                            body.chars().take(100).collect::<String>()
+                        ))
+                    }
+                }) {
+                    Ok(Ok(msg)) => Ok(msg),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+            .await;
+        let _ = cx.update(|cx| {
+            match result {
+                Ok(msg) => {
+                    cx.set_global(SignalProbeState {
+                        probing: false,
+                        url: Some(url),
+                        ok: Some(true),
+                        message: Some(msg),
+                    });
+                }
+                Err(e) => {
+                    cx.set_global(SignalProbeState {
+                        probing: false,
+                        url: Some(url),
+                        ok: Some(false),
+                        message: Some(e),
+                    });
+                }
+            }
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
 fn resolve_smelt_bridge() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -707,9 +848,32 @@ fn stop_webrtc_bridge(cx: &mut App) {
 /// 开关「跨网 WebRTC」：只改配置 + 异步拉 bridge（不在 UI 线程阻塞/建房）。
 pub fn apply_webrtc_toggle(enabled: bool, cx: &mut App) {
     let mut c = cx.global::<RemoteConfig>().clone();
-    c.webrtc_enabled = enabled;
+
     if enabled {
+        let signal = normalize_signal_http(&c.signal_http);
+        if !signal_http_ok(&signal) {
+            // 未配置信令：不打开开关，提示用户先填地址
+            c.webrtc_enabled = false;
+            save_remote_config(&c);
+            cx.set_global(c);
+            cx.set_global(WebrtcRuntimeState {
+                connecting: false,
+                share_url: None,
+                error: Some(
+                    "请先填写「信令服务地址」（你部署的 smelt-signal，如 https://signal.example.com）"
+                        .into(),
+                ),
+                bridge_pid: None,
+                qr_png: None,
+            });
+            cx.refresh_windows();
+            return;
+        }
+        c.signal_http = signal;
+        c.webrtc_enabled = true;
         c.enabled = true;
+    } else {
+        c.webrtc_enabled = false;
     }
     save_remote_config(&c);
     cx.set_global(c);
@@ -753,8 +917,21 @@ fn spawn_webrtc_start(cx: &mut App) {
         .try_global::<RemoteRuntimeState>()
         .and_then(|r| r.addr.clone());
     let write = cfg.write_enabled;
-    let signal_http = cfg.signal_http.trim_end_matches('/').to_string();
+    let signal_http = normalize_signal_http(&cfg.signal_http);
     let bridge_bin = resolve_smelt_bridge();
+
+    if !signal_http_ok(&signal_http) {
+        cx.set_global(WebrtcRuntimeState {
+            connecting: false,
+            share_url: None,
+            error: Some(
+                "未配置信令服务地址。请在设置 → 远程 填写你的 smelt-signal URL。".into(),
+            ),
+            bridge_pid: None,
+            qr_png: None,
+        });
+        return;
+    }
 
     cx.set_global(WebrtcRuntimeState {
         connecting: true,
@@ -765,9 +942,8 @@ fn spawn_webrtc_start(cx: &mut App) {
     });
 
     cx.spawn(async move |cx| {
-        // GPUI 的 background executor 不是 tokio。reqwest 的 .await 必须在临时
-        // current-thread runtime 里 block_on，否则会 panic「no reactor running」
-        // （表现为 Option::expect_failed，直接把 GUI 崩掉）。套路同 pet.rs / updater.rs。
+        // webrtc_start_blocking 里也有同步的 remote_start/进程 spawn，不止 reqwest 那段，
+        // 所以这里仍额外兜一层 catch_unwind（block_on_tokio 只包它内部的 reqwest 部分）。
         let result = cx
             .background_executor()
             .spawn(async move {
@@ -828,7 +1004,7 @@ fn spawn_webrtc_start(cx: &mut App) {
 }
 
 /// 在后台线程同步跑完整条 WebRTC 启动链（网关 → 信令建房 → bridge → QR）。
-/// 所有 reqwest 调用包在临时 tokio current-thread runtime 里，避免「no reactor」。
+/// reqwest 调用经 [`smelt_core::block_on::block_on_tokio`] 跑，避免「no reactor」。
 fn webrtc_start_blocking(
     existing_token: Option<String>,
     existing_addr: Option<String>,
@@ -876,6 +1052,10 @@ fn webrtc_start_blocking(
         );
     };
 
+    if !signal_http_ok(&signal_http) {
+        return Err("未配置信令服务地址".into());
+    }
+
     // 1) 公网信令建房（reqwest 需要 tokio runtime）
     #[derive(serde::Deserialize)]
     struct Room {
@@ -884,11 +1064,7 @@ fn webrtc_start_blocking(
     }
     let room: Room = {
         let signal_http = signal_http.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("无法创建网络运行时：{e}"))?;
-        rt.block_on(async move {
+        smelt_core::block_on::block_on_tokio(async move {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
@@ -909,7 +1085,9 @@ fn webrtc_start_blocking(
                 ));
             }
             resp.json::<Room>().await.map_err(|e| e.to_string())
-        })?
+        })
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)?
     };
 
     let signal_ws = {
@@ -1375,6 +1553,19 @@ impl Workspace {
             cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(pc.color)));
 
         self.settings_subs.clear();
+
+        // 信令服务地址：无写死域名，用户填自己的 smelt-signal。故意不订阅 Change/Blur
+        // 自动落盘——下面「保存」按钮走 apply_signal_http，靠 draft≠saved 判断是否要
+        // 重启 bridge；这里要是也自动写 RemoteConfig，会在按「保存」之前就把值同步过去，
+        // dirty 恒为 false，按钮和地址变更重启 bridge 的逻辑都会失效。
+        let remote_sig = normalize_signal_http(&cx.global::<RemoteConfig>().signal_http);
+        let signal_http_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://signal.example.com（你部署的 smelt-signal）")
+                .default_value(remote_sig)
+        });
+        self.signal_http_input = Some(signal_http_input);
+
         self.settings_subs.push(cx.subscribe(
             &opacity_slider,
             |this, _s, ev: &SliderEvent, cx| {
@@ -2375,6 +2566,7 @@ impl Workspace {
         );
 
         // —— 远程：本机 → 跨网 WebRTC → 临时 CF → 写入 → 分享卡片（复制 + 扫码）——
+        let signal_http_input = self.signal_http_input.clone();
         let remote_page = SettingPage::new("远程").group(
             SettingGroup::new().items(vec![
                 SettingItem::new(
@@ -2387,6 +2579,187 @@ impl Workspace {
                 .description(
                     "打开后生成本机分享能力（局域网 / 跨网都依赖）。关掉会停止所有分享。",
                 ),
+                // 信令地址完整交互：输入 + 保存 + 探测 + 状态
+                SettingItem::render({
+                    let signal_http_input = signal_http_input.clone();
+                    move |_, _, cx: &mut App| {
+                        let muted = cx.theme().muted_foreground;
+                        let fg = cx.theme().foreground;
+                        let danger = cx.theme().danger;
+                        let secondary = cx.theme().secondary;
+                        let border = cx.theme().border;
+                        let success = cx.theme().success;
+                        let cfg = cx.global::<RemoteConfig>().clone();
+                        let probe = cx
+                            .try_global::<SignalProbeState>()
+                            .cloned()
+                            .unwrap_or_default();
+                        let saved = normalize_signal_http(&cfg.signal_http);
+                        let draft = signal_http_from_input(signal_http_input.as_ref(), cx);
+                        let configured = signal_http_ok(&saved);
+                        let draft_ok = signal_http_ok(&draft);
+                        let dirty = draft != saved;
+
+                        let status_line = if probe.probing {
+                            ("探测中…".to_string(), muted)
+                        } else if let Some(ok) = probe.ok {
+                            let msg = probe.message.clone().unwrap_or_default();
+                            if ok {
+                                (format!("✓ {msg}"), success)
+                            } else {
+                                (format!("✗ {msg}"), danger)
+                            }
+                        } else if configured {
+                            (format!("已保存：{saved}"), muted)
+                        } else {
+                            ("未配置 — 跨网 WebRTC 需要信令地址".into(), danger)
+                        };
+
+                        let input_entity = signal_http_input.clone();
+                        let input_for_save = signal_http_input.clone();
+                        let input_for_probe = signal_http_input.clone();
+                        let input_for_clear = signal_http_input.clone();
+
+                        v_flex()
+                            .w_full()
+                            .gap_2()
+                            .p_3()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(border)
+                            .bg(secondary.opacity(0.35))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(fg)
+                                    .child("信令服务地址"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(
+                                        "自部署的 smelt-signal 根 URL（无内置默认）。\
+                                         例：https://signal.example.com · 部署见 deploy/signal/",
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .children(
+                                                input_entity
+                                                    .as_ref()
+                                                    .map(|s| Input::new(s).small()),
+                                            ),
+                                    )
+                                    .child({
+                                        let can_save = draft_ok && dirty;
+                                        let label = if dirty {
+                                            "保存".to_string()
+                                        } else {
+                                            "已保存".to_string()
+                                        };
+                                        let b = btn("signal-save", label).flex_shrink_0();
+                                        if can_save {
+                                            b.on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_, window, cx: &mut App| {
+                                                    let v = signal_http_from_input(
+                                                        input_for_save.as_ref(),
+                                                        cx,
+                                                    );
+                                                    if !signal_http_ok(&v) {
+                                                        window.push_notification(
+                                                            Notification::error(
+                                                                "请填写 https:// 或 http:// 开头的地址",
+                                                            ),
+                                                            cx,
+                                                        );
+                                                        return;
+                                                    }
+                                                    apply_signal_http(v, true, cx);
+                                                    window.push_notification(
+                                                        Notification::success("信令地址已保存"),
+                                                        cx,
+                                                    );
+                                                },
+                                            )
+                                        } else {
+                                            b.opacity(0.45)
+                                        }
+                                    })
+                                    .child({
+                                        let can_probe = draft_ok && !probe.probing;
+                                        let label = if probe.probing {
+                                            "探测中…".to_string()
+                                        } else {
+                                            "探测连通".to_string()
+                                        };
+                                        let b = btn("signal-probe", label).flex_shrink_0();
+                                        if can_probe {
+                                            b.on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_, _window, cx: &mut App| {
+                                                    let v = signal_http_from_input(
+                                                        input_for_probe.as_ref(),
+                                                        cx,
+                                                    );
+                                                    // 探测前先落盘，避免配置与探测目标不一致
+                                                    if signal_http_ok(&v) {
+                                                        apply_signal_http(v.clone(), false, cx);
+                                                    }
+                                                    probe_signal_http(v, cx);
+                                                },
+                                            )
+                                        } else {
+                                            b.opacity(0.45)
+                                        }
+                                    })
+                                    .child(
+                                        btn("signal-clear", "清除".into())
+                                            .flex_shrink_0()
+                                            .text_color(muted)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_, window, cx: &mut App| {
+                                                    if let Some(inp) = input_for_clear.as_ref() {
+                                                        inp.update(cx, |s, cx| {
+                                                            s.set_value("", window, cx);
+                                                        });
+                                                    }
+                                                    apply_signal_http(String::new(), true, cx);
+                                                    cx.set_global(SignalProbeState::default());
+                                                    window.push_notification(
+                                                        Notification::success("已清除信令地址"),
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(status_line.1)
+                                    .child(status_line.0),
+                            )
+                            .when(dirty && draft_ok, |el| {
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("有未保存修改，点「保存」写入配置（跨网开启时会重启 bridge）。"),
+                                )
+                            })
+                    }
+                }),
                 SettingItem::new(
                     "跨网（WebRTC）",
                     SettingField::switch(
@@ -2395,8 +2768,8 @@ impl Workspace {
                     ),
                 )
                 .description(
-                    "推荐：手机蜂窝也能连。经公网信令握手，数据优先点对点到本机；\
-                     打开后生成可复制 / 扫码的跨网链接（需已部署 smelt-signal）。",
+                    "推荐：手机蜂窝也能连。经上方信令握手，数据优先点对点到本机；\
+                     打开后生成可复制 / 扫码的跨网链接。请先配置并保存信令地址。",
                 ),
                 SettingItem::new(
                     "临时 Cloudflare（高级）",

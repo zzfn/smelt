@@ -51,11 +51,25 @@ export function connectSignaling(url: string, handlers: SignalingHandlers): Sign
   };
 }
 
-/** 从 hello_ok 取出 ICE 配置；缺省时仅 STUN 便于本地 dev */
+/**
+ * 缺省 ICE：多源公共 STUN（与 smelt-signal 一致；hello_ok 会覆盖）。
+ * 国内优先腾讯/小米，Cloudflare 全球免费 STUN，Google 兜底。
+ * 生产应在信令挂 coturn TURN（见 deploy/signal/coturn.md）。
+ */
+export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.qq.com:3478" },
+  { urls: "stun:stun.miwifi.com:3478" },
+  { urls: "stun:stun.cloudflare.com:3478" },
+  { urls: "stun:stun.l.google.com:19302" },
+];
+
+/** 从 hello_ok 取出 ICE 配置；缺省用 DEFAULT_ICE_SERVERS */
 export function iceServersFromHello(msg: { ice_servers?: IceServerConfig[] }): RTCIceServer[] {
   const list = msg.ice_servers?.length
     ? msg.ice_servers
-    : [{ urls: "stun:stun.l.google.com:19302" }];
+    : DEFAULT_ICE_SERVERS.map((s) => ({
+        urls: s.urls as string,
+      }));
   return list.map((s) => ({
     urls: s.urls,
     username: s.username,

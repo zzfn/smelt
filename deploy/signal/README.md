@@ -106,11 +106,26 @@ sudo systemctl restart smelt-signal
 | `install.sh` | VPS：分步安装（超时+日志） |
 | `smelt-signal.service` | systemd |
 | `smelt-signal.env.example` | → `/etc/smelt/smelt-signal.env` |
+| `coturn.md` | TURN 部署说明 |
+| `install-coturn.sh` | 同机装 coturn + 写 `SMELT_ICE_SERVERS` |
+| `rotate-turn-credential.sh` | 手动轮换 TURN 静态密码（凭证是长期的，建议定期跑） |
+| `turnserver.conf.example` | coturn 配置模板 |
 | `Caddyfile` | 可选 Caddy |
 | `Dockerfile` | 可选容器构建 |
 | `.github/workflows/signal.yml` | CI → `signal-nightly` |
 
 ---
+
+## 跨网 ICE（STUN / TURN）
+
+- **默认**：进程内置多源公共 STUN（腾讯 / 小米 / Cloudflare / Google），零配置。
+- **推荐生产**（蜂窝、严格 NAT）：同机装 **coturn**，信令下发 TURN。  
+  → 完整步骤：[`coturn.md`](./coturn.md) · 脚本：[`install-coturn.sh`](./install-coturn.sh)
+
+```bash
+sudo PUBLIC_IP=你的弹性公网IP DOMAIN=signal.你的域名.com \
+  bash install-coturn.sh
+```
 
 ## 腾讯云安全组
 
@@ -119,6 +134,8 @@ sudo systemctl restart smelt-signal
 | TCP 80 | ACME + HTTP |
 | TCP 443 | HTTPS / WSS |
 | TCP 22 | SSH（建议收紧来源） |
+| UDP/TCP **3478** | coturn STUN/TURN（装了才开） |
+| UDP **49152–49251** | coturn 中继（装了才开；可按 conf 调整） |
 
 ---
 

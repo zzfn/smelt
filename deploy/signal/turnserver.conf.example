@@ -1,0 +1,40 @@
+# coturn 配置模板 → 复制为 /etc/turnserver.conf 后改 PUBLIC_IP / 域名 / 密码
+# 安装：见 coturn.md 或 install-coturn.sh
+#
+# 说明：
+# - 3478：STUN/TURN（UDP+TCP）
+# - 49152-49251：中继端口（DataChannel 流量小，不必开满 65535）
+# - 与 smelt-signal 同机时，signal 仍只听 127.0.0.1:7878；本文件只服务 ICE
+
+listening-ip=0.0.0.0
+listening-port=3478
+# 若已有 Let's Encrypt 证书且要 turns:（可选）：
+# tls-listening-port=5349
+# cert=/etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem
+# pkey=/etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem
+
+fingerprint
+lt-cred-mech
+# 静态用户：install-coturn.sh 会改成随机密码
+user=smelt:CHANGE_ME_STRONG_PASSWORD
+realm=signal.example.com
+
+# 腾讯云必须填「弹性公网 IP」（不是内网 IP）
+# 若云厂商 NAT 出口 IP 与弹性 IP 不同，用：external-ip=公网IP/内网IP
+external-ip=YOUR_PUBLIC_IP
+
+min-port=49152
+max-port=49251
+
+# 安全与噪音
+no-cli
+no-multicast-peers
+no-loopback-peers
+# 不把日志打到 syslog 时可开：
+# simple-log
+# log-file=/var/log/turnserver.log
+# verbose
+
+# 进程用户（Debian/Ubuntu 包自带 turnserver 用户）
+# proc-user=turnserver
+# proc-group=turnserver

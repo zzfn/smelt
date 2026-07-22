@@ -21,9 +21,9 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
 pub struct Config {
-    /// 如 https://signal.zhyqhxb.fun
+    /// 用户自部署的信令 HTTP 根，如 https://signal.example.com（必填，无默认）
     pub signal_http: String,
-    /// 如 wss://signal.zhyqhxb.fun/ws（空则从 signal_http 推导）
+    /// 如 wss://signal.example.com/ws（空则从 signal_http 推导）
     pub signal_ws: String,
     /// 本机网关，如 http://127.0.0.1:18765
     pub gateway_base: String,
@@ -38,9 +38,17 @@ pub struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         let signal_http = env::var("SMELT_SIGNAL_HTTP")
-            .unwrap_or_else(|_| "https://signal.zhyqhxb.fun".into())
+            .unwrap_or_default()
+            .trim()
             .trim_end_matches('/')
             .to_string();
+        if signal_http.is_empty()
+            || !(signal_http.starts_with("https://") || signal_http.starts_with("http://"))
+        {
+            bail!(
+                "请设置 SMELT_SIGNAL_HTTP=https://你的信令域名（自部署 smelt-signal，无内置默认）"
+            );
+        }
         let signal_ws = env::var("SMELT_SIGNAL_WS").unwrap_or_else(|_| {
             let u = signal_http
                 .replacen("https://", "wss://", 1)
@@ -152,7 +160,7 @@ fn print_help() {
 smelt-bridge — Mac 跨网桥（host）
 
 环境变量：
-  SMELT_SIGNAL_HTTP     信令 HTTP 根，默认 https://signal.zhyqhxb.fun
+  SMELT_SIGNAL_HTTP     信令 HTTP 根（必填，无默认），如 https://signal.example.com
   SMELT_SIGNAL_WS       信令 WS，默认由 HTTP 推导 …/ws
   SMELT_GATEWAY         本机网关，默认 http://127.0.0.1:18765
   SMELT_GATEWAY_TOKEN   网关 token（必填）
@@ -163,6 +171,7 @@ smelt-bridge — Mac 跨网桥（host）
   # 先起可写网关
   cargo run -p smeltd --bin gateway -- --port 18765 --write
   # 另开终端
+  SMELT_SIGNAL_HTTP=https://signal.example.com \
   SMELT_GATEWAY_TOKEN=<token> cargo run -p smelt-bridge
 "
     );

@@ -1802,11 +1802,10 @@ impl Workspace {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(anyhow::Error::from)?
-                        .block_on(agent::complete_with_system(cfg, system, diff, 100))
+                    smelt_core::block_on::block_on_tokio(agent::complete_with_system(
+                        cfg, system, diff, 100,
+                    ))
+                    .and_then(|r| r)
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {

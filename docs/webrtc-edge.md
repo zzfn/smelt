@@ -156,9 +156,18 @@ cargo run -p smelt-signal
 |------|------|------|
 | `SMELT_SIGNAL_BIND` | `127.0.0.1:7878` | 监听地址 |
 | `SMELT_ROOM_TTL_SECS` | `3600` | 房间默认存活 |
-| `SMELT_ICE_SERVERS` | Google 公共 STUN | JSON 数组，下发给 `hello_ok` |
+| `SMELT_ICE_SERVERS` | 四公共 STUN（见下） | JSON 数组，下发给 `hello_ok` |
 
-本地 dev 只给 STUN；生产把 coturn 写进 `SMELT_ICE_SERVERS`。房间内存存、短时效，进程重启清空。
+**默认公共 STUN（未设环境变量时）：**
+
+1. `stun:stun.qq.com:3478`（腾讯，国内优先）  
+2. `stun:stun.miwifi.com:3478`（小米备份）  
+3. `stun:stun.cloudflare.com:3478`（CF 免费无限 STUN）  
+4. `stun:stun.l.google.com:19302`（Google 兜底）
+
+仅 STUN 约 7～8 成能直连；**手机蜂窝 / 对称 NAT 需要 TURN**。  
+生产：同机 coturn + 写入 `SMELT_ICE_SERVERS`，见 [`deploy/signal/coturn.md`](../deploy/signal/coturn.md)。  
+房间内存存、短时效，进程重启清空。
 
 **公网部署（腾讯云 Ubuntu 等）：** 见 [`deploy/signal/README.md`](../deploy/signal/README.md)  
 （推荐 CI 产物 + systemd + Caddy → `https://域名/health`、`wss://域名/ws`）。
@@ -174,20 +183,23 @@ cargo run -p smeltd --bin gateway -- --port 18765 --write
 # 记下打印的 token=...
 
 # 2) 桥：建房 + host 信令 + WebRTC + 转发 gateway
+#    SMELT_SIGNAL_HTTP 填你自己部署的信令，无内置默认域名
 SMELT_GATEWAY_TOKEN=<token> \
-SMELT_SIGNAL_HTTP=https://signal.zhyqhxb.fun \
+SMELT_SIGNAL_HTTP=https://signal.example.com \
   cargo run -p smelt-bridge
 ```
 
-终端会打印跨网 URL，默认页根是 **信令 HTTPS**（SPA 已嵌进 `smelt-signal`）：
+终端会打印跨网 URL，页根是 **信令 HTTPS**（SPA 已嵌进 `smelt-signal`）：
 
-`https://signal.zhyqhxb.fun/?room=&k=&signal=wss://…/ws&token=`
+`https://signal.example.com/?room=&k=&signal=wss://…/ws&token=`
 
 手机 **只开这一条** 即可；不需要 CF 隧道拉本机网页。业务数据仍是 WebRTC → Mac bridge。
 
+GUI 设置 → 远程 → **信令服务地址** 同样须手动填写（写入 `~/.smelt/collab.json` 的 `signal_http`）。
+
 | 环境变量 | 默认 |
 |----------|------|
-| `SMELT_SIGNAL_HTTP` | `https://signal.zhyqhxb.fun` |
+| `SMELT_SIGNAL_HTTP` | **必填**，无默认 |
 | `SMELT_SIGNAL_WS` | 由 HTTP 推导 `/ws` |
 | `SMELT_GATEWAY` | `http://127.0.0.1:18765` |
 | `SMELT_GATEWAY_TOKEN` | **必填** |

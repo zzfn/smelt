@@ -5,7 +5,7 @@
  * 主动 close() 不会触发 onClose；意外断线会触发 onClose，供上层自动重连。
  */
 
-import { connectSignaling, iceServersFromHello } from "./signaling";
+import { connectSignaling, DEFAULT_ICE_SERVERS, iceServersFromHello } from "./signaling";
 import type { RtcConnectOptions, RtcConnPhase, SignalingMessage, SignalPayload } from "./types";
 import { encodeFrame, type DcFrame } from "./frames";
 
@@ -39,7 +39,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
 
   let pc: RTCPeerConnection | null = null;
   let dc: RTCDataChannel | null = null;
-  let iceServers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  let iceServers: RTCIceServer[] = [...DEFAULT_ICE_SERVERS];
 
   const pendingIce: RTCIceCandidateInit[] = [];
   let remoteDescSet = false;
