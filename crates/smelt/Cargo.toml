@@ -19,6 +19,11 @@ anyhow = "1"
 dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+# ACP 对话粘贴图片：协议要 base64 后的字节（见 acp.rs 的 PromptImage）。
+base64 = "0.22"
+# @ / 补全走 gpui-component 的 CompletionProvider，候选类型来自 lsp-types，
+# 版本必须跟 gpui-component 对齐（0.97 + proposed），否则是两套不兼容的类型。
+lsp-types = { version = "0.97.0", features = ["proposed"] }
 # GPUI + gpui-component（组件库，Apache-2.0）。三者锁到 gpui-component 用的同一个
 # zed commit，避免版本漂移；gpui_platform 开 runtime_shaders 免装完整 Xcode。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }

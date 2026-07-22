@@ -720,13 +720,26 @@ fn parse_hunk(line: &str) -> (u32, u32) {
 // ===================== diff 渲染 =====================
 
 /// diff 行类型 → (前景, 整行背景, 左色条, 行内变化片段深底)。
+/// 色值走 ui_theme 的 diff_* 语义位，深浅两套主题各一份（浅色下「深底」其实是浅底，
+/// 名字保留 hl 语义：比整行底更浓，用来点出行内真正改动的片段）。
 pub(crate) fn diff_colors(kind: DiffKind) -> (Rgba, Option<Rgba>, Option<Rgba>, Rgba) {
+    use crate::ui_theme as t;
     match kind {
-        DiffKind::Add => (rgb(0xb5e08a), Some(rgb(0x16261a)), Some(rgb(0x4ba14b)), rgb(0x2f6b34)),
-        DiffKind::Del => (rgb(0xf7a3ae), Some(rgb(0x2a1620)), Some(rgb(0xc75c6a)), rgb(0x7a2836)),
-        DiffKind::Context => (rgb(0xc0caf5), None, None, rgb(0)),
-        DiffKind::Hunk => (rgb(0x7dcfff), Some(rgb(0x16202e)), None, rgb(0)),
-        DiffKind::Meta => (rgb(0x565f89), None, None, rgb(0)),
+        DiffKind::Add => (
+            rgb(t::diff_add_fg()),
+            Some(rgb(t::diff_add_bg())),
+            Some(rgb(t::diff_add_bar())),
+            rgb(t::diff_add_hl()),
+        ),
+        DiffKind::Del => (
+            rgb(t::diff_del_fg()),
+            Some(rgb(t::diff_del_bg())),
+            Some(rgb(t::diff_del_bar())),
+            rgb(t::diff_del_hl()),
+        ),
+        DiffKind::Context => (rgb(t::diff_ctx_fg()), None, None, rgb(0)),
+        DiffKind::Hunk => (rgb(t::diff_hunk_fg()), Some(rgb(t::diff_hunk_bg())), None, rgb(0)),
+        DiffKind::Meta => (rgb(t::diff_meta_fg()), None, None, rgb(0)),
     }
 }
 
@@ -845,7 +858,7 @@ fn render_diff_line(
             .px_1()
             .flex()
             .justify_end()
-            .text_color(rgb(0x4a5178))
+            .text_color(rgb(crate::ui_theme::text_faint()))
             .child(n.map(|v| v.to_string()).unwrap_or_default())
     };
 
@@ -861,7 +874,7 @@ fn render_diff_line(
     if matches!(l.kind, DiffKind::Add | DiffKind::Del) {
         row = row.cursor_pointer();
         if selected {
-            row = row.border_2().border_color(rgb(0x4a9eff));
+            row = row.border_2().border_color(rgb(crate::ui_theme::blue()));
         }
         let ws = ws.clone();
         row = row.on_click(move |_ev, _window, cx| {
@@ -871,7 +884,7 @@ fn render_diff_line(
     let hunk_idx = hunks.idx_at(i);
     // F7 停在这块就描一道边，跳完才看得出落点。
     if hunk_idx.is_some() && hunk_idx == hunks.active {
-        row = row.border_1().border_color(rgb(0x7dcfff));
+        row = row.border_1().border_color(rgb(crate::ui_theme::diff_hunk_fg()));
     }
     // hunk 头行才需要 hover 分组（按钮藏在里面）。
     if hunk_idx.is_some() {
@@ -905,7 +918,7 @@ pub(crate) fn render_readonly_diff_line(l: &DiffLine, gw: f32) -> Div {
             .px_1()
             .flex()
             .justify_end()
-            .text_color(rgb(0x4a5178))
+            .text_color(rgb(crate::ui_theme::text_faint()))
             .child(n.map(|v| v.to_string()).unwrap_or_default())
     };
     let mut row = div().flex().items_center().h(px(FILE_LINE_H)).whitespace_nowrap();
@@ -991,7 +1004,7 @@ fn render_half(
         .h_full();
     let Some(i) = idx else {
         // 空侧：略暗的底表示「此侧无对应行」。
-        return base.bg(rgb(0x101218));
+        return base.bg(rgb(crate::ui_theme::diff_empty_bg()));
     };
     let l = &lines[i];
     let (fg, bg, bar, hl) = diff_colors(l.kind);
@@ -1003,7 +1016,7 @@ fn render_half(
     if matches!(l.kind, DiffKind::Add | DiffKind::Del) {
         row = row.cursor_pointer();
         if selected.contains(&i) {
-            row = row.border_2().border_color(rgb(0x4a9eff));
+            row = row.border_2().border_color(rgb(crate::ui_theme::blue()));
         }
         let ws = ws.clone();
         row = row.on_click(move |_ev, _window, cx| {
@@ -1020,7 +1033,7 @@ fn render_half(
             .px_1()
             .flex()
             .justify_end()
-            .text_color(rgb(0x4a5178))
+            .text_color(rgb(crate::ui_theme::text_faint()))
             .child(ln.map(|v| v.to_string()).unwrap_or_default()),
     )
     .child(diff_text_area(l, fg, hl))
@@ -1053,7 +1066,7 @@ fn render_split_row(
             // hunk 头在并排视图里也是整行，同样挂按钮；文本占满剩余宽度把按钮推到右边。
             let hunk_idx = hunks.idx_at(*i);
             if hunk_idx.is_some() && hunk_idx == hunks.active {
-                d = d.border_1().border_color(rgb(0x7dcfff));
+                d = d.border_1().border_color(rgb(crate::ui_theme::diff_hunk_fg()));
             }
             if hunk_idx.is_some() {
                 d = d.group(HUNK_ROW_GROUP);
@@ -1073,7 +1086,7 @@ fn render_split_row(
             .w_full()
             .whitespace_nowrap()
             .child(render_half(ri, *l, true, lines, selected, ws, gw))
-            .child(div().w(px(1.)).h_full().bg(rgb(0x2a2e3d))) // 中缝分隔
+            .child(div().w(px(1.)).h_full().bg(rgb(crate::ui_theme::diff_gutter()))) // 中缝分隔
             .child(render_half(ri, *r, false, lines, selected, ws, gw)),
     }
 }
@@ -2929,7 +2942,7 @@ impl Workspace {
                         .items_center()
                         .justify_center()
                         .text_sm()
-                        .text_color(rgb(ui_theme::TEXT_FAINT))
+                        .text_color(rgb(ui_theme::text_faint()))
                         .child("无项目目录"),
                 )
                 .into_any_element();
@@ -2946,9 +2959,9 @@ impl Workspace {
                     .font_family("monospace")
                     // 有待推/待拉才亮绿，0/0 弱化——常绿会把「没事」渲染成「有事」。
                     .text_color(if ahead + behind > 0 {
-                        rgb(ui_theme::GREEN)
+                        rgb(ui_theme::green())
                     } else {
-                        rgb(ui_theme::TEXT_FAINT)
+                        rgb(ui_theme::text_faint())
                     })
                     .child(format!("↑{ahead} ↓{behind}")),
             );
@@ -3007,7 +3020,7 @@ impl Workspace {
                     .pb_1()
                     .text_size(px(10.))
                     .font_semibold()
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .child(title),
             );
             for (rix, row) in build_git_tree(&files, collapsed).into_iter().enumerate() {
@@ -3029,9 +3042,9 @@ impl Workspace {
                                 .py(px(3.))
                                 .text_xs()
                                 .font_family("monospace")
-                                .text_color(rgb(ui_theme::TEXT_MUTED))
+                                .text_color(rgb(ui_theme::text_muted()))
                                 .cursor_pointer()
-                                .hover(|d| d.bg(rgb(ui_theme::BG_HOVER)))
+                                .hover(|d| d.bg(rgb(ui_theme::bg_hover())))
                                 .child(
                                     div()
                                         .w(px(10.))
@@ -3056,11 +3069,11 @@ impl Workspace {
                         let untracked = code == "??";
                         let letter = code.trim().chars().next().unwrap_or('M').to_string();
                         let letter_color = if untracked || letter == "A" {
-                            rgb(ui_theme::GREEN)
+                            rgb(ui_theme::green())
                         } else if letter == "D" {
-                            rgb(ui_theme::RED)
+                            rgb(ui_theme::red())
                         } else {
-                            rgb(ui_theme::ACCENT)
+                            rgb(ui_theme::accent())
                         };
                         // 勾选 = 已暂存：索引位（porcelain 第一位）不是空格/`?`
                         // 就算暂存（判定与全屏页一致）。STAGED 分组里的行天然是勾上的。
@@ -3099,14 +3112,14 @@ impl Workspace {
                                 .text_xs()
                                 .font_family("monospace")
                                 .cursor_pointer()
-                                .hover(|d| d.bg(rgb(ui_theme::BG_HOVER)))
+                                .hover(|d| d.bg(rgb(ui_theme::bg_hover())))
                                 .child(stage_checkbox)
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .text_color(rgb(ui_theme::TEXT))
+                                        .text_color(rgb(ui_theme::text()))
                                         .child(row.name),
                                 )
                                 .child(div().flex_shrink_0().text_color(letter_color).child(letter))
@@ -3136,7 +3149,7 @@ impl Workspace {
                     .flex()
                     .justify_center()
                     .text_sm()
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .child("工作区干净"),
             );
         } else {
@@ -3181,19 +3194,19 @@ impl Workspace {
                 .id(id)
                 .text_xs()
                 .text_color(if enabled {
-                    rgb(ui_theme::TEXT_MUTED)
+                    rgb(ui_theme::text_muted())
                 } else {
-                    rgb(ui_theme::TEXT_FAINT)
+                    rgb(ui_theme::text_faint())
                 })
                 .when(enabled, |d| {
-                    d.cursor_pointer().hover(|d| d.text_color(rgb(ui_theme::TEXT_BRIGHT)))
+                    d.cursor_pointer().hover(|d| d.text_color(rgb(ui_theme::text_bright())))
                 })
                 .child(label)
         };
         let commit_bar = div()
             .flex_shrink_0()
             .border_t_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .p_2p5()
             .flex()
             .flex_col()
@@ -3214,12 +3227,12 @@ impl Workspace {
                     .text_center()
                     .map(|d| {
                         if has_text && !pushing {
-                            d.bg(rgb(ui_theme::ACCENT))
-                                .text_color(rgb(ui_theme::ON_ACCENT))
+                            d.bg(rgb(ui_theme::accent()))
+                                .text_color(rgb(ui_theme::on_accent()))
                                 .cursor_pointer()
                                 .hover(|d| d.opacity(0.9))
                         } else {
-                            d.bg(rgb(ui_theme::BG_CARD)).text_color(rgb(ui_theme::TEXT_FAINT))
+                            d.bg(rgb(ui_theme::bg_card())).text_color(rgb(ui_theme::text_faint()))
                         }
                     })
                     .child(if pushing { "推送中…" } else { "提交并推送" })

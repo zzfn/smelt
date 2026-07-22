@@ -101,6 +101,16 @@ impl Appearance {
     }
 }
 
+/// 把主题模式落到所有吃颜色的层：gpui-component 部件、自绘 UI 语义色板、终端调色板。
+/// **唯一入口**——三处必须同时切，漏一处就是「面板变浅了但终端还是黑的」这种半吊子。
+/// 只改全局态不重绘，调用方自己决定什么时候 `cx.refresh_windows()`
+/// （启动时还没有窗口，切换时才需要）。
+pub fn apply_theme_mode(mode: ThemeMode, cx: &mut App) {
+    Theme::change(mode, None, cx);
+    crate::ui_theme::set_light(!mode.is_dark());
+    terminal::set_dark_mode(mode.is_dark());
+}
+
 /// 外观设置文件路径：~/.smelt/appearance.json。
 fn appearance_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".smelt").join("appearance.json"))
@@ -244,10 +254,137 @@ pub struct AgentUiConfig {
     /// 状态通道进入「等你批准 / 等你输入」时用 Notification 组件弹出。
     #[serde(default = "default_true")]
     pub notify_awaiting: bool,
-    /// ACP 会话的 agent 启动命令（空白分词）。默认 Claude 官方适配器；权限门保留
-    /// ——结构化审批正是这条通道的卖点，别在这里加 bypass 类参数。
+    /// Claude ACP 会话的 agent 启动命令（空白分词）。默认 Claude 官方适配器；权限门
+    /// 保留——结构化审批正是这条通道的卖点，别在这里加 bypass 类参数。
+    ///
+    /// 字段名没跟着 `AcpAgentKind` 改成 `acp_claude_cmd`：老配置文件里就叫这个，
+    /// 改名等于把用户自定义过的命令悄悄重置回默认。
     #[serde(default = "default_acp_cmd")]
     pub acp_cmd: String,
+    /// GitHub Copilot ACP 会话的启动命令。
+    #[serde(default = "default_acp_copilot_cmd")]
+    pub acp_copilot_cmd: String,
+    /// Codex ACP 会话的启动命令。
+    #[serde(default = "default_acp_codex_cmd")]
+    pub acp_codex_cmd: String,
+    /// Grok ACP 会话的启动命令。
+    #[serde(default = "default_acp_grok_cmd")]
+    pub acp_grok_cmd: String,
+}
+
+impl AgentUiConfig {
+    /// 某个 agent 种类当前生效的启动命令。
+    pub fn acp_cmd_for(&self, agent: AcpAgentKind) -> String {
+        match agent {
+            AcpAgentKind::Claude => self.acp_cmd.clone(),
+            AcpAgentKind::Copilot => self.acp_copilot_cmd.clone(),
+            AcpAgentKind::Codex => self.acp_codex_cmd.clone(),
+            AcpAgentKind::Grok => self.acp_grok_cmd.clone(),
+        }
+    }
+
+    /// 改某个 agent 的启动命令（设置页三条输入框共用）。
+    pub fn set_acp_cmd_for(&mut self, agent: AcpAgentKind, cmd: String) {
+        match agent {
+            AcpAgentKind::Claude => self.acp_cmd = cmd,
+            AcpAgentKind::Copilot => self.acp_copilot_cmd = cmd,
+            AcpAgentKind::Codex => self.acp_codex_cmd = cmd,
+            AcpAgentKind::Grok => self.acp_grok_cmd = cmd,
+        }
+    }
+}
+
+/// ACP 会话可接的 agent 种类。**新增一种 agent = 这个枚举加一条**，命令、显示名、
+/// 设置项、新建菜单都从这里派生，别再散着写死。
+///
+/// 序列化用 `id()` 那串小写标识（存进 workspace.json 的 ACP 会话存档），不用
+/// serde 派生——枚举变体名将来改了不该炸存档。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AcpAgentKind {
+    Claude,
+    Copilot,
+    Codex,
+    Grok,
+}
+
+impl AcpAgentKind {
+    /// 新建菜单 / 设置页的排列顺序。
+    pub const ALL: [Self; 4] = [Self::Claude, Self::Copilot, Self::Codex, Self::Grok];
+
+    /// 存档标识（稳定，别改）。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Copilot => "copilot",
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+        }
+    }
+
+    /// 存档标识 → 种类；认不出（旧存档 / 手改坏了）返回 None，调用方自己兜底。
+    pub fn from_id(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.id() == s)
+    }
+
+    /// 给人看的 agent 名（会话标题、启动横幅、菜单项共用）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Copilot => "GitHub Copilot",
+            Self::Codex => "Codex",
+            Self::Grok => "Grok",
+        }
+    }
+
+    /// 短名：会话标题这种窄地方用（「Copilot 对话 · smelt」）。
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Copilot => "Copilot",
+            Self::Codex => "Codex",
+            Self::Grok => "Grok",
+        }
+    }
+
+    /// 出厂启动命令。
+    pub fn default_cmd(self) -> String {
+        match self {
+            Self::Claude => default_acp_cmd(),
+            Self::Copilot => default_acp_copilot_cmd(),
+            Self::Codex => default_acp_codex_cmd(),
+            Self::Grok => default_acp_grok_cmd(),
+        }
+    }
+}
+
+/// 全局配置里某个 agent 的启动命令；配置还没装载就退回出厂值。
+pub fn acp_cmd_for(agent: AcpAgentKind, cx: &App) -> String {
+    cx.try_global::<AgentUiConfig>()
+        .map(|c| c.acp_cmd_for(agent))
+        .unwrap_or_else(|| agent.default_cmd())
+}
+
+/// 设置页「Agent 集成」里每个 agent 一条启动命令输入框（从枚举派生，加一家
+/// agent 不用回来抄第四遍）。
+fn acp_cmd_setting_item(agent: AcpAgentKind) -> SettingItem {
+    SettingItem::new(
+        format!("{} 启动命令", agent.label()),
+        SettingField::input(
+            move |cx: &App| acp_cmd_for(agent, cx).into(),
+            move |v: SharedString, cx: &mut App| {
+                let v = v.trim().to_string();
+                // 留空 = 恢复该 agent 的出厂命令（不是清成空串跑不起来）。
+                let cmd = if v.is_empty() { agent.default_cmd() } else { v };
+                apply_agent_ui(move |c| c.set_acp_cmd_for(agent, cmd), cx);
+            },
+        ),
+    )
+    .description(format!(
+        "「{}」对话会话的 agent 启动命令（ACP 协议，空白分词）。\
+         留空恢复默认；改动只影响之后新建的会话。",
+        agent.label()
+    ))
+    .keywords(["acp", "对话", "agent", agent.id()])
 }
 
 pub fn default_acp_cmd() -> String {
@@ -268,11 +405,40 @@ pub fn default_acp_cmd() -> String {
     "bunx --bun @agentclientprotocol/claude-agent-acp@0.59.0".to_string()
 }
 
+pub fn default_acp_copilot_cmd() -> String {
+    // Copilot CLI 自带 ACP 服务端，不需要适配器：`copilot --help` 里明写
+    // `--acp  Start as Agent Client Protocol server`（实测 1.0.73）。
+    // 代价是得先装 CLI（`brew install copilot` / npm `@github/copilot`）并
+    // `copilot` 登录过——找不到命令时 Fatal 会带上 stderr 说明。
+    "copilot --acp".to_string()
+}
+
+pub fn default_acp_codex_cmd() -> String {
+    // Codex CLI 自己**没有** ACP 入口（`codex --help` 只有 mcp / mcp-server），
+    // 走 Zed 维护的适配器包；它按平台分发原生二进制（optionalDependencies），
+    // bunx 会自动取对应架构那份。同样锁版本，理由见 default_acp_cmd。
+    // 登录态复用 codex CLI 的 `~/.codex`。
+    "bunx --bun @zed-industries/codex-acp@0.16.0".to_string()
+}
+
+pub fn default_acp_grok_cmd() -> String {
+    // Grok CLI 自带 ACP：`grok agent stdio`（help 里只写「Run the agent over
+    // stdio」没提协议名，实测发 initialize 能正常握手，agentCapabilities 齐全）。
+    // 需先装 grok CLI 并登录（凭据在 ~/.grok/auth.json）。
+    //
+    // 注意它 `promptCapabilities.image = false`——四家里唯一不收图的，粘贴图片
+    // 对 Grok 会话没用。
+    "grok agent stdio".to_string()
+}
+
 impl Default for AgentUiConfig {
     fn default() -> Self {
         Self {
             notify_awaiting: true,
             acp_cmd: default_acp_cmd(),
+            acp_copilot_cmd: default_acp_copilot_cmd(),
+            acp_codex_cmd: default_acp_codex_cmd(),
+            acp_grok_cmd: default_acp_grok_cmd(),
         }
     }
 }
@@ -1917,19 +2083,21 @@ impl Workspace {
             .clone();
         let appearance_page = SettingPage::new("外观").default_open(true).group(
             SettingGroup::new().items(vec![
-                // 本版仅深色：设计稿只有深色方案，开关撤掉换成说明行——
-                // 比留一个拨了没反应的开关诚实（main() 初始化处无条件 Dark）。
                 SettingItem::new(
                     "主题模式",
-                    SettingField::render(|_, _, cx: &mut App| {
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("本版本仅提供深色主题")
-                            .into_any_element()
-                    }),
+                    SettingField::switch(
+                        |cx: &App| cx.global::<Appearance>().theme_mode.is_dark(),
+                        |v: bool, cx: &mut App| {
+                            let mode = if v { ThemeMode::Dark } else { ThemeMode::Light };
+                            apply_appearance(|a| a.theme_mode = mode, cx);
+                            apply_theme_mode(mode, cx);
+                            // 色板是进程级全局态（见 ui_theme），改完不重绘就还是旧色。
+                            cx.refresh_windows();
+                        },
+                    )
+                    .default_value(true),
                 )
-                .description("浅色方案待设计稿补齐后恢复"),
+                .description("开启为深色主题，关闭为浅色主题"),
                 SettingItem::new(
                     "字体大小",
                     SettingField::render(move |_, _, cx: &mut App| {
@@ -2373,10 +2541,10 @@ impl Workspace {
                     btn_hover(
                         "restart-update",
                         "立即重启更新".into(),
-                        Hsla::from(rgba(0x4a9eff40)),
+                        Hsla::from(crate::ui_theme::tint(crate::ui_theme::blue(), 0x40)),
                     )
-                        .text_color(rgb(0x8fc7ff))
-                        .bg(Hsla::from(rgba(0x4a9eff24)))
+                        .text_color(rgb(crate::ui_theme::blue()))
+                        .bg(Hsla::from(crate::ui_theme::tint(crate::ui_theme::blue(), 0x24)))
                         .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
                             if let updater::UpdateStatus::ReadyToInstall { staged_app, .. } = &status {
                                 // 先 handoff smeltd 再换 .app，避免会话全灭后对话被「重新初始化」。
@@ -2475,10 +2643,10 @@ impl Workspace {
                     let restart_daemon_btn = btn_hover(
                         "restart-daemon",
                         "重启守护进程".into(),
-                        Hsla::from(rgba(0xef444440)),
+                        Hsla::from(crate::ui_theme::tint(crate::ui_theme::red(), 0x40)),
                     )
-                        .text_color(rgb(0xff8f8f))
-                        .bg(Hsla::from(rgba(0xef444424)))
+                        .text_color(rgb(crate::ui_theme::red()))
+                        .bg(Hsla::from(crate::ui_theme::tint(crate::ui_theme::red(), 0x24)))
                         .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut App| {
                             restart_entity.update(cx, |this, cx| {
                                 this.show_daemon_restart_confirm = true;
@@ -2549,8 +2717,8 @@ impl Workspace {
                 })),
         );
 
-        // —— Claude 集成：审批通知 + hooks 安装/还原 ——
-        let agent_page = SettingPage::new("Claude 集成").group(
+        // —— Agent 集成：ACP 启动命令 + 审批通知 + Claude hooks 安装/还原 ——
+        let agent_page = SettingPage::new("Agent 集成").group(
             SettingGroup::new()
                 .item(
                     SettingItem::new(
@@ -2572,34 +2740,10 @@ impl Workspace {
                     )
                     .keywords(["通知", "notification", "审批"]),
                 )
-                .item(
-                    SettingItem::new(
-                        "ACP 启动命令",
-                        SettingField::input(
-                            |cx: &App| {
-                                cx.try_global::<AgentUiConfig>()
-                                    .map(|c| c.acp_cmd.clone())
-                                    .unwrap_or_else(default_acp_cmd)
-                                    .into()
-                            },
-                            |v: SharedString, cx: &mut App| {
-                                let v = v.trim().to_string();
-                                apply_agent_ui(
-                                    |c| {
-                                        c.acp_cmd =
-                                            if v.is_empty() { default_acp_cmd() } else { v.clone() }
-                                    },
-                                    cx,
-                                );
-                            },
-                        ),
-                    )
-                    .description(
-                        "「Claude 消息流」会话的 agent 启动命令（ACP 协议，空白分词）。\
-                         留空恢复默认；改动只影响之后新建的会话。",
-                    )
-                    .keywords(["acp", "消息流", "agent", "claude"]),
-                )
+                .item(acp_cmd_setting_item(AcpAgentKind::Claude))
+                .item(acp_cmd_setting_item(AcpAgentKind::Copilot))
+                .item(acp_cmd_setting_item(AcpAgentKind::Codex))
+                .item(acp_cmd_setting_item(AcpAgentKind::Grok))
                 .item(SettingItem::render(move |_, _, cx: &mut App| {
                     let installed = claude_hooks_installed();
                     let (fg, muted, border) = {
@@ -2612,7 +2756,7 @@ impl Workspace {
                         "未安装（结构面板只能靠标题猜测，hook 事实不会上报）"
                     };
                     let status_color: Hsla = if installed {
-                        rgb(0x22c55e).into()
+                        rgb(crate::ui_theme::green()).into()
                     } else {
                         muted
                     };
@@ -2645,9 +2789,9 @@ impl Workspace {
                                         .cursor_pointer()
                                         .border_1()
                                         .border_color(border)
-                                        .bg(rgba(0x22c55e22))
+                                        .bg(crate::ui_theme::tint(crate::ui_theme::green(), 0x22))
                                         .text_sm()
-                                        .text_color(rgb(0x22c55e))
+                                        .text_color(rgb(crate::ui_theme::green()))
                                         .hover(|s| s.opacity(0.9))
                                         .child(if installed {
                                             "重新安装 hooks"
@@ -3149,6 +3293,8 @@ impl Workspace {
                                 div()
                                     .p_2()
                                     .rounded(px(8.))
+                                    // 二维码底必须是纯白，两种主题都一样：
+                                    // 深色底上的二维码扫不出来。别跟着色板走。
                                     .bg(gpui::rgb(0xffffff))
                                     .child(
                                         img(std::sync::Arc::new(Image::from_bytes(

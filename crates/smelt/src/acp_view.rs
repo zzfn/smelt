@@ -10,8 +10,11 @@ use gpui::{
     InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
     Window,
 };
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{h_flex, v_flex, ActiveTheme, StyledExt};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::spinner::Spinner;
+use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable, StyledExt};
 
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, Plan, PlanEntryStatus, SessionId, ToolCallId,
@@ -20,8 +23,9 @@ use agent_client_protocol::schema::v1::{
 
 use crate::acp::{
     spawn_acp, AcpCommand, AcpEvent, AcpHandle, AcpLaunch, ElicitField, ElicitFieldKind,
-    ElicitationResponder, PermissionResponder,
+    ElicitationResponder, ModelState, PermissionResponder, ReadyKind,
 };
+use crate::settings::AcpAgentKind;
 use crate::terminal::{DaemonPhase, DaemonSessionState};
 use crate::ui_theme;
 
@@ -71,6 +75,15 @@ enum AcpPhase {
     Ended(String),
 }
 
+/// `@` / `/` 补全弹层的状态。回合态，不落盘。
+struct CompletionPopup {
+    /// 触发 token 在输入框文本里的字节范围（含 `@`/`/`），接受候选时按它替换。
+    start: usize,
+    end: usize,
+    items: Vec<crate::acp_completion::Candidate>,
+    selected: usize,
+}
+
 /// 待审批卡片：responder 是 Option 因为 select 消费所有权（从 &mut self take）。
 struct PermissionCard {
     question: String,
@@ -112,6 +125,17 @@ pub struct AcpView {
     handle: Option<AcpHandle>,
     /// 重启用的启动参数（placeholder / restart 共用）。
     cmd: String,
+    /// 这条会话接的是哪个 agent（Claude / Copilot / Codex）：决定显示名，也决定
+    /// 「重新开始」时该去全局配置的哪一条命令上取最新值。
+    agent: AcpAgentKind,
+    /// 已粘进来、等着随下一条 prompt 发出去的图片（缩略图条显示，发完清空）。
+    /// 只在内存里待到发送为止：图片体积大，不进 workspace.json。
+    pending_images: Vec<std::sync::Arc<gpui::Image>>,
+    /// `@` / `/` 补全弹层的当前状态；None = 没在补全。
+    completion: Option<CompletionPopup>,
+    /// cwd 下的文件清单缓存（`@` 的候选源）。每敲一个字符跑一次 git ls-files
+    /// 会明显卡手，所以一次会话只列一次。
+    file_cache: Option<std::rc::Rc<Vec<String>>>,
     /// agent 侧真实的 session id：握手成功后写入，`restart()` 拿它去尝试
     /// `session/load` 真续接；也存盘（main.rs AcpSaved），GUI 重开后同样能续。
     acp_session_id: Option<SessionId>,
@@ -121,14 +145,26 @@ pub struct AcpView {
     /// 吞掉不重复；等到 agent 给出实质响应/turn 收尾就清掉，之后的 UserChunk
     /// （只可能来自 replay）正常追加显示。
     awaiting_user_echo: bool,
-    /// 会话当前可用的命令数（输入框工具栏胶囊展示）；None = agent 没发过这个
-    /// 更新（不是「0 个」，是「不知道」，不该显示成 0）。
-    available_commands: Option<usize>,
+    /// 会话当前可用的斜杠命令 (名字, 说明)；空 = agent 没发过这个更新。
+    /// 胶囊点开列出来、点一条填进输入框——只显示数量没有任何用处。
+    available_commands: Vec<(String, String)>,
+    /// 上下文用量：(已用 token, 窗口大小)。None = agent 没上报过，不显示。
+    usage: Option<(u64, u64)>,
+    /// 本次启动/续接的起点，用来在横幅上报「已等了几秒」。
+    /// 实测 `session/new` 里 Claude Code 自身要约 10 秒（跟下载无关，同一适配器
+    /// 进程建第二个会话一样慢），没有进度反馈会让人以为卡死了。
+    starting_since: Option<std::time::Instant>,
     /// agent 最近一次上报的任务计划（每次全量覆盖）。回合态：不落盘，
     /// TurnEnded 保留最后一份供回看，「重新开始」清空。
     plan: Option<Plan>,
     /// PLAN 条折叠态（默认展开，跟设计稿一致）。
     plan_collapsed: bool,
+    /// 模型状态：当前名 + 可切换的候选（协议给什么显示什么）；None = agent
+    /// 没上报过，UI 就不显示模型胶囊，不拿适配器包名冒充。
+    model: Option<ModelState>,
+    /// 手动展开了完整输出的工具调用（key = tool_call_id）。长输出默认折叠成
+    /// 前几行 + 「展开」，回合态不落盘。
+    expanded_tools: std::collections::HashSet<String>,
     /// 冷恢复占位待自动续接：GUI 重启后第一次切到这个会话时自动 restart
     /// （协议级 session/load 续接），免去手点「重新开始」。只消费一次——
     /// 自动续接失败（Fatal → Ended）后回到手动，错误得让人看见，不能循环重试。
@@ -143,11 +179,13 @@ impl AcpView {
     pub fn start(
         window: &mut Window,
         cx: &mut Context<Self>,
+        agent: AcpAgentKind,
         cmd: String,
         cwd: Option<String>,
     ) -> Self {
-        let mut this = Self::placeholder(cx, cmd, cwd, String::new(), Vec::new(), None);
+        let mut this = Self::placeholder(cx, agent, cmd, cwd, String::new(), Vec::new(), None);
         this.phase = AcpPhase::Starting;
+        this.starting_since = Some(std::time::Instant::now());
         this.init_input(window, cx);
         let handle = spawn_acp(AcpLaunch {
             cmd: this.cmd.clone(),
@@ -165,6 +203,7 @@ impl AcpView {
     /// 机会在「重新开始」时真续接。
     pub fn placeholder(
         cx: &mut Context<Self>,
+        agent: AcpAgentKind,
         cmd: String,
         cwd: Option<String>,
         reason: String,
@@ -187,11 +226,19 @@ impl AcpView {
             input: None,
             handle: None,
             cmd,
+            agent,
+            pending_images: Vec::new(),
+            completion: None,
+            file_cache: None,
             acp_session_id: resume_session_id,
             awaiting_user_echo: false,
-            available_commands: None,
+            available_commands: Vec::new(),
+            usage: None,
+            starting_since: None,
             plan: None,
             plan_collapsed: false,
+            model: None,
+            expanded_tools: std::collections::HashSet::new(),
             scroll: gpui::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _input_sub: None,
@@ -210,14 +257,19 @@ impl AcpView {
         // 一个有 zod 依赖 bug 的适配器版本，改了默认值后，已存在的旧会话点
         // 「重新开始」却因为这里死守 self.cmd 而继续用旧版本，看起来像「修复
         // 没生效」。
+        // 取的是**本会话这个 agent** 那一条配置：多 agent 之后死拿 acp_cmd 会让
+        // Copilot / Codex 会话一点「重新开始」就变成 Claude 会话。
         if let Some(cfg) = cx.try_global::<crate::settings::AgentUiConfig>() {
-            self.cmd = cfg.acp_cmd.clone();
+            self.cmd = cfg.acp_cmd_for(self.agent);
         }
         self.permission = None;
         self.elicitation = None;
         self.plan = None; // 计划是回合态，新会话不该带着上一段的进度条
+        self.model = None; // 模型等新会话握手后重新上报
+        self.usage = None; // 上下文用量属于旧会话，别带到新的上
         self.completed_unread = false;
         self.phase = AcpPhase::Starting;
+        self.starting_since = Some(std::time::Instant::now());
         self.init_input(window, cx);
         let handle = spawn_acp(AcpLaunch {
             cmd: self.cmd.clone(),
@@ -236,12 +288,12 @@ impl AcpView {
     /// 「空闲」胶囊，自相矛盾。
     pub(crate) fn phase_label(&self) -> (&'static str, u32) {
         match &self.phase {
-            AcpPhase::Starting => ("启动中", ui_theme::BLUE),
-            AcpPhase::Idle => ("空闲", ui_theme::TEXT_FAINT),
-            AcpPhase::Running => ("运行中", ui_theme::BLUE),
-            AcpPhase::AwaitingApproval => ("等你批准", ui_theme::YELLOW),
-            AcpPhase::AwaitingChoice => ("等你选择", ui_theme::YELLOW),
-            AcpPhase::Ended(_) => ("已结束", ui_theme::TEXT_FAINT),
+            AcpPhase::Starting => ("启动中", ui_theme::blue()),
+            AcpPhase::Idle => ("空闲", ui_theme::text_faint()),
+            AcpPhase::Running => ("运行中", ui_theme::blue()),
+            AcpPhase::AwaitingApproval => ("等你批准", ui_theme::yellow()),
+            AcpPhase::AwaitingChoice => ("等你选择", ui_theme::yellow()),
+            AcpPhase::Ended(_) => ("已结束", ui_theme::text_faint()),
         }
     }
 
@@ -263,7 +315,7 @@ impl AcpView {
         }
         let input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("给 agent 的指令，Enter 发送，Shift+Enter 换行")
+                .placeholder("给 agent 的指令：@ 引文件，/ 用命令，Enter 发送，Shift+Enter 换行")
                 .multi_line(true)
                 .auto_grow(1, 8)
         });
@@ -271,20 +323,50 @@ impl AcpView {
             &input,
             window,
             |this: &mut Self, _input, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { shift, .. } = ev {
-                    if !shift {
-                        this.submit_input(window, cx);
+                match ev {
+                    InputEvent::PressEnter { shift, .. } => {
+                        if !shift {
+                            this.submit_input(window, cx);
+                        }
                     }
+                    // 每次文本变化重算补全 token（打 `@`/`/` 就弹，打空格就收）。
+                    InputEvent::Change => this.refresh_completion(cx),
+                    InputEvent::Blur => this.completion = None,
+                    _ => {}
                 }
             },
         ));
         self.input = Some(input);
     }
 
+    /// 启动期每秒重绘一次，让横幅上的「已 N 秒」真的在走。
+    /// 相位离开 Starting 就自然停（不占常驻定时器）。
+    fn tick_starting(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                let keep = this
+                    .update(cx, |v, cx| {
+                        let starting = matches!(v.phase, AcpPhase::Starting);
+                        if starting {
+                            cx.notify();
+                        }
+                        starting
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// 挂上连接句柄并起事件 drain（start / restart 共用）。
     fn attach_handle(&mut self, handle: AcpHandle, cx: &mut Context<Self>) {
         let event_rx = handle.event_rx.clone();
         self.handle = Some(handle);
+        self.tick_starting(cx);
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = event_rx.recv().await {
                 if this.update(cx, |view, cx| view.apply_event(ev, cx)).is_err() {
@@ -326,6 +408,100 @@ impl AcpView {
     /// 启动命令（存档用：重开 GUI 后按它「重新开始」）。
     pub fn launch_cmd(&self) -> &str {
         &self.cmd
+    }
+
+    /// 这条会话接的 agent 种类（存档 / 标题 / 舞台头胶囊用）。
+    pub fn agent_kind(&self) -> AcpAgentKind {
+        self.agent
+    }
+
+    /// agent 报上来的斜杠命令（`/` 补全的候选源，见 acp_completion.rs）。
+    pub fn available_commands(&self) -> &[(String, String)] {
+        &self.available_commands
+    }
+
+    /// cwd 下的文件清单（首次调用才真去列，之后走缓存）。
+    fn file_list(&mut self) -> std::rc::Rc<Vec<String>> {
+        if let Some(cached) = &self.file_cache {
+            return cached.clone();
+        }
+        let list = self
+            .cwd
+            .as_deref()
+            .map(crate::acp_completion::list_files)
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()));
+        self.file_cache = Some(list.clone());
+        list
+    }
+
+    /// 按输入框当前内容重算补全候选。
+    fn refresh_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.input.clone() else {
+            self.completion = None;
+            return;
+        };
+        let (text, cursor) = {
+            let s = input.read(cx);
+            (s.value().to_string(), s.cursor())
+        };
+        // cursor 是字节偏移，可能落在多字节字符中间（中文输入过程中），
+        // 切之前先确认是字符边界，否则 panic。
+        let cursor = cursor.min(text.len());
+        if !text.is_char_boundary(cursor) {
+            return;
+        }
+        let Some(trigger) = crate::acp_completion::detect_trigger(&text[..cursor]) else {
+            if self.completion.is_some() {
+                self.completion = None;
+                cx.notify();
+            }
+            return;
+        };
+        let files = match trigger.kind {
+            crate::acp_completion::Kind::At => self.file_list(),
+            crate::acp_completion::Kind::Slash => std::rc::Rc::new(Vec::new()),
+        };
+        let items =
+            crate::acp_completion::candidates(&trigger, &files, &self.available_commands);
+        self.completion = (!items.is_empty()).then(|| CompletionPopup {
+            start: trigger.start,
+            end: cursor,
+            items,
+            selected: 0,
+        });
+        cx.notify();
+    }
+
+    /// 上下移动补全选中项（返回 false = 当前没在补全，按键该交回输入框）。
+    fn move_completion(&mut self, delta: i32, cx: &mut Context<Self>) -> bool {
+        let Some(popup) = &mut self.completion else { return false };
+        let n = popup.items.len() as i32;
+        popup.selected = (popup.selected as i32 + delta).rem_euclid(n) as usize;
+        cx.notify();
+        true
+    }
+
+    /// 把选中的候选替换进输入框（返回 false = 没在补全）。
+    fn accept_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(popup) = self.completion.take() else { return false };
+        let Some(input) = self.input.clone() else { return false };
+        let Some(item) = popup.items.get(popup.selected) else { return false };
+        let insert = item.insert.clone();
+        input.update(cx, |s, cx| {
+            let text = s.value().to_string();
+            // 只换掉触发 token 那一段，光标后面的内容原样留着。
+            if popup.start <= popup.end
+                && popup.end <= text.len()
+                && text.is_char_boundary(popup.start)
+                && text.is_char_boundary(popup.end)
+            {
+                let merged = format!("{}{}{}", &text[..popup.start], insert, &text[popup.end..]);
+                s.set_value(merged, window, cx);
+            }
+            s.focus(window, cx);
+        });
+        cx.notify();
+        true
     }
 
     /// 末几条消息的纯文本（总览卡片迷你预览，对齐终端的 last_lines）。
@@ -405,13 +581,32 @@ impl AcpView {
     }
 
     /// 总览快捷回复直达（对齐终端会话的 send_key_to_session 语义）。
+    /// 连带把已粘贴的待发图片一起发出去并清空。
     pub fn send_prompt(&mut self, text: String, cx: &mut Context<Self>) {
-        if text.trim().is_empty() {
+        // 光有图没有字也算一条有效 prompt（「这截图什么意思」式的用法）。
+        if text.trim().is_empty() && self.pending_images.is_empty() {
             return;
         }
+        let images: Vec<crate::acp::PromptImage> = self
+            .pending_images
+            .iter()
+            .map(|im| crate::acp::PromptImage {
+                mime: image_mime(im.format).to_string(),
+                data_b64: base64_encode(&im.bytes),
+            })
+            .collect();
+        let img_count = images.len();
         if let Some(h) = &self.handle {
-            if h.cmd_tx.try_send(AcpCommand::Prompt(text.clone())).is_ok() {
-                self.entries.push(AcpEntry::User(text));
+            if h.cmd_tx.try_send(AcpCommand::Prompt { text: text.clone(), images }).is_ok() {
+                // 历史里只留「带了几张图」的标记：base64 动辄几 MB，进不得
+                // workspace.json（那是每条消息都要落盘的存档）。
+                let shown = match (text.is_empty(), img_count) {
+                    (_, 0) => text,
+                    (true, n) => format!("[{n} 张图片]"),
+                    (false, n) => format!("{text}\n[{n} 张图片]"),
+                };
+                self.entries.push(AcpEntry::User(shown));
+                self.pending_images.clear();
                 self.awaiting_user_echo = true;
                 self.phase = AcpPhase::Running;
                 self.completed_unread = false;
@@ -419,6 +614,23 @@ impl AcpView {
                 cx.notify();
             }
         }
+    }
+
+    /// 剪贴板里是图就收进待发列表（返回 true 表示这次粘贴被图片消费掉了，
+    /// 调用方据此拦下事件，别再让输入框按文本粘一遍）。
+    fn take_clipboard_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else { return false };
+        let mut got = false;
+        for entry in item.into_entries() {
+            if let gpui::ClipboardEntry::Image(image) = entry {
+                self.pending_images.push(std::sync::Arc::new(image));
+                got = true;
+            }
+        }
+        if got {
+            cx.notify();
+        }
+        got
     }
 
     /// 关闭会话：让连接收摊（drop 子进程），并从全局状态表摘掉自己。
@@ -434,7 +646,8 @@ impl AcpView {
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(input) = self.input.clone() else { return };
         let text = input.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        // 只贴了图没打字也要能发。
+        if text.is_empty() && self.pending_images.is_empty() {
             return;
         }
         input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -445,16 +658,32 @@ impl AcpView {
     fn apply_event(&mut self, ev: AcpEvent, cx: &mut Context<Self>) {
         // 持久化要排除的事件（match 会消费 ev，得在此之前先记下来）：
         // AgentChunk 是逐块流式增量，触发太密；Plan 本来就不落盘，触发没意义。
-        let skip_persist = matches!(ev, AcpEvent::AgentChunk { .. } | AcpEvent::Plan(_));
+        let skip_persist =
+            matches!(
+                ev,
+                AcpEvent::AgentChunk { .. }
+                    | AcpEvent::Plan(_)
+                    | AcpEvent::Model(_)
+                    | AcpEvent::Usage { .. }
+            );
         // 除 UserChunk/Status/AvailableCommands 外的任何事件都代表「已经过了
         // 等自己那条 prompt 回声的窗口」——后两者是跟对话轮次推进无关的元数据
         // 更新，agent 给出实质响应或者 turn 收尾才算真的翻篇。
-        if !matches!(ev, AcpEvent::UserChunk(_) | AcpEvent::Status(_) | AcpEvent::AvailableCommands(_)) {
+        if !matches!(
+            ev,
+            AcpEvent::UserChunk(_)
+                | AcpEvent::Status(_)
+                | AcpEvent::AvailableCommands(_)
+                | AcpEvent::Usage { .. }
+        ) {
             self.awaiting_user_echo = false;
         }
         match ev {
-            AcpEvent::AvailableCommands(n) => {
-                self.available_commands = Some(n);
+            AcpEvent::AvailableCommands(list) => {
+                self.available_commands = list;
+            }
+            AcpEvent::Usage { used, size, .. } => {
+                self.usage = (size > 0).then_some((used, size));
             }
             AcpEvent::Status(msg) => {
                 self.status_line = Some(msg);
@@ -471,21 +700,24 @@ impl AcpView {
                     }
                 }
             }
-            AcpEvent::Ready { session_id, resumed } => {
+            AcpEvent::Ready { session_id, kind } => {
                 self.acp_session_id = Some(session_id);
-                if resumed {
-                    // 真续接：agent 马上会把完整历史重放一遍（session/update
-                    // 通知，走正常的 AgentChunk/ToolCall 分支），本地快照先清空
-                    // 避免重复；重放内容比本地快照更权威。
-                    self.entries.clear();
-                } else if !self.entries.is_empty() {
-                    // 这其实是一次全新会话（没有旧 id / adapter 不支持 load /
-                    // load 失败），但本地还留着之前的历史——插分割线做标记，
-                    // 不能让人以为对话凭空断了。
-                    self.entries.push(AcpEntry::Divider(format!(
-                        "新会话 · {}",
-                        chrono::Local::now().format("%m-%d %H:%M")
-                    )));
+                match kind {
+                    // `session/load` 续接：agent 马上把完整历史重放一遍，本地
+                    // 快照先清空避免变成两份（重放内容比本地快照权威）。
+                    ReadyKind::ResumedWithReplay => self.entries.clear(),
+                    // `session/resume` 续接：不重放，本地快照就是全部内容——
+                    // 既不能清（清了就真没了），也别插分割线（对话是连着的）。
+                    ReadyKind::ResumedKeepHistory => {}
+                    // 全新会话，但本地还留着上一段——插分割线标明断点，
+                    // 不能让人以为 agent 记得上面的内容。
+                    ReadyKind::Fresh if !self.entries.is_empty() => {
+                        self.entries.push(AcpEntry::Divider(format!(
+                            "新会话 · agent 不记得以上内容 · {}",
+                            chrono::Local::now().format("%m-%d %H:%M")
+                        )));
+                    }
+                    ReadyKind::Fresh => {}
                 }
                 self.phase = AcpPhase::Idle;
                 self.status_line = None;
@@ -529,6 +761,9 @@ impl AcpView {
                         *output = tool_content_parts(&c);
                     }
                 }
+            }
+            AcpEvent::Model(state) => {
+                self.model = Some(state);
             }
             AcpEvent::Plan(p) => {
                 // 每次全量覆盖：协议约定 Plan 更新携带完整清单，不做增量合并。
@@ -721,6 +956,19 @@ impl AcpView {
         cx.notify();
     }
 
+    /// 当前模型的人类可读名（舞台头显示用）；None = agent 没上报过。
+    pub(crate) fn model_name(&self) -> Option<String> {
+        self.model.as_ref().map(|m| m.current_name.clone())
+    }
+
+    /// 切模型：值 id 来自协议给的候选列表。turn 跑着时也能切——协议允许，
+    /// 生效范围由 agent 决定（通常下一轮起效），我们不替它加限制。
+    fn set_model(&mut self, value_id: String) {
+        if let Some(h) = &self.handle {
+            let _ = h.cmd_tx.try_send(AcpCommand::SetModel(value_id));
+        }
+    }
+
     /// 输入栏 agent 胶囊的展示名：从启动命令里抠个可读的包名/程序名
     /// （`bunx @scope/claude-agent-acp@0.59.0` → `claude-agent-acp`，
     /// `copilot --acp` → `copilot`）。没有模型名数据源，不硬编。
@@ -757,18 +1005,18 @@ impl AcpView {
         // 「第几步 of 总数」：正在跑的算当前步；全完成就是 n of n。
         let current = (done + in_progress).min(total);
         let (summary, summary_color) = if done == total {
-            (format!("{total} of {total} · 完成"), gpui::rgb(ui_theme::GREEN))
+            (format!("{total} of {total} · 完成"), gpui::rgb(ui_theme::green()))
         } else if in_progress > 0 {
-            (format!("{current} of {total} · 进行中"), gpui::rgb(ui_theme::ACCENT))
+            (format!("{current} of {total} · 进行中"), gpui::rgb(ui_theme::accent()))
         } else {
-            (format!("{done} of {total}"), gpui::rgb(ui_theme::TEXT_MUTED))
+            (format!("{done} of {total}"), gpui::rgb(ui_theme::text_muted()))
         };
         let progress = (done as f32 + in_progress as f32 * 0.5) / total as f32;
 
         let mut bar = gpui_component::v_flex()
             .border_b_1()
-            .border_color(gpui::rgb(ui_theme::BORDER_DIM))
-            .bg(gpui::rgb(ui_theme::BG_STATUS))
+            .border_color(gpui::rgb(ui_theme::border_dim()))
+            .bg(gpui::rgb(ui_theme::bg_status()))
             .child(
                 h_flex()
                     .id("acp-plan-toggle")
@@ -785,14 +1033,14 @@ impl AcpView {
                         div()
                             .w(px(10.))
                             .text_xs()
-                            .text_color(gpui::rgb(ui_theme::TEXT_MUTED))
+                            .text_color(gpui::rgb(ui_theme::text_muted()))
                             .child(if self.plan_collapsed { "▸" } else { "▾" }),
                     )
                     .child(
                         div()
                             .text_xs()
                             .font_semibold()
-                            .text_color(gpui::rgb(ui_theme::TEXT_MUTED))
+                            .text_color(gpui::rgb(ui_theme::text_muted()))
                             .child("PLAN"),
                     )
                     .child(div().text_xs().text_color(summary_color).child(summary))
@@ -802,13 +1050,13 @@ impl AcpView {
                             .max_w(px(180.))
                             .h(px(5.))
                             .rounded_full()
-                            .bg(gpui::rgb(ui_theme::BORDER_DIM))
+                            .bg(gpui::rgb(ui_theme::border_dim()))
                             .overflow_hidden()
                             .child(
                                 div()
                                     .w(gpui::relative(progress.clamp(0., 1.)))
                                     .h_full()
-                                    .bg(gpui::rgb(ui_theme::ACCENT)),
+                                    .bg(gpui::rgb(ui_theme::accent())),
                             ),
                     ),
             );
@@ -823,18 +1071,18 @@ impl AcpView {
                                 .flex_shrink_0()
                                 .size(px(15.))
                                 .rounded_sm()
-                                .bg(gpui::rgb(ui_theme::GREEN))
+                                .bg(gpui::rgb(ui_theme::green()))
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .text_xs()
-                                .text_color(gpui::rgb(ui_theme::ON_ACCENT))
+                                .text_color(gpui::rgb(ui_theme::on_accent()))
                                 .child("✓"),
                         )
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(gpui::rgb(ui_theme::TEXT_FAINT))
+                                .text_color(gpui::rgb(ui_theme::text_faint()))
                                 .line_through()
                                 .child(entry.content.clone()),
                         ),
@@ -845,11 +1093,11 @@ impl AcpView {
                                 .size(px(15.))
                                 .rounded_sm()
                                 .border_1()
-                                .border_color(gpui::rgb(ui_theme::ACCENT))
+                                .border_color(gpui::rgb(ui_theme::accent()))
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(div().size(px(7.)).rounded_xs().bg(gpui::rgb(ui_theme::ACCENT))),
+                                .child(div().size(px(7.)).rounded_xs().bg(gpui::rgb(ui_theme::accent()))),
                         )
                         .child(
                             h_flex()
@@ -859,13 +1107,13 @@ impl AcpView {
                                     div()
                                         .text_sm()
                                         .font_medium()
-                                        .text_color(gpui::rgb(ui_theme::TEXT_BRIGHT))
+                                        .text_color(gpui::rgb(ui_theme::text_bright()))
                                         .child(entry.content.clone()),
                                 )
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(gpui::rgb(ui_theme::ACCENT))
+                                        .text_color(gpui::rgb(ui_theme::accent()))
                                         .child("· 进行中"),
                                 ),
                         ),
@@ -877,12 +1125,12 @@ impl AcpView {
                                 .size(px(15.))
                                 .rounded_sm()
                                 .border_1()
-                                .border_color(gpui::rgb(ui_theme::BORDER_FOCUS)),
+                                .border_color(gpui::rgb(ui_theme::border_focus())),
                         )
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(gpui::rgb(ui_theme::TEXT_MID))
+                                .text_color(gpui::rgb(ui_theme::text_mid()))
                                 .child(entry.content.clone()),
                         ),
                 };
@@ -938,13 +1186,19 @@ impl Render for AcpView {
                     .text_sm()
                     .text_color(muted)
                     .child(self.status_line.clone().unwrap_or_else(|| {
-                        // 续接旧会话和全新启动是两件事，文案别混：带着旧
-                        // session id 时说的是「接上次那段」，不是从零开一个。
-                        if self.acp_session_id.is_some() {
-                            "正在续接上次的会话…".to_string()
+                        // 说实话：慢的是 Claude Code 自己建会话（实测约 10 秒），
+                        // 不是「首次下载适配器」——那句每次都显示，是假的。
+                        // 报出已等秒数，免得看着像卡死。
+                        let waited = self
+                            .starting_since
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let what = if self.acp_session_id.is_some() {
+                            "正在续接上次的会话".to_string()
                         } else {
-                            "正在启动 agent…（首次需下载适配器，可能要一会儿）".to_string()
-                        }
+                            format!("正在启动 {}", self.agent.label())
+                        };
+                        format!("{what}…（已 {waited} 秒，通常 10 秒左右）")
                     }))
                     .into_any_element(),
             ),
@@ -1010,8 +1264,8 @@ impl Render for AcpView {
                         .px_4()
                         .py_2()
                         .rounded_lg()
-                        .bg(gpui::rgb(ui_theme::GREEN))
-                        .text_color(gpui::rgb(ui_theme::ON_ACCENT))
+                        .bg(gpui::rgb(ui_theme::green()))
+                        .text_color(gpui::rgb(ui_theme::on_accent()))
                         .text_sm()
                         .font_semibold()
                         .cursor_pointer()
@@ -1040,7 +1294,7 @@ impl Render for AcpView {
                         .border_color(t.border)
                         .text_sm()
                         .cursor_pointer()
-                        .when(danger, |d| d.text_color(gpui::rgb(ui_theme::RED)))
+                        .when(danger, |d| d.text_color(gpui::rgb(ui_theme::red())))
                         .hover(|d| d.opacity(0.85))
                         .child(opt.name.clone())
                         .on_click(cx.listener(move |this, _ev, _window, cx| {
@@ -1062,14 +1316,39 @@ impl Render for AcpView {
             .gap_4();
         for (i, entry) in self.entries.iter().enumerate() {
             let el: gpui::AnyElement = match entry {
-                AcpEntry::User(text) => div()
+                // agent 回显的「中断」标记不是用户说的话，别套成气泡——
+                // 那会读成「用户发了一条叫 [Request interrupted...] 的消息」。
+                AcpEntry::User(text) if is_interrupt_marker(text) => h_flex()
+                    .items_center()
+                    .gap_2()
+                    .my_1()
+                    .child(div().flex_1().h(px(1.)).bg(t.border))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("已中断"),
+                    )
+                    .child(div().flex_1().h(px(1.)).bg(t.border))
+                    .into_any_element(),
+                // 用户气泡右对齐限宽（对齐设计稿）：整行铺满时跟 agent 正文
+                // 混成一片，看不出谁在说话。
+                AcpEntry::User(text) => h_flex()
                     .w_full()
-                    .px_4()
-                    .py_3()
-                    .rounded_lg()
-                    .bg(t.muted)
-                    .text_sm()
-                    .child(crate::markdown_mermaid::markdown_view(("acp-user-md", i), text.clone()))
+                    .justify_end()
+                    .child(
+                        div()
+                            .max_w(gpui::relative(0.72))
+                            .px_4()
+                            .py_2p5()
+                            .rounded_lg()
+                            .bg(t.muted)
+                            .text_sm()
+                            .child(crate::markdown_mermaid::markdown_view(
+                                ("acp-user-md", i),
+                                text.clone(),
+                            )),
+                    )
                     .into_any_element(),
                 AcpEntry::Assistant { text, thought } => h_flex()
                     .items_start()
@@ -1089,9 +1368,9 @@ impl Render for AcpView {
                     let accent = tool_accent_color(kind);
                     let (status_dot, status_label): (gpui::Hsla, &str) = match status {
                         ToolCallStatus::Pending => (t.muted_foreground, "待执行"),
-                        ToolCallStatus::InProgress => (gpui::rgb(ui_theme::BLUE).into(), "执行中"),
-                        ToolCallStatus::Completed => (gpui::rgb(ui_theme::GREEN).into(), "完成"),
-                        ToolCallStatus::Failed => (gpui::rgb(ui_theme::RED).into(), "失败"),
+                        ToolCallStatus::InProgress => (gpui::rgb(ui_theme::blue()).into(), "执行中"),
+                        ToolCallStatus::Completed => (gpui::rgb(ui_theme::green()).into(), "完成"),
+                        ToolCallStatus::Failed => (gpui::rgb(ui_theme::red()).into(), "失败"),
                         _ => (t.muted_foreground, "…"), // schema #[non_exhaustive]
                     };
 
@@ -1117,12 +1396,12 @@ impl Render for AcpView {
                             .font_family("monospace")
                             .child(
                                 div()
-                                    .text_color(gpui::rgb(ui_theme::GREEN))
+                                    .text_color(gpui::rgb(ui_theme::green()))
                                     .child(format!("+{total_added}")),
                             )
                             .child(
                                 div()
-                                    .text_color(gpui::rgb(ui_theme::RED))
+                                    .text_color(gpui::rgb(ui_theme::red()))
                                     .child(format!("-{total_removed}")),
                             )
                             .into_any_element()
@@ -1160,7 +1439,7 @@ impl Render for AcpView {
                                         .font_family("monospace")
                                         .text_color(muted)
                                         .truncate()
-                                        .child(title.clone()),
+                                        .child(strip_kind_prefix(title, kind).to_string()),
                                 )
                                 .child(header_right),
                         );
@@ -1180,17 +1459,61 @@ impl Render for AcpView {
                                         t.muted_foreground,
                                     )),
                             ),
-                            ToolOutputPart::Text(text) if !text.trim().is_empty() => card.child(
-                                div()
-                                    .px_4()
-                                    .pb_3()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .font_family("monospace")
-                                    .max_h(px(160.))
-                                    .overflow_hidden()
-                                    .child(text.clone()),
-                            ),
+                            ToolOutputPart::Text(text) if !text.trim().is_empty() => {
+                                // adapter 把工具输出包在 markdown 围栏里（```console…```），
+                                // 当纯文本渲染会把 ``` 直接显示出来。剥掉再展示。
+                                let body = strip_code_fence(text);
+                                let lines: Vec<&str> = body.lines().collect();
+                                let total = lines.len();
+                                let key = id.to_string();
+                                let expanded = self.expanded_tools.contains(&key);
+                                // 默认只出前 8 行：以前是 max_h + overflow_hidden，
+                                // 内容被硬切掉且没有任何展开入口，等于看不到全部。
+                                let shown = if expanded || total <= TOOL_OUTPUT_PREVIEW_LINES {
+                                    body.to_string()
+                                } else {
+                                    lines[..TOOL_OUTPUT_PREVIEW_LINES].join("\n")
+                                };
+                                let need_toggle = total > TOOL_OUTPUT_PREVIEW_LINES;
+                                card.child(
+                                    v_flex()
+                                        .px_4()
+                                        .pb_3()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .font_family("monospace")
+                                                .child(shown),
+                                        )
+                                        .when(need_toggle, |d| {
+                                            let key = key.clone();
+                                            d.child(
+                                                div()
+                                                    .id(("acp-tool-toggle", i * 100 + part_ix))
+                                                    .text_xs()
+                                                    .text_color(gpui::rgb(ui_theme::blue()))
+                                                    .cursor_pointer()
+                                                    .hover(|d| d.opacity(0.8))
+                                                    .child(if expanded {
+                                                        "收起".to_string()
+                                                    } else {
+                                                        format!("展开全部 {total} 行")
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |this, _ev, _window, cx| {
+                                                            if !this.expanded_tools.remove(&key) {
+                                                                this.expanded_tools
+                                                                    .insert(key.clone());
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                        }),
+                                )
+                            }
                             ToolOutputPart::Text(_) => card,
                         };
                     }
@@ -1220,6 +1543,28 @@ impl Render for AcpView {
                     .into_any_element(),
             };
             list = list.child(el);
+        }
+
+        // 「正在思考」占位：回合在跑、但 agent 还没吐出正文（最后一条不是
+        // assistant 气泡）时，消息流末尾必须有活的东西。否则从按下发送到首字
+        // 落地之间是一整屏纯黑——Copilot 这类首字延迟长的 agent 上看着像卡死。
+        // 用 Spinner 而不是「已 N 秒」：GPUI 没有定时重绘，秒数会僵在原地，
+        // 反而更像死了；spinner 自带动画帧，转着就说明进程还在。
+        if matches!(self.phase, AcpPhase::Running)
+            && !matches!(self.entries.last(), Some(AcpEntry::Assistant { .. }))
+        {
+            list = list.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Spinner::new().xsmall().color(muted))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(format!("{} 正在思考…", self.agent.short_label())),
+                    ),
+            );
         }
 
         // 独立权限卡片：仅当消息流里没有可内嵌的工具卡片时兜底渲染
@@ -1262,7 +1607,7 @@ impl Render for AcpView {
                 .gap_3()
                 .rounded_lg()
                 .border_1()
-                .border_color(gpui::rgb(ui_theme::YELLOW))
+                .border_color(gpui::rgb(ui_theme::yellow()))
                 .child(
                     h_flex()
                         .gap_2()
@@ -1291,7 +1636,7 @@ impl Render for AcpView {
                             .py_1()
                             .rounded_lg()
                             .border_1()
-                            .border_color(if selected { gpui::rgb(0xf59e0b).into() } else { t.border })
+                            .border_color(if selected { gpui::rgb(ui_theme::yellow()).into() } else { t.border })
                             .when(selected, |d| d.bg(t.muted))
                             .text_sm()
                             .cursor_pointer()
@@ -1329,7 +1674,7 @@ impl Render for AcpView {
                                 .rounded_lg()
                                 .text_sm()
                                 .when(ready, |d| {
-                                    d.bg(gpui::rgb(0x22c55e))
+                                    d.bg(gpui::rgb(ui_theme::green()))
                                         .text_color(gpui::white())
                                         .cursor_pointer()
                                         .hover(|x| x.opacity(0.85))
@@ -1364,7 +1709,80 @@ impl Render for AcpView {
             body
         });
 
-        let agent_name = self.agent_label();
+        // 胶囊优先显示真实模型名；协议没给就退回适配器名——但要让人看得出
+        // 那是「适配器」不是模型，不能拿包名冒充模型。
+        let (pill_text, pill_is_model) = match &self.model {
+            Some(m) => (m.current_name.clone(), true),
+            None => (self.agent_label(), false),
+        };
+        // 候选模型（协议给了才有）：胶囊变成可点下拉，点一项即切。
+        let model_options: Vec<(String, String)> =
+            self.model.as_ref().map(|m| m.options.clone()).unwrap_or_default();
+        let current_model = self.model.as_ref().map(|m| m.current_name.clone());
+        // 补全弹层：画在输入框**上方**，而且是正常流式元素不是绝对定位浮层——
+        // 输入框贴着窗口底边，往下开的菜单一定会被窗口边缘裁掉（组件自带那套
+        // 就是这么废的，见 acp_completion.rs 文件头）。往上顶消息流反而符合
+        // CLI 补全条的直觉。
+        let completion_bar = self.completion.as_ref().map(|popup| {
+            let mut list = v_flex()
+                .id("acp-completion")
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(t.border)
+                .bg(ui_theme::overlay(0x14));
+            for (ix, item) in popup.items.iter().enumerate() {
+                let selected = ix == popup.selected;
+                list = list.child(
+                    h_flex()
+                        .id(("acp-completion-item", ix))
+                        .px_3()
+                        .py_1()
+                        .gap_2()
+                        .items_center()
+                        .when(selected, |d| d.bg(ui_theme::overlay(0x28)))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(ui_theme::overlay(0x20)))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .font_family("monospace")
+                                .text_color(if selected {
+                                    gpui::rgb(ui_theme::accent())
+                                } else {
+                                    gpui::rgb(ui_theme::text_mid())
+                                })
+                                .child(item.label.clone()),
+                        )
+                        .when(!item.hint.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .truncate()
+                                    .child(item.hint.clone()),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _ev, window, cx| {
+                            if let Some(popup) = &mut this.completion {
+                                popup.selected = ix;
+                            }
+                            this.accept_completion(window, cx);
+                        })),
+                );
+            }
+            list.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("↑↓ 选择 · Enter/Tab 插入 · Esc 关闭"),
+            )
+        });
+
         let input_row = self.input.as_ref().map(|input| {
             v_flex()
                 .border_t_1()
@@ -1377,22 +1795,191 @@ impl Render for AcpView {
                         .pt_2()
                         .gap_2()
                         .items_center()
-                        .child(toolbar_pill("@ 上下文"))
-                        .when_some(self.available_commands, |row, n| {
-                            row.child(toolbar_pill(format!("{n} 条命令")))
-                        })
                         .child(
-                            // agent 胶囊：紫色标识当前会话背后是哪个 agent 命令。
+                            // 点一下就在输入框补个 `@` 并聚焦，补全菜单随即弹出
+                            // ——这个胶囊以前是纯装饰，点不动。
+                            div()
+                                .id("acp-at-pill")
+                                .px_2p5()
+                                .py_0p5()
+                                .rounded_full()
+                                .bg(ui_theme::overlay(0x18))
+                                .text_xs()
+                                .text_color(gpui::rgb(ui_theme::text_muted()))
+                                .cursor_pointer()
+                                .hover(|d| d.opacity(0.8))
+                                .child("@ 引用文件")
+                                .on_click(cx.listener(|this, _ev, window, cx| {
+                                    this.insert_prompt_text("@", window, cx);
+                                })),
+                        )
+                        .when(!self.available_commands.is_empty(), |row| {
+                            // 斜杠命令：点开列出来、点一条填进输入框。以前只显示
+                            // 「N 条命令」这个数字——看得见、点不开、用不上。
+                            let cmds = self.available_commands.clone();
+                            let n = cmds.len();
+                            let this = cx.entity();
+                            row.child(
+                                // 触发器必须是 Button：gpui-component 的
+                                // DropdownMenu（左键）只对 Button 实现，挂在普通
+                                // div 上只能用 context_menu，那是右键——等于点不动。
+                                Button::new("acp-commands-pill")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(format!("/ {n} 条命令 ▾"))
+                                    .text_color(gpui::rgb(ui_theme::text_muted()))
+                                    .dropdown_menu(move |menu, _window, _cx| {
+                                        let mut menu = menu.item(PopupMenuItem::label("斜杠命令"));
+                                        // 菜单塞不下几十条，列前 20 条（够覆盖常用的）
+                                        for (name, desc) in cmds.iter().take(20) {
+                                            let label = if desc.trim().is_empty() {
+                                                format!("/{name}")
+                                            } else {
+                                                format!("/{name} — {desc}")
+                                            };
+                                            let insert = format!("/{name}");
+                                            let this = this.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(label)
+                                                    .on_click(move |_ev, window, cx| {
+                                                        let insert = insert.clone();
+                                                        this.update(cx, |v, cx| {
+                                                            v.insert_prompt_text(&insert, window, cx)
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    }),
+                            )
+                        })
+                        .children(self.usage.map(|(used, size)| {
+                            // 上下文用量：接近用满时变色告警——「还剩多少」是决定
+                            // 要不要 /compact 的依据，不该藏起来。
+                            let pct = ((used as f64 / size as f64) * 100.0).round() as u32;
+                            let color = if pct >= 90 {
+                                ui_theme::red()
+                            } else if pct >= 75 {
+                                ui_theme::yellow()
+                            } else {
+                                ui_theme::text_muted()
+                            };
                             div()
                                 .px_2p5()
                                 .py_0p5()
                                 .rounded_full()
                                 .bg(gpui::rgba(0x80808020))
                                 .text_xs()
-                                .text_color(gpui::rgb(ui_theme::PURPLE))
-                                .child(agent_name.clone()),
-                        ),
+                                .text_color(gpui::rgb(color))
+                                .child(format!("上下文 {pct}%"))
+                        }))
+                        .child({
+                            // 模型胶囊：紫色。协议没上报模型时显示适配器名并加
+                            // 「适配器」前缀，免得把包名读成模型名。
+                            // 有候选就用 Button 触发左键下拉（见上面命令胶囊的注释）。
+                            let label = if pill_is_model {
+                                pill_text.clone()
+                            } else {
+                                format!("适配器 {pill_text}")
+                            };
+                            let color = if pill_is_model {
+                                ui_theme::purple()
+                            } else {
+                                ui_theme::text_muted()
+                            };
+                            if model_options.len() > 1 {
+                                let cur = current_model.clone();
+                                let opts = model_options.clone();
+                                let this = cx.entity();
+                                Button::new("acp-model-pill")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(format!("{label} ▾"))
+                                    .text_color(gpui::rgb(color))
+                                    .dropdown_menu(move |menu, _window, _cx| {
+                                        let mut menu = menu.item(PopupMenuItem::label("切换模型"));
+                                        for (value, name) in &opts {
+                                            let is_cur = cur.as_deref() == Some(name.as_str());
+                                            let value = value.clone();
+                                            let this = this.clone();
+                                            // 用组件自带的 checked：勾选位由它统一
+                                            // 预留，所有名字对齐。自己拿 "✓ " / "   "
+                                            // 凑缩进对不齐——两者宽度并不相等。
+                                            menu = menu.item(
+                                                PopupMenuItem::new(name.clone())
+                                                    .checked(is_cur)
+                                                    .on_click(move |_ev, _window, cx| {
+                                                        let value = value.clone();
+                                                        this.update(cx, |v, _cx| {
+                                                            v.set_model(value)
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    })
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .px_2p5()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(ui_theme::overlay(0x18))
+                                    .text_xs()
+                                    .text_color(gpui::rgb(color))
+                                    .child(label)
+                                    .into_any_element()
+                            }
+                        }),
                 )
+                // 待发图片的缩略图条：粘完得看得见「贴上了」，还得能反悔。
+                .when(!self.pending_images.is_empty(), |col| {
+                    let mut strip = h_flex().px_3().pt_2().gap_2().items_center().flex_wrap();
+                    for (ix, im) in self.pending_images.iter().enumerate() {
+                        strip = strip.child(
+                            div()
+                                .id(("acp-pending-img", ix))
+                                .relative()
+                                .child(
+                                    gpui::img(im.clone())
+                                        .h(px(56.))
+                                        .max_w(px(96.))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(t.border),
+                                )
+                                .child(
+                                    // 右上角小 ×：点掉这张。
+                                    div()
+                                        .absolute()
+                                        .top(px(-4.))
+                                        .right(px(-4.))
+                                        .size(px(16.))
+                                        .rounded_full()
+                                        .bg(ui_theme::overlay(0xcc))
+                                        .text_xs()
+                                        .text_color(gpui::rgb(ui_theme::text_mid()))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|d| d.opacity(0.8))
+                                        .child("×")
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |this, _ev, _window, cx| {
+                                                if ix < this.pending_images.len() {
+                                                    this.pending_images.remove(ix);
+                                                }
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }),
+                                        ),
+                                ),
+                        );
+                    }
+                    col.child(strip)
+                })
                 .child(
                     h_flex()
                         .p_3()
@@ -1423,8 +2010,8 @@ impl Render for AcpView {
                                 .px_4()
                                 .py_1p5()
                                 .rounded_lg()
-                                .bg(gpui::rgb(ui_theme::ACCENT))
-                                .text_color(gpui::rgb(ui_theme::ON_ACCENT))
+                                .bg(gpui::rgb(ui_theme::accent()))
+                                .text_color(gpui::rgb(ui_theme::on_accent()))
                                 .text_sm()
                                 .font_semibold()
                                 .cursor_pointer()
@@ -1453,14 +2040,98 @@ impl Render for AcpView {
                     cx.stop_propagation();
                 }
             }))
+            // 补全弹层的键盘操作。同样只能走 **action 的 capture 阶段**：
+            // 上/下/回车/Esc/Tab 在输入框里全都绑成了 action，冒泡阶段和
+            // capture_key_down 都轮不到我们（见下面 ⌘V 那段的教训）。
+            // 没在补全时一律不拦，按键原样交回输入框。
+            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveUp, _window, cx| {
+                if this.move_completion(-1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveDown, _window, cx| {
+                if this.move_completion(1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(
+                |this, _: &gpui_component::input::Enter, window, cx| {
+                    // 补全开着时回车是「选中这条」，不是发送——否则永远选不上。
+                    if this.accept_completion(window, cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_component::input::IndentInline, window, cx| {
+                    if this.accept_completion(window, cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(|this, _: &gpui_component::input::Escape, _window, cx| {
+                if this.completion.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            // ⌘V 贴图（输入框聚焦时，也就是绝大多数情况）：必须拦 **Paste
+            // action 的 capture 阶段**，不能拦 key_down。
+            //
+            // 真实教训：第一版挂的是 capture_key_down，实测完全没反应。GPUI 的
+            // dispatch_key_event 顺序是「先派发 action bindings，binding 消费掉
+            // 就直接 return」，capture 阶段的 key listener 排在那之后——输入框
+            // 把 cmd-v 绑成了 Paste（gpui-component input/state.rs），于是这个
+            // 事件永远轮不到我们。而 action 的 capture 阶段是从根往下走的，
+            // 挂在这里就能抢在输入框（更深的节点）前面拿到。
+            .capture_action(cx.listener(
+                |this, _: &gpui_component::input::Paste, _window, cx| {
+                    // 只有剪贴板真是图片才截胡；文本粘贴照样放行给输入框。
+                    if this.take_clipboard_image(cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            // 焦点不在输入框里（点了消息流等）时 Paste binding 不匹配，
+            // action 那条路走不到——这条按 key_down 兜底。
+            .capture_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
+                if ev.keystroke.modifiers.platform
+                    && ev.keystroke.key == "v"
+                    && this.take_clipboard_image(cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
             .bg(t.background)
             .children(banner)
             .children(plan_bar)
             .child(list)
             .children(permission)
             .children(elicitation)
+            .children(completion_bar)
             .children(input_row)
     }
+}
+
+/// GPUI 剪贴板图片格式 → 协议要的 MIME。
+fn image_mime(format: gpui::ImageFormat) -> &'static str {
+    match format {
+        gpui::ImageFormat::Png => "image/png",
+        gpui::ImageFormat::Jpeg => "image/jpeg",
+        gpui::ImageFormat::Webp => "image/webp",
+        gpui::ImageFormat::Gif => "image/gif",
+        gpui::ImageFormat::Svg => "image/svg+xml",
+        gpui::ImageFormat::Bmp => "image/bmp",
+        gpui::ImageFormat::Tiff => "image/tiff",
+        // 协议字段是必填的字符串，认不出的格式给个通用值让 agent 自己嗅探，
+        // 总好过不发（ImageFormat 是 #[non_exhaustive]，会长新枝）。
+        _ => "application/octet-stream",
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// assistant 消息的发送方头像：主橙方块 + 首字母（设计稿色板 ACCENT），
@@ -1471,11 +2142,11 @@ fn assistant_avatar() -> impl IntoElement {
         .w(px(24.))
         .h(px(24.))
         .rounded_md()
-        .bg(gpui::rgb(ui_theme::ACCENT))
+        .bg(gpui::rgb(ui_theme::accent()))
         .flex()
         .items_center()
         .justify_center()
-        .text_color(gpui::rgb(ui_theme::ON_ACCENT))
+        .text_color(gpui::rgb(ui_theme::on_accent()))
         .text_xs()
         .font_semibold()
         .child("C")
@@ -1488,19 +2159,51 @@ fn toolbar_pill(label: impl Into<gpui::SharedString>) -> impl IntoElement {
         .px_2p5()
         .py_0p5()
         .rounded_full()
-        .bg(gpui::rgba(0x80808020))
+        .bg(ui_theme::overlay(0x18))
         .text_xs()
-        .text_color(gpui::rgb(0x9ca3af))
+        .text_color(gpui::rgb(ui_theme::text_muted()))
         .child(label.into())
+}
+
+/// 工具输出默认只展开这么多行，其余折叠到「展开全部 N 行」后面。
+const TOOL_OUTPUT_PREVIEW_LINES: usize = 8;
+
+/// agent 回显的「用户中断」标记——它走的是 UserMessageChunk 通道，但不是用户
+/// 打的字，UI 得把它渲染成状态提示而不是消息气泡。
+fn is_interrupt_marker(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with("[Request interrupted by user") && t.ends_with(']')
+}
+
+/// 剥掉整段被 markdown 围栏包住的工具输出（```lang\n…\n```）。只在「整段就是
+/// 一个围栏块」时剥——正文里穿插的代码块交给 markdown 渲染器，别在这里瞎切。
+fn strip_code_fence(text: &str) -> &str {
+    let t = text.trim();
+    let Some(rest) = t.strip_prefix("```") else { return text };
+    // 跳过围栏后面的语言标注那一行
+    let Some(nl) = rest.find('\n') else { return text };
+    let Some(body) = rest[nl + 1..].strip_suffix("```") else { return text };
+    body.trim_end_matches('\n')
+}
+
+/// 工具标题里去掉与 kind 标签重复的前缀：adapter 常把标题写成
+/// `Read crates/foo.rs`，而卡片左边已经有一个 `Read` 标签了。
+fn strip_kind_prefix<'a>(title: &'a str, kind: &ToolKind) -> &'a str {
+    let label = tool_kind_label(kind);
+    title
+        .strip_prefix(label)
+        .map(|r| r.trim_start())
+        .filter(|r| !r.is_empty())
+        .unwrap_or(title)
 }
 
 /// ToolKind → 强调色：读类蓝、改类橙、执行类绿，一眼区分工具在干什么类型的事。
 fn tool_accent_color(kind: &ToolKind) -> gpui::Rgba {
     match kind {
-        ToolKind::Read | ToolKind::Search | ToolKind::Fetch => gpui::rgb(ui_theme::BLUE),
-        ToolKind::Edit | ToolKind::Delete | ToolKind::Move => gpui::rgb(ui_theme::ACCENT),
-        ToolKind::Execute => gpui::rgb(ui_theme::GREEN),
-        _ => gpui::rgb(ui_theme::TEXT_MUTED),
+        ToolKind::Read | ToolKind::Search | ToolKind::Fetch => gpui::rgb(ui_theme::blue()),
+        ToolKind::Edit | ToolKind::Delete | ToolKind::Move => gpui::rgb(ui_theme::accent()),
+        ToolKind::Execute => gpui::rgb(ui_theme::green()),
+        _ => gpui::rgb(ui_theme::text_muted()),
     }
 }
 
@@ -1560,14 +2263,14 @@ fn render_diff_lines(
         let line = change.value().trim_end_matches('\n').to_string();
         let (bg, prefix, fg): (Option<gpui::Hsla>, &str, gpui::Hsla) = match change.tag() {
             similar::ChangeTag::Delete => (
-                Some(crate::ui_theme::tint(crate::ui_theme::RED, 0x22).into()),
+                Some(crate::ui_theme::tint(crate::ui_theme::red(), 0x22).into()),
                 "-",
-                gpui::rgb(crate::ui_theme::RED).into(),
+                gpui::rgb(crate::ui_theme::red()).into(),
             ),
             similar::ChangeTag::Insert => (
-                Some(crate::ui_theme::tint(crate::ui_theme::GREEN, 0x22).into()),
+                Some(crate::ui_theme::tint(crate::ui_theme::green(), 0x22).into()),
                 "+",
-                gpui::rgb(crate::ui_theme::DIFF_ADD_TEXT).into(),
+                gpui::rgb(crate::ui_theme::diff_add_text()).into(),
             ),
             similar::ChangeTag::Equal => (None, " ", muted_color),
         };
@@ -1604,4 +2307,29 @@ fn tool_content_parts(
             _ => None, // Terminal 等 MVP 不渲染
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_interrupt_marker, strip_code_fence};
+
+    #[test]
+    fn strips_whole_output_code_fence_only() {
+        // adapter 把工具输出整段包在围栏里 → 剥掉，别把 ``` 显示给人看
+        assert_eq!(strip_code_fence("```console\nhello\nworld\n```"), "hello\nworld");
+        // 无语言标注同理
+        assert_eq!(strip_code_fence("```\nplain\n```"), "plain");
+        // 正文里穿插的代码块不属于「整段就是一个围栏」，原样返回交给 markdown
+        let mixed = "前言\n```rs\nlet x = 1;\n```\n后记";
+        assert_eq!(strip_code_fence(mixed), mixed);
+        // 没有围栏的普通输出原样返回
+        assert_eq!(strip_code_fence("exit 0"), "exit 0");
+    }
+
+    #[test]
+    fn detects_interrupt_marker() {
+        assert!(is_interrupt_marker("[Request interrupted by user]"));
+        assert!(is_interrupt_marker("[Request interrupted by user for tool use]"));
+        assert!(!is_interrupt_marker("请把这段中断逻辑说清楚"));
+    }
 }

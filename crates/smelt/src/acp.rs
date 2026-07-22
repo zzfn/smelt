@@ -17,8 +17,12 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
     CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction,
     ElicitationCapabilities, ElicitationContentValue, ElicitationFormCapabilities,
-    ElicitationMode, ElicitationPropertySchema, ElicitationSchema, InitializeRequest,
-    LoadSessionRequest, MultiSelectItems, NewSessionResponse, PermissionOption, Plan,
+    ElicitationMode, ElicitationPropertySchema, ElicitationSchema, ImageContent, InitializeRequest,
+    LoadSessionRequest, MultiSelectItems, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PromptRequest, PromptResponse,
+    Plan, ResumeSessionRequest, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionConfigValueId, SetSessionConfigOptionRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
     ToolCall, ToolCallId, ToolCallUpdate,
@@ -44,12 +48,26 @@ pub struct AcpLaunch {
     pub resume_session_id: Option<SessionId>,
 }
 
+/// 随 prompt 一起发出去的一张图（剪贴板粘进来的截图等）。
+///
+/// 协议要的就是 base64 + mime，所以在进这条通道前就编码好——连接线程不碰
+/// GPUI 的图片类型，`acp.rs 不许引 gpui` 那条底线在这里同样成立。
+pub struct PromptImage {
+    /// `image/png` 这类 MIME。
+    pub mime: String,
+    /// base64 编码后的原始字节（不带 data: 前缀）。
+    pub data_b64: String,
+}
+
 /// UI → 连接线程的指令。
 pub enum AcpCommand {
     /// 发一轮 prompt（agent 空闲时才该发；UI 侧负责在 turn 进行中排队/禁用）。
-    Prompt(String),
+    /// `images` 空 = 纯文本那条老路径。
+    Prompt { text: String, images: Vec<PromptImage> },
     /// 取消当前 turn（session/cancel 通知）。
     Cancel,
+    /// 切换模型：值 id 来自 `AcpEvent::Model` 给的候选列表。
+    SetModel(String),
     /// 关闭会话：退出连接循环，随连接 drop 杀掉子进程。
     Shutdown,
 }
@@ -58,10 +76,9 @@ pub enum AcpCommand {
 pub enum AcpEvent {
     /// 启动阶段的进度文案（下载运行时 / 拉取适配器等），Starting 横幅显示。
     Status(String),
-    /// 握手完成，可以发 prompt 了。`resumed` = 这次是不是真的接上了旧会话
-    /// （`session/load` 成功）——UI 据此决定清空本地历史（真续接，agent 会
-    /// 重放全部）还是保留历史并插分割线（这其实是一次全新会话）。
-    Ready { session_id: SessionId, resumed: bool },
+    /// 握手完成，可以发 prompt 了。`kind` 说明这是怎么接上的——布尔的
+    /// 「resumed 与否」表达不了三种情况，会让「续接成功」被渲染成「新会话」。
+    Ready { session_id: SessionId, kind: ReadyKind },
     /// assistant 正文 / 思考块的流式增量（content 已文本化）。
     AgentChunk { thought: bool, text: String },
     ToolCall(ToolCall),
@@ -69,6 +86,10 @@ pub enum AcpEvent {
     /// agent 的任务计划（步骤清单 + 三态进度）：每次全量覆盖，回合态不落盘。
     /// UI 渲染成消息流上方的可折叠 PLAN 条。
     Plan(Plan),
+    /// 模型状态：当前名 + 可选列表。来自会话配置项里 category=Model 的那条
+    /// select；建会话时给一次，切换或 agent 侧改动时通过 ConfigOptionUpdate 再给。
+    /// 取不到就一直是 None，UI 不假装知道。
+    Model(ModelState),
     /// agent 请求权限：UI 渲染按钮，凭 responder 直接回 RPC。
     Permission {
         /// 请求摘要（tool call 标题，没有就用工具 id）。
@@ -84,9 +105,12 @@ pub enum AcpEvent {
     /// 我们没有替它们手动 push 过）。正常 live 对话是否也会收到这个事件目前
     /// 没有把握确认，UI 侧用「等回声」状态机兼容两种可能，见 acp_view.rs。
     UserChunk(String),
-    /// 会话当前可用的命令集大小（`/compact` 这类斜杠命令，不是「工具」）。
-    /// 只存数量，UI 侧输入框工具栏展示成「N 条命令」的胶囊。
-    AvailableCommands(usize),
+    /// 会话当前可用的斜杠命令（`/compact` 这类，不是「工具」）：(名字, 说明)。
+    /// 以前只存数量——一个光秃秃的「47 条命令」既点不开也没法用，等于没有。
+    AvailableCommands(Vec<(String, String)>),
+    /// 上下文用量：已用 / 窗口大小（token），外加本轮缓存读取量（agent 给才有）。
+    /// UI 据此显示「上下文 32%」这类指示。
+    Usage { used: u64, size: u64, cached_read: Option<u64> },
     /// agent 的选择题 / 表单（AskUserQuestion 类）：UI 渲染字段，凭 responder 回填。
     Elicitation {
         message: String,
@@ -97,6 +121,28 @@ pub enum AcpEvent {
     TurnEnded(StopReason),
     /// 连接不可恢复地结束：启动失败 / 协议错误 / 子进程退出。带 stderr 尾巴。
     Fatal(String),
+}
+
+/// 会话是怎么接上的——决定 UI 拿本地历史怎么办。
+#[derive(Clone, Copy, PartialEq)]
+pub enum ReadyKind {
+    /// 全新会话。本地若有旧历史，UI 插一条分割线标明「以下是新对话」。
+    Fresh,
+    /// `session/load` 续接：agent 随后会把完整历史重放一遍，本地快照要清空，
+    /// 否则重放内容叠在旧内容上变成两份。
+    ResumedWithReplay,
+    /// `session/resume` 续接：**不重放**历史。本地快照就是全部内容，原样留着，
+    /// 也不插分割线——对话是连着的，不是新的。
+    ResumedKeepHistory,
+}
+
+/// 模型选择状态：UI 拿它渲染「当前模型」胶囊和下拉候选。
+#[derive(Clone, PartialEq)]
+pub struct ModelState {
+    /// 当前模型的人类可读名（`Claude Sonnet 4.5`）。
+    pub current_name: String,
+    /// 可选模型：(值 id, 人类可读名)。空 = agent 没给候选，UI 就只显示不给切。
+    pub options: Vec<(String, String)>,
 }
 
 /// 权限回执守卫：UI 点按钮时消费；**被 drop（视图关闭、卡片被弃置）自动回
@@ -381,12 +427,53 @@ async fn run_connection(
                 .block_task()
                 .await?;
 
-            // 有旧 session id 且 adapter 声明支持 load_session：先试 session/load
-            // 真续接（agent 记得之前聊了什么，会重放完整历史）。SDK 的 retry 机制
-            // 保证 load 期间提前到达的 session/update 通知不会在 attach 前丢失
-            // （jsonrpc.rs 里 `Handled::No{retry:true}` 的排队重试就是为这个场景
-            // 设计的，session/new 走的也是同一套）。
-            if let Some(sid) = launch.resume_session_id.clone() {
+            // 恢复链：resume → load → new。
+            //
+            // - `session/resume` **不重放历史**（实测 0 条通知）：我们本地已经存着
+            //   完整消息流，让 agent 再吐一遍纯属浪费，还得处理去重。协议能力位里
+            //   没声明它（claude-agent-acp 只报 loadSession），但实测可用，所以按
+            //   「试了不亏」处理——失败就落到 load。
+            // - 前置检查 transcript 在不在：ACP 的会话 id 就是 Claude Code 的
+            //   transcript 文件名，文件不存在（会话建了没说过话 / 已被清理）时
+            //   续接必然「Resource not found」，实测白等约 2 秒。直接跳过。
+            //
+            // 速度上 resume/load 都要十几秒——那是 Claude Code 自身启动的成本，
+            // 换哪条路都躲不掉（实测 new 10.4s / load 15.7s / resume 17.6s）。
+            let resumable = launch.resume_session_id.as_ref().is_some_and(|sid| {
+                launch.cwd.as_deref().is_some_and(|c| {
+                    crate::session_history::transcript_path(c, &sid.to_string()).exists()
+                })
+            });
+            if let Some(sid) = launch.resume_session_id.clone().filter(|_| resumable) {
+                // 先试不重放的 resume
+                let mut resume_req = ResumeSessionRequest::new(sid.clone(), cwd.clone());
+                if let Some(meta) = claude_raw_sdk_meta(&launch.cmd) {
+                    resume_req = resume_req.meta(meta);
+                }
+                if let Ok(resumed) = connection.send_request(resume_req).block_task().await {
+                    let model_cfg = resumed
+                        .config_options
+                        .as_deref()
+                        .and_then(model_from_config)
+                        .map(|(id, state)| {
+                            let _ = event_tx.try_send(AcpEvent::Model(state));
+                            id
+                        });
+                    let resp = NewSessionResponse::new(sid.clone())
+                        .modes(resumed.modes)
+                        .config_options(resumed.config_options)
+                        .meta(resumed.meta);
+                    let session = connection.attach_session(resp, Default::default())?;
+                    // resume 不重放：本地历史原样留着，也别插「新会话」分割线。
+                    return drive_session(
+                        session,
+                        cmd_rx,
+                        event_tx,
+                        ReadyKind::ResumedKeepHistory,
+                        model_cfg,
+                    )
+                    .await;
+                }
                 if init.agent_capabilities.load_session {
                     match connection
                         .send_request(LoadSessionRequest::new(sid.clone(), cwd.clone()))
@@ -394,12 +481,21 @@ async fn run_connection(
                         .await
                     {
                         Ok(loaded) => {
+                            let model_cfg = loaded
+                                .config_options
+                                .as_deref()
+                                .and_then(model_from_config)
+                                .map(|(id, state)| {
+                                    let _ = event_tx.try_send(AcpEvent::Model(state));
+                                    id
+                                });
                             let resp = NewSessionResponse::new(sid)
                                 .modes(loaded.modes)
                                 .config_options(loaded.config_options)
                                 .meta(loaded.meta);
                             let session = connection.attach_session(resp, Default::default())?;
-                            return drive_session(session, cmd_rx, event_tx, true).await;
+                            return drive_session(session, cmd_rx, event_tx, ReadyKind::ResumedWithReplay, model_cfg)
+                                .await;
                         }
                         Err(e) => {
                             // 旧会话可能已被清理/损坏——不是致命错误，退回全新会话，
@@ -412,11 +508,24 @@ async fn run_connection(
                 }
             }
 
-            connection
-                .build_session(&cwd)
+            // 手动 session/new 而不是 build_session：SDK 的 ActiveSession 只留
+            // session_id/modes/meta，会把 config_options（模型等）丢掉，而那正是
+            // 「当前用的哪个模型」的唯一来源。attach_session 与 load 路径同款，
+            // 提前到达的 session/update 通知照样被 SDK 的重试机制兜住。
+            let created = connection
+                .send_request(NewSessionRequest::new(std::path::Path::new(&cwd)))
                 .block_task()
-                .run_until(async |session| drive_session(session, cmd_rx, event_tx, false).await)
-                .await
+                .await?;
+            let model_cfg = created
+                .config_options
+                .as_deref()
+                .and_then(model_from_config)
+                .map(|(id, state)| {
+                    let _ = event_tx.try_send(AcpEvent::Model(state));
+                    id
+                });
+            let session = connection.attach_session(created, Default::default())?;
+            drive_session(session, cmd_rx, event_tx, ReadyKind::Fresh, model_cfg).await
         })
         .await
 }
@@ -427,9 +536,12 @@ async fn drive_session<'r>(
     mut session: ActiveSession<'r, Agent>,
     cmd_rx: smol::channel::Receiver<AcpCommand>,
     event_tx: smol::channel::Sender<AcpEvent>,
-    resumed: bool,
+    ready_kind: ReadyKind,
+    // 模型配置项的 id（agent 报了才有）——切模型时按它下发 set_config_option。
+    mut model_config_id: Option<SessionConfigId>,
 ) -> Result<(), agent_client_protocol::Error> {
-    let _ = event_tx.try_send(AcpEvent::Ready { session_id: session.session_id().clone(), resumed });
+    let _ = event_tx
+        .try_send(AcpEvent::Ready { session_id: session.session_id().clone(), kind: ready_kind });
     loop {
         // 两个等待源合一：先构造 read_update future，race 决议后它
         // 即被 drop（消息未出队不会丢），借用随之结束——绕开
@@ -451,13 +563,61 @@ async fn drive_session<'r>(
             Next::Cmd(None) | Next::Cmd(Some(AcpCommand::Shutdown)) => {
                 return Ok(());
             }
-            Next::Cmd(Some(AcpCommand::Prompt(text))) => {
-                session.send_prompt(text)?;
+            Next::Cmd(Some(AcpCommand::Prompt { text, images })) => {
+                if images.is_empty() {
+                    // 纯文本走 SDK 的 send_prompt：它顺带把 StopReason 塞回
+                    // read_update 流，TurnEnded 由 translate_update 发。
+                    session.send_prompt(text)?;
+                } else {
+                    // 带图就得自己拼 ContentBlock——SDK 的 send_prompt 只收
+                    // 一个 ToString，塞不进 Image block。代价是 StopReason 不
+                    // 再流经 read_update，得在响应回调里自己发 TurnEnded
+                    // （所以这里**不能**改成 block_task().await：那会把整个
+                    // 连接循环卡住，流式更新全部收不到）。
+                    let mut blocks: Vec<ContentBlock> = Vec::new();
+                    if !text.is_empty() {
+                        blocks.push(text.into());
+                    }
+                    for im in images {
+                        blocks.push(ContentBlock::Image(ImageContent::new(im.data_b64, im.mime)));
+                    }
+                    let tx = event_tx.clone();
+                    session
+                        .connection()
+                        .send_request(PromptRequest::new(session.session_id().clone(), blocks))
+                        .on_receiving_result(async move |result| {
+                            let PromptResponse { stop_reason, .. } = result?;
+                            let _ = tx.try_send(AcpEvent::TurnEnded(stop_reason));
+                            Ok(())
+                        })?;
+                }
             }
             Next::Cmd(Some(AcpCommand::Cancel)) => {
                 session
                     .connection()
                     .send_notification(CancelNotification::new(session.session_id().clone()))?;
+            }
+            Next::Cmd(Some(AcpCommand::SetModel(value_id))) => {
+                // 没拿到模型配置项 id 说明这个 agent 压根没报模型 → 无从切起，
+                // UI 侧本来也不会给出下拉（options 为空）。
+                let Some(cfg_id) = model_config_id.clone() else { continue };
+                let req = SetSessionConfigOptionRequest::new(
+                    session.session_id().clone(),
+                    cfg_id,
+                    SessionConfigValueId::new(value_id),
+                );
+                match session.connection().send_request(req).block_task().await {
+                    // 响应带回全量配置项：直接据此刷新当前模型（不猜切没切成）。
+                    Ok(resp) => {
+                        if let Some((id, state)) = model_from_config(&resp.config_options) {
+                            model_config_id = Some(id);
+                            let _ = event_tx.try_send(AcpEvent::Model(state));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = event_tx.try_send(AcpEvent::Status(format!("切换模型失败：{e}")));
+                    }
+                }
             }
             Next::Update(update) => {
                 translate_update(update?, &event_tx).await?;
@@ -490,10 +650,26 @@ async fn translate_update(
                             Some(AcpEvent::UserChunk(content_text(&chunk.content)))
                         }
                         SessionUpdate::AvailableCommandsUpdate(u) => {
-                            Some(AcpEvent::AvailableCommands(u.available_commands.len()))
+                            Some(AcpEvent::AvailableCommands(
+                                u.available_commands
+                                    .into_iter()
+                                    .map(|c| (c.name, c.description))
+                                    .collect(),
+                            ))
                         }
+                        // 上下文用量：used/size 是 token 数，UI 换算成百分比。
+                        SessionUpdate::UsageUpdate(u) => Some(AcpEvent::Usage {
+                            used: u.used,
+                            size: u.size,
+                            cached_read: None,
+                        }),
                         // 计划（步骤清单）：透传给 UI 渲染 PLAN 条。
                         SessionUpdate::Plan(p) => Some(AcpEvent::Plan(p)),
+                        // 会话配置变了（用户在 agent 侧换了模型等）：只关心模型。
+                        SessionUpdate::ConfigOptionUpdate(u) => {
+                            model_from_config(&u.config_options)
+                                .map(|(_, state)| AcpEvent::Model(state))
+                        }
                         // 模式 / 用量等仍不渲染（见方案「已知不做」）。
                         _ => None,
                     };
@@ -531,6 +707,58 @@ fn build_agent(
         }
     });
     Ok(agent)
+}
+
+/// Claude Code 适配器专用 meta：要它把原始 SDK 消息也发过来（里面带 usage /
+/// 缓存 token 等明细，普通 ACP 事件里没有）。非 Claude 的 agent 不认这个键，
+/// 传了也只是被忽略，但没必要发。
+fn claude_raw_sdk_meta(cmd: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if !cmd.contains("claude") {
+        return None;
+    }
+    let mut inner = serde_json::Map::new();
+    inner.insert("emitRawSDKMessages".to_string(), serde_json::Value::Bool(true));
+    let mut meta = serde_json::Map::new();
+    meta.insert("claudeCode".to_string(), serde_json::Value::Object(inner));
+    Some(meta)
+}
+
+/// 从会话配置项里挑出「当前模型」的人类可读名。
+///
+/// 协议把模型建模成一条 `category = Model` 的 select 配置项：`current_value`
+/// 是值 id，`options` 里同 id 那条的 `name` 才是给人看的名字（如
+/// `Claude Sonnet 4.5`）。找不到对应选项就退回值 id 本身——显示 `sonnet-4.5`
+/// 也比显示适配器包名强。
+pub(crate) fn model_from_config(
+    options: &[SessionConfigOption],
+) -> Option<(SessionConfigId, ModelState)> {
+    let opt = options
+        .iter()
+        .find(|o| matches!(o.category, Some(SessionConfigOptionCategory::Model)))?;
+    let SessionConfigKind::Select(sel) = &opt.kind else { return None };
+    let cur = &sel.current_value;
+    // 选项可能是平铺的，也可能按厂商/档位分组，两种都要翻。
+    let flat: Vec<&agent_client_protocol::schema::v1::SessionConfigSelectOption> =
+        match &sel.options {
+            SessionConfigSelectOptions::Ungrouped(v) => v.iter().collect(),
+            SessionConfigSelectOptions::Grouped(gs) => {
+                gs.iter().flat_map(|g| g.options.iter()).collect()
+            }
+            _ => Vec::new(), // schema #[non_exhaustive]，协议会长新枝
+        };
+    let name = flat
+        .iter()
+        .find(|o| &o.value == cur)
+        .map(|o| o.name.clone())
+        .unwrap_or_else(|| cur.to_string());
+    if name.trim().is_empty() {
+        return None;
+    }
+    let options = flat
+        .iter()
+        .map(|o| (o.value.to_string(), o.name.clone()))
+        .collect();
+    Some((opt.id.clone(), ModelState { current_name: name, options }))
 }
 
 /// 权限卡片的问题摘要：tool call 有标题用标题，否则退回工具 id。
@@ -822,5 +1050,100 @@ mod runtime_tests {
         let out = std::process::Command::new(&path).arg("--version").output().unwrap();
         assert!(out.status.success());
         eprintln!("bun @ {} → {}", path.display(), String::from_utf8_lossy(&out.stdout).trim());
+    }
+}
+
+#[cfg(test)]
+mod image_block_tests {
+    use super::{ContentBlock, ImageContent};
+
+    /// 图片 block 的 wire 形状：`{"type":"image","data":<b64>,"mimeType":...}`。
+    /// 实测这个形状 Copilot 能正确读图（发纯红图问颜色，答「红色」）——序列化
+    /// 一旦偏了（比如 mimeType 变 mime_type），agent 收到的就是废数据，
+    /// 而且不会报错，只会答得驴唇不对马嘴。
+    #[test]
+    fn image_block_wire_shape() {
+        let block = ContentBlock::Image(ImageContent::new("QUJD", "image/png"));
+        let v = serde_json::to_value(&block).expect("序列化");
+        assert_eq!(v["type"], "image");
+        assert_eq!(v["data"], "QUJD");
+        assert_eq!(v["mimeType"], "image/png");
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use agent_client_protocol::schema::v1::{
+        SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions,
+    };
+
+    use agent_client_protocol::schema::v1::SessionConfigValueId;
+
+    fn opt(value: &str, name: &str) -> SessionConfigSelectOption {
+        SessionConfigSelectOption::new(SessionConfigValueId::new(value.to_string()), name.to_string())
+    }
+
+    fn model_option(current: &str, options: SessionConfigSelectOptions) -> SessionConfigOption {
+        SessionConfigOption::new(
+            SessionConfigId::new("model".to_string()),
+            "Model".to_string(),
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                SessionConfigValueId::new(current.to_string()),
+                options,
+            )),
+        )
+        .category(SessionConfigOptionCategory::Model)
+    }
+
+    /// 取的是给人看的 name，不是值 id。
+    #[test]
+    fn picks_human_readable_name_of_current_value() {
+        let opts = vec![model_option(
+            "sonnet-4-5",
+            SessionConfigSelectOptions::Ungrouped(vec![
+                opt("opus-4-8", "Claude Opus 4.8"),
+                opt("sonnet-4-5", "Claude Sonnet 4.5"),
+            ]),
+        )];
+        let (id, state) = super::model_from_config(&opts).expect("应解析出模型项");
+        assert_eq!(id.to_string(), "model");
+        assert_eq!(state.current_name, "Claude Sonnet 4.5");
+        // 候选要带全，UI 靠它渲染下拉
+        assert_eq!(state.options.len(), 2);
+        assert!(state.options.iter().any(|(v, n)| v == "opus-4-8" && n == "Claude Opus 4.8"));
+    }
+
+    /// 选项按厂商/档位分组时同样要能翻出来。
+    #[test]
+    fn looks_inside_grouped_options() {
+        use agent_client_protocol::schema::v1::{SessionConfigGroupId, SessionConfigSelectGroup};
+        let group = SessionConfigSelectGroup::new(
+            SessionConfigGroupId::new("anthropic".to_string()),
+            "Anthropic".to_string(),
+            vec![opt("haiku-4-5", "Claude Haiku 4.5")],
+        );
+        let opts = vec![model_option(
+            "haiku-4-5",
+            SessionConfigSelectOptions::Grouped(vec![group]),
+        )];
+        let (_, state) = super::model_from_config(&opts).expect("分组里也该翻得出来");
+        assert_eq!(state.current_name, "Claude Haiku 4.5");
+        assert_eq!(state.options.len(), 1);
+    }
+
+    /// 没有 Model 分类的配置项 → None，UI 就不显示模型胶囊（不瞎猜）。
+    #[test]
+    fn returns_none_without_model_category() {
+        let other = SessionConfigOption::new(
+            SessionConfigId::new("mode".to_string()),
+            "Mode".to_string(),
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                SessionConfigValueId::new("ask".to_string()),
+                SessionConfigSelectOptions::Ungrouped(vec![opt("ask", "Ask")]),
+            )),
+        )
+        .category(SessionConfigOptionCategory::Mode);
+        assert!(super::model_from_config(&[other]).is_none());
     }
 }

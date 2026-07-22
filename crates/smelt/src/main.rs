@@ -6,6 +6,7 @@
 //! 运行： cargo run --bin smelt
 
 mod acp;
+mod acp_completion;
 mod acp_view;
 mod agent;
 mod claude_memory;
@@ -476,9 +477,10 @@ impl Session {
                     .read(cx)
                     .cwd()
                     .map(|c| c.rsplit('/').next().unwrap_or(&c).to_string());
+                let agent = view.read(cx).agent_kind().short_label();
                 match dir {
-                    Some(d) if !d.is_empty() => format!("Claude 对话 · {d}"),
-                    _ => "Claude 对话".to_string(),
+                    Some(d) if !d.is_empty() => format!("{agent} 对话 · {d}"),
+                    _ => format!("{agent} 对话"),
                 }
             }
         })
@@ -626,7 +628,7 @@ impl Session {
 /// 设置窗口 pages 列表里的页下标——调整 `render_settings_content` 末尾那个
 /// `pages(vec![...])` 的顺序时必须同步改这里，否则应用菜单「检查更新…」会跳错页。
 const SETTINGS_PAGE_APPEARANCE: usize = 0;
-// appearance / 桌面宠物 / 启动 / Claude 集成 / 更新 / 远程
+// appearance / 桌面宠物 / 启动 / Agent 集成 / 更新 / 远程
 const SETTINGS_PAGE_UPDATE: usize = 4;
 
 /// 重命名弹窗改的是谁：侧栏会话行改整个会话的名，分屏子行只改那一个 pane 的名。
@@ -875,6 +877,10 @@ struct SessionState {
 struct AcpSaved {
     cwd: Option<String>,
     cmd: String,
+    /// agent 种类标识（`AcpAgentKind::id()`）。旧存档没有这个字段 → None，恢复时
+    /// 按 cmd 里的包名反推，反推不出就当 Claude（多 agent 之前只可能是它）。
+    #[serde(default)]
+    agent: Option<String>,
     #[serde(default)]
     entries: Vec<acp_view::AcpEntry>,
     #[serde(default)]
@@ -1625,9 +1631,15 @@ impl Workspace {
             } else {
                 "上次的对话已随 GUI 退出结束（历史消息已保留，点击重新开始继续）"
             };
+            let agent = saved
+                .agent
+                .as_deref()
+                .and_then(settings::AcpAgentKind::from_id)
+                .unwrap_or_else(|| acp_agent_from_cmd(&saved.cmd));
             let view = cx.new(|cx| {
                 acp_view::AcpView::placeholder(
                     cx,
+                    agent,
                     saved.cmd,
                     saved.cwd,
                     reason.to_string(),
@@ -1926,14 +1938,19 @@ impl Workspace {
         })
     }
 
-    /// 「+」菜单「Claude 消息流」：新建 ACP 会话（第二种会话类型，结构化消息流）。
-    /// spawn_acp 只起线程立即返回，不需要 add_session_with_launch 那套后台三段舞。
-    fn add_acp_session(&mut self, cwd: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let cmd = cx
-            .try_global::<settings::AgentUiConfig>()
-            .map(|c| c.acp_cmd.clone())
-            .unwrap_or_else(settings::default_acp_cmd);
-        let view = cx.new(|cx| acp_view::AcpView::start(window, cx, cmd, cwd));
+    /// 「+」菜单「对话 · smelt 原生界面」下那几项：新建 ACP 会话（第二种会话类型，
+    /// 结构化消息流）。`agent` 决定接哪家（Claude / Copilot / Codex），命令从对应的
+    /// 全局配置取。spawn_acp 只起线程立即返回，不需要 add_session_with_launch 那套
+    /// 后台三段舞。
+    fn add_acp_session(
+        &mut self,
+        agent: settings::AcpAgentKind,
+        cwd: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cmd = settings::acp_cmd_for(agent, cx);
+        let view = cx.new(|cx| acp_view::AcpView::start(window, cx, agent, cmd, cwd));
         let _acp_persist_sub = Some(self.subscribe_acp_persist(&view, cx));
         self.sessions.push(Session {
             kind: SessionKind::Acp(view),
@@ -2122,6 +2139,7 @@ impl Workspace {
                         acp: Some(AcpSaved {
                             cwd: v.cwd(),
                             cmd: v.launch_cmd().to_string(),
+                            agent: Some(v.agent_kind().id().to_string()),
                             entries: v.entries_for_save(),
                             resume_session_id: v.resume_session_id_for_save(),
                         }),
@@ -2904,9 +2922,9 @@ impl Workspace {
                                     .items_center()
                                     .min_w_0()
                                     .child(div().size_2().rounded_full().bg(if is_orphan {
-                                        rgb(0xef4444)
+                                        rgb(ui_theme::red())
                                     } else {
-                                        rgb(0x22c55e)
+                                        rgb(ui_theme::green())
                                     }))
                                     .child(
                                         div()
@@ -2918,7 +2936,7 @@ impl Workspace {
                                     .children(is_orphan.then(|| {
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0xef4444))
+                                            .text_color(rgb(ui_theme::red()))
                                             .child("孤儿（无侧栏追踪）")
                                     })),
                             )
@@ -3154,7 +3172,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().size_2().rounded_full().bg(rgb(0x4a9eff)))
+                            .child(div().size_2().rounded_full().bg(rgb(ui_theme::blue())))
                             .child(div().text_sm().text_color(fg).child(name)),
                     )
                     .child(div().text_xs().text_color(muted).child(msg))
@@ -3280,18 +3298,18 @@ impl Workspace {
             let t = cx.theme();
             (t.foreground, t.muted_foreground)
         };
-        let card_bg = rgb(0x17181d);
-        let card_border = rgba(0xffffff12);
-        let soft_bg: Hsla = rgba(0xffffff0d).into();
-        let c_red: Hsla = rgb(0xef4444).into();
-        let c_blue: Hsla = rgb(0x4a9eff).into();
-        let c_green: Hsla = rgb(0x22c55e).into();
-        let c_amber: Hsla = rgb(0xf59e0b).into();
-        let red_tint: Hsla = rgba(0xef444422).into();
-        let blue_tint: Hsla = rgba(0x4a9eff22).into();
-        let green_tint: Hsla = rgba(0x22c55e22).into();
-        let amber_tint: Hsla = rgba(0xf59e0b22).into();
-        let c_muted_dot: Hsla = rgba(0x8b93a7aa).into();
+        let card_bg = rgb(ui_theme::bg_card());
+        let card_border = ui_theme::overlay(0x12);
+        let soft_bg: Hsla = ui_theme::overlay(0x0d).into();
+        let c_red: Hsla = rgb(ui_theme::red()).into();
+        let c_blue: Hsla = rgb(ui_theme::blue()).into();
+        let c_green: Hsla = rgb(ui_theme::green()).into();
+        let c_amber: Hsla = rgb(ui_theme::yellow()).into();
+        let red_tint: Hsla = ui_theme::tint(ui_theme::red(), 0x22).into();
+        let blue_tint: Hsla = ui_theme::tint(ui_theme::blue(), 0x22).into();
+        let green_tint: Hsla = ui_theme::tint(ui_theme::green(), 0x22).into();
+        let amber_tint: Hsla = ui_theme::tint(ui_theme::yellow(), 0x22).into();
+        let c_muted_dot: Hsla = ui_theme::tint(ui_theme::text_muted(), 0xaa).into();
 
         let statuses: Vec<AgentStatus> = self.sessions.iter().map(|s| s.status(cx)).collect();
         let need = statuses
@@ -3304,8 +3322,8 @@ impl Workspace {
         // 筛选：要一眼像「分段按钮」，未选中也有底/边/hover，别和装饰 pill 混。
         let filter_chip = |id: &'static str, label: String, f: OverviewFilter, color: Hsla, tint: Hsla| {
             let on = filter == f;
-            let idle_bg: Hsla = rgba(0xffffff14).into();
-            let idle_border: Hsla = rgba(0xffffff28).into();
+            let idle_bg: Hsla = ui_theme::overlay(0x14).into();
+            let idle_border: Hsla = ui_theme::overlay(0x28).into();
             div()
                 .id(id)
                 .px(px(12.))
@@ -3323,7 +3341,7 @@ impl Workspace {
                 })
                 .text_color(if on { color } else { fg })
                 .hover(|d| {
-                    d.bg(if on { tint } else { rgba(0xffffff22).into() })
+                    d.bg(if on { tint } else { ui_theme::overlay(0x22).into() })
                         .border_color(color)
                 })
                 .child(label)
@@ -3535,14 +3553,15 @@ impl Workspace {
                     .border_1()
                     .border_color(card_edge)
                     .when(is_approval, |d| d.border_2().border_color(c_red))
+                    // 等审批的卡片底压一层薄红，跟普通卡片一眼分开
                     .bg(if is_approval {
-                        rgb(0x1a1214)
+                        ui_theme::tint(ui_theme::red(), 0x1a)
                     } else {
                         card_bg
                     })
                     .shadow_sm()
                     .cursor_pointer()
-                    .hover(|d| d.border_color(dot).shadow_lg().bg(rgb(0x1c1e24)))
+                    .hover(|d| d.border_color(dot).shadow_lg().bg(rgb(ui_theme::bg_hover())))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -3601,13 +3620,13 @@ impl Workspace {
                     // hook 事实块：工具 / 审批问句（审批时更醒目）
                     .children(fact_question.as_ref().map(|q| {
                         let (bg, tc) = if is_approval {
-                            (rgba(0xef444433), c_red)
+                            (ui_theme::tint(ui_theme::red(), 0x33), c_red)
                         } else if matches!(status, AgentStatus::Running) {
-                            (rgba(0x4a9eff22), c_blue)
+                            (ui_theme::tint(ui_theme::blue(), 0x22), c_blue)
                         } else if matches!(status, AgentStatus::NeedsAttention) {
-                            (rgba(0xf59e0b22), c_amber)
+                            (ui_theme::tint(ui_theme::yellow(), 0x22), c_amber)
                         } else {
-                            (rgba(0xffffff0d), muted)
+                            (ui_theme::overlay(0x0d), muted)
                         };
                         div()
                             .px(px(10.))
@@ -3644,9 +3663,9 @@ impl Workspace {
                             })
                             .map(|m| {
                                 let (bg, tc) = if is_approval {
-                                    (rgba(0xef444422), c_red)
+                                    (ui_theme::tint(ui_theme::red(), 0x22), c_red)
                                 } else {
-                                    (rgba(0xf59e0b22), c_amber)
+                                    (ui_theme::tint(ui_theme::yellow(), 0x22), c_amber)
                                 };
                                 div()
                                     .px(px(8.))
@@ -3663,7 +3682,7 @@ impl Workspace {
                         div()
                             .p_2()
                             .rounded_lg()
-                            .bg(rgb(0x0d0d10))
+                            .bg(rgb(ui_theme::bg_status()))
                             .font_family(terminal_view::font_family())
                             .text_xs()
                             .text_color(muted)
@@ -3682,8 +3701,8 @@ impl Workspace {
                         let ix_open = ix;
                         let opts = perm.as_ref().map(|p| p.options.clone()).unwrap_or_default();
                         let has_opts = !opts.is_empty();
-                        let btn_idle: Hsla = rgba(0xffffff18).into();
-                        let btn_border: Hsla = rgba(0xffffff30).into();
+                        let btn_idle: Hsla = ui_theme::overlay(0x18).into();
+                        let btn_border: Hsla = ui_theme::overlay(0x30).into();
                         card.child(
                             div()
                                 .flex()
@@ -3871,23 +3890,23 @@ impl Workspace {
     /// 弹窗按钮的中性/强调配色：(中性底色, 中性 hover, 强调底色, 强调 hover, 强调文字色)。
     /// `danger=true` 强调色用红（危险操作，如删除/重启），`false` 用蓝（普通确认）。
     fn modal_accent_colors(danger: bool) -> (Hsla, Hsla, Hsla, Hsla, Hsla) {
-        let neutral_bg: Hsla = rgba(0xffffff0a).into();
-        let neutral_hover: Hsla = rgba(0xffffff1f).into();
+        let neutral_bg: Hsla = ui_theme::overlay(0x0a).into();
+        let neutral_hover: Hsla = ui_theme::overlay(0x1f).into();
         if danger {
             (
                 neutral_bg,
                 neutral_hover,
-                rgba(0xef444424).into(),
-                rgba(0xef444440).into(),
-                Hsla::from(rgb(0xff8f8f)),
+                ui_theme::tint(ui_theme::red(), 0x24).into(),
+                ui_theme::tint(ui_theme::red(), 0x40).into(),
+                Hsla::from(rgb(ui_theme::red())),
             )
         } else {
             (
                 neutral_bg,
                 neutral_hover,
-                rgba(0x4a9eff24).into(),
-                rgba(0x4a9eff40).into(),
-                Hsla::from(rgb(0x8fc7ff)),
+                ui_theme::tint(ui_theme::blue(), 0x24).into(),
+                ui_theme::tint(ui_theme::blue(), 0x40).into(),
+                Hsla::from(rgb(ui_theme::blue())),
             )
         }
     }
@@ -3903,7 +3922,7 @@ impl Workspace {
             .rounded_lg()
             .bg(bg)
             .border_1()
-            .border_color(rgba(0xffffff12))
+            .border_color(ui_theme::overlay(0x12))
             .text_sm()
             .text_color(text_color)
             .child(label)
@@ -4852,11 +4871,19 @@ impl Render for Workspace {
             .and_then(|c| self.repo_info.get(c.as_str()).cloned())
             .and_then(|(_, i)| i)
             .map(|i| i.branch);
-        // 标题栏 agent 胶囊：当前 ACP agent 命令的展示名。
-        let acp_label = cx
-            .try_global::<settings::AgentUiConfig>()
-            .map(|c| acp_agent_label(&c.acp_cmd))
-            .unwrap_or_else(|| "agent".to_string());
+        // 标题栏 agent 胶囊：跟着**当前会话**的 agent 走（多 agent 之后死盯全局
+        // Claude 命令，会在 Copilot 会话上顶着「Claude Code」）；当前不是 ACP 会话
+        // 就退回 Claude 那条配置，跟以前一致。
+        let acp_label = match self.sessions.get(self.active_session).map(|s| &s.kind) {
+            Some(SessionKind::Acp(view)) => {
+                let v = view.read(cx);
+                acp_pill_label(v.agent_kind(), v.launch_cmd())
+            }
+            _ => {
+                let agent = settings::AcpAgentKind::Claude;
+                acp_pill_label(agent, &settings::acp_cmd_for(agent, cx))
+            }
+        };
         // 当前活动会话的标题：放到标题栏右侧作为上下文提示。
         let active_title = titles
             .iter()
@@ -5199,17 +5226,17 @@ impl Render for Workspace {
                                         .px_2()
                                         .py(px(2.))
                                         .rounded(px(6.))
-                                        .bg(rgb(ui_theme::BG_HOVER))
+                                        .bg(rgb(ui_theme::bg_hover()))
                                         .border_1()
-                                        .border_color(rgb(ui_theme::BORDER_MID))
+                                        .border_color(rgb(ui_theme::border_mid()))
                                         .text_xs()
                                         .font_family("monospace")
-                                        .text_color(rgb(ui_theme::TEXT_MUTED))
+                                        .text_color(rgb(ui_theme::text_muted()))
                                         .child(
                                             div()
                                                 .size(px(6.))
                                                 .rounded_full()
-                                                .bg(rgb(ui_theme::GREEN)),
+                                                .bg(rgb(ui_theme::green())),
                                         )
                                         .child(b)
                                 })),
@@ -5265,13 +5292,13 @@ impl Render for Workspace {
                                                     .h(px(14.))
                                                     .px(px(3.))
                                                     .rounded(px(7.))
-                                                    .bg(rgb(ui_theme::YELLOW))
+                                                    .bg(rgb(ui_theme::yellow()))
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
                                                     .text_size(px(9.))
                                                     .font_semibold()
-                                                    .text_color(rgb(ui_theme::ON_ACCENT))
+                                                    .text_color(rgb(ui_theme::on_accent()))
                                                     .child(notif_count.to_string()),
                                             )
                                         })
@@ -5286,7 +5313,7 @@ impl Render for Workspace {
                                 )
                                 .child(
                                     // agent 胶囊：紫点 + 当前 ACP agent 展示名，点击开
-                                    // 设置窗「Claude 集成」页（换 agent 命令的入口）。
+                                    // 设置窗「Agent 集成」页（换 agent 命令的入口）。
                                     div()
                                         .id("agent-pill")
                                         .flex()
@@ -5295,19 +5322,19 @@ impl Render for Workspace {
                                         .px_2()
                                         .py(px(3.))
                                         .rounded(px(6.))
-                                        .bg(rgb(ui_theme::BG_HOVER))
+                                        .bg(rgb(ui_theme::bg_hover()))
                                         .border_1()
-                                        .border_color(rgb(ui_theme::BORDER_MID))
+                                        .border_color(rgb(ui_theme::border_mid()))
                                         .cursor_pointer()
-                                        .hover(|s| s.border_color(rgb(ui_theme::BORDER_FOCUS)))
+                                        .hover(|s| s.border_color(rgb(ui_theme::border_focus())))
                                         .text_xs()
                                         .font_family("monospace")
-                                        .text_color(rgb(ui_theme::TEXT_MID))
+                                        .text_color(rgb(ui_theme::text_mid()))
                                         .child(
                                             div()
                                                 .size(px(6.))
                                                 .rounded_full()
-                                                .bg(rgb(ui_theme::PURPLE)),
+                                                .bg(rgb(ui_theme::purple())),
                                         )
                                         .child(acp_label.clone())
                                         .on_mouse_down(
@@ -5317,7 +5344,7 @@ impl Render for Workspace {
                                                 if this.llm_inputs.is_none() {
                                                     this.init_llm_inputs(window, cx);
                                                 }
-                                                this.settings_page_ix = 3; // Claude 集成页
+                                                this.settings_page_ix = 3; // Agent 集成页
                                                 this.settings_page_nonce += 1;
                                                 this.open_settings_window(cx);
                                             }),
@@ -5426,9 +5453,9 @@ impl Render for Workspace {
                         .id("file-drop-overlay")
                         .absolute()
                         .inset_0()
-                        .bg(rgba(0x4a9eff28))
+                        .bg(ui_theme::tint(ui_theme::blue(), 0x28))
                         .border_2()
-                        .border_color(rgb(0x4a9eff))
+                        .border_color(rgb(ui_theme::blue()))
                         .on_drop::<ExternalPaths>(cx.listener(
                             |this, ep: &ExternalPaths, _window, cx| {
                                 this.open_paths(ep.paths(), cx);
@@ -5454,11 +5481,11 @@ impl Render for Workspace {
                     .unwrap_or_else(|| "—".into());
                 // 帧率健康度着色：≥55 绿、≥30 黄、否则红。
                 let color = if fps >= 55.0 {
-                    rgb(0x22c55e)
+                    rgb(ui_theme::green())
                 } else if fps >= 30.0 {
-                    rgb(0xf59e0b)
+                    rgb(ui_theme::yellow())
                 } else {
-                    rgb(0xef4444)
+                    rgb(ui_theme::red())
                 };
                 div()
                     .absolute()
@@ -5467,9 +5494,9 @@ impl Render for Workspace {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(rgba(0x000000cc))
+                    .bg(ui_theme::tint(ui_theme::bg_card(), 0xcc))
                     .border_1()
-                    .border_color(rgba(0xffffff22))
+                    .border_color(ui_theme::overlay(0x22))
                     .font_family(terminal_view::font_family())
                     .text_xs()
                     .text_color(color)
@@ -5498,6 +5525,31 @@ fn acp_agent_label(cmd: &str) -> String {
     let tok = cmd.split_whitespace().rev().find(|t| !t.starts_with('-')).unwrap_or("agent");
     let name = tok.rsplit('/').next().unwrap_or(tok);
     name.split('@').find(|s| !s.is_empty()).unwrap_or(name).to_string()
+}
+
+/// 标题栏 agent 胶囊的文字：命令还是出厂值就显示人话名（`Claude Code`），用户
+/// 自定义过就显示命令里抠出的包名——自定义了还写「Claude Code」等于撒谎。
+fn acp_pill_label(agent: settings::AcpAgentKind, cmd: &str) -> String {
+    if cmd.trim() == agent.default_cmd() {
+        agent.label().to_string()
+    } else {
+        acp_agent_label(cmd)
+    }
+}
+
+/// 旧存档没记 agent 种类时，从启动命令反推一把（命令里出现过 copilot / codex
+/// 字样就归给它们）；认不出当 Claude——多 agent 之前的存档只可能是它。
+fn acp_agent_from_cmd(cmd: &str) -> settings::AcpAgentKind {
+    let c = cmd.to_ascii_lowercase();
+    if c.contains("copilot") {
+        settings::AcpAgentKind::Copilot
+    } else if c.contains("codex") {
+        settings::AcpAgentKind::Codex
+    } else if c.contains("grok") {
+        settings::AcpAgentKind::Grok
+    } else {
+        settings::AcpAgentKind::Claude
+    }
 }
 
 /// 当前工作目录字符串。
@@ -5652,12 +5704,10 @@ fn main() {
         ])]);
 
         // 外观设置：读盘设为全局单例，据此确定窗口背景外观（透明 / 模糊）。
-        // 主题本版强制深色——设计稿只有深色方案；旧配置里可能存着 Light，
-        // 这里无条件 Dark（theme_mode 字段保留只为 serde 兼容，外观页开关已撤）。
+        // 主题模式在建窗口之前落地，首帧就是对的，不会先闪一下深色再变浅。
         let appearance = load_appearance();
         let window_bg = appearance.window_bg();
-        Theme::change(ThemeMode::Dark, None, cx);
-        terminal::set_dark_mode(true);
+        settings::apply_theme_mode(appearance.theme_mode, cx);
         terminal_view::set_font_px(appearance.font_px);
         terminal_view::set_font_family(&appearance.font_family);
         cx.set_global(appearance);
@@ -6024,5 +6074,49 @@ mod pane_state_tests {
             }
             _ => panic!("应当反序列化成 Leaf"),
         }
+    }
+}
+
+#[cfg(test)]
+mod acp_agent_tests {
+    use super::{acp_agent_from_cmd, acp_pill_label, AcpSaved};
+    use crate::settings::AcpAgentKind;
+
+    /// 多 agent 之前的 ACP 存档没有 `agent` 字段：必须读得进来（None），
+    /// 不能整条会话解析失败——那等于用户重开 GUI 少一个会话。
+    #[test]
+    fn old_acp_archive_without_agent_field_still_loads() {
+        let old = r#"{"cwd":"/tmp/x","cmd":"bunx --bun @agentclientprotocol/claude-agent-acp@0.59.0"}"#;
+        let back: AcpSaved = serde_json::from_str(old).unwrap();
+        assert!(back.agent.is_none(), "旧存档不该凭空冒出 agent 字段");
+        assert_eq!(acp_agent_from_cmd(&back.cmd), AcpAgentKind::Claude);
+    }
+
+    /// 旧存档反推：命令里带 copilot / codex 字样的归给对应 agent，其余当 Claude。
+    #[test]
+    fn agent_inferred_from_legacy_cmd() {
+        assert_eq!(acp_agent_from_cmd("copilot --acp"), AcpAgentKind::Copilot);
+        assert_eq!(
+            acp_agent_from_cmd("bunx --bun @zed-industries/codex-acp"),
+            AcpAgentKind::Codex
+        );
+        assert_eq!(acp_agent_from_cmd("some-other-agent"), AcpAgentKind::Claude);
+    }
+
+    /// 存档标识必须往返得回来（改了 id 就等于把用户的会话认成别家 agent）。
+    #[test]
+    fn agent_id_roundtrips() {
+        for a in AcpAgentKind::ALL {
+            assert_eq!(AcpAgentKind::from_id(a.id()), Some(a));
+        }
+        assert_eq!(AcpAgentKind::from_id("gemini"), None);
+    }
+
+    /// 胶囊文案：出厂命令显示人话名，自定义过就显示命令里抠出的包名。
+    #[test]
+    fn pill_label_tells_truth_about_custom_cmd() {
+        let claude = AcpAgentKind::Claude;
+        assert_eq!(acp_pill_label(claude, &claude.default_cmd()), "Claude Code");
+        assert_eq!(acp_pill_label(claude, "bunx my-own-acp@1.2.3"), "my-own-acp");
     }
 }

@@ -45,9 +45,9 @@ impl Workspace {
             .items_center()
             .gap_2p5()
             .px_3()
-            .bg(rgb(ui_theme::BG_STATUS))
+            .bg(rgb(ui_theme::bg_status()))
             .border_b_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .child(
                 div()
                     .id("stage-back")
@@ -58,9 +58,9 @@ impl Workspace {
                     .py(px(2.))
                     .rounded(px(6.))
                     .text_sm()
-                    .text_color(rgb(ui_theme::TEXT_MID))
+                    .text_color(rgb(ui_theme::text_mid()))
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(ui_theme::BG_HOVER)).text_color(rgb(ui_theme::TEXT_BRIGHT)))
+                    .hover(|d| d.bg(rgb(ui_theme::bg_hover())).text_color(rgb(ui_theme::text_bright())))
                     .child(back)
                     .on_click(move |_ev, window, cx| {
                         this.update(cx, |ws, cx| ws.set_stage_override(None, window, cx));
@@ -70,7 +70,7 @@ impl Workspace {
                 div()
                     .text_xs()
                     .font_semibold()
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .child(label),
             )
             .child(div().flex_1())
@@ -78,7 +78,7 @@ impl Workspace {
                 div()
                     .text_xs()
                     .font_family("monospace")
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .child("Esc"),
             )
     }
@@ -101,6 +101,12 @@ impl Workspace {
                 (phase_text(st), ui_theme::session_dot_color(st))
             }
         };
+        // ACP 会话把当前模型也摆到舞台头上——「这轮对话用的哪个模型」是随时
+        // 要能确认的事实，不该只藏在输入栏胶囊里。
+        let model = match &sess.kind {
+            SessionKind::Acp(view) => view.read(cx).model_name(),
+            SessionKind::Term { .. } => None,
+        };
         let cwd_tail = sess
             .cwd(cx)
             .map(|c| crate::project_name_for_cwd(&c))
@@ -109,9 +115,9 @@ impl Workspace {
 
         // 类型点：agent 紫圆 / 终端绿方（与会话列表一致）。
         let type_dot: AnyElement = if is_term {
-            div().size(px(9.)).rounded_xs().bg(rgb(ui_theme::GREEN)).into_any_element()
+            div().size(px(9.)).rounded_xs().bg(rgb(ui_theme::green())).into_any_element()
         } else {
-            div().size(px(9.)).rounded_full().bg(rgb(ui_theme::PURPLE)).into_any_element()
+            div().size(px(9.)).rounded_full().bg(rgb(ui_theme::purple())).into_any_element()
         };
 
         let e_split = this.clone();
@@ -125,13 +131,13 @@ impl Workspace {
                 .gap_2p5()
                 .px_4()
                 .border_b_1()
-                .border_color(rgb(ui_theme::BORDER_DIM))
+                .border_color(rgb(ui_theme::border_dim()))
                 .child(type_dot)
                 .child(
                     div()
                         .text_sm()
                         .font_semibold()
-                        .text_color(rgb(ui_theme::TEXT_BRIGHT))
+                        .text_color(rgb(ui_theme::text_bright()))
                         .child(title),
                 )
                 .child(
@@ -143,19 +149,35 @@ impl Workspace {
                         .px_2()
                         .py(px(2.))
                         .rounded(px(6.))
-                        .bg(rgb(ui_theme::BG_CARD))
+                        .bg(rgb(ui_theme::bg_card()))
                         .border_1()
-                        .border_color(rgb(ui_theme::BORDER_MID))
+                        .border_color(rgb(ui_theme::border_mid()))
                         .text_xs()
-                        .text_color(rgb(ui_theme::TEXT_MUTED))
+                        .text_color(rgb(ui_theme::text_muted()))
                         .child(div().size(px(6.)).rounded_full().bg(phase_color))
                         .child(phase_label),
                 )
+                .children(model.map(|m| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded(px(6.))
+                        .bg(rgb(ui_theme::bg_card()))
+                        .border_1()
+                        .border_color(rgb(ui_theme::border_mid()))
+                        .text_xs()
+                        .text_color(rgb(ui_theme::text_mid()))
+                        .child(div().size(px(6.)).rounded_full().bg(rgb(ui_theme::purple())))
+                        .child(m)
+                }))
                 .child(
                     div()
                         .text_xs()
                         .font_family("monospace")
-                        .text_color(rgb(ui_theme::TEXT_FAINT))
+                        .text_color(rgb(ui_theme::text_faint()))
                         .child(cwd_tail),
                 )
                 .child(div().flex_1())
@@ -164,9 +186,9 @@ impl Workspace {
                         .id("stage-split")
                         .text_xs()
                         .font_family("monospace")
-                        .text_color(rgb(ui_theme::TEXT_FAINT))
+                        .text_color(rgb(ui_theme::text_faint()))
                         .cursor_pointer()
-                        .hover(|d| d.text_color(rgb(ui_theme::TEXT_MID)))
+                        .hover(|d| d.text_color(rgb(ui_theme::text_mid())))
                         .child("split ⌘D")
                         .on_click(move |_ev, _window, cx| {
                             e_split.update(cx, |ws, cx| ws.split_active(Axis::Horizontal, cx));
@@ -178,9 +200,9 @@ impl Workspace {
                         .id("stage-more")
                         .px_1()
                         .text_base()
-                        .text_color(rgb(ui_theme::TEXT_FAINT))
+                        .text_color(rgb(ui_theme::text_faint()))
                         .cursor_pointer()
-                        .hover(|d| d.text_color(rgb(ui_theme::TEXT_MID)))
+                        .hover(|d| d.text_color(rgb(ui_theme::text_mid())))
                         .child("⋯")
                         .context_menu(move |menu, _window, _cx| {
                             let e_rename = e_menu.clone();
@@ -226,12 +248,12 @@ impl Workspace {
                 .items_center()
                 .gap_3()
                 .px_4()
-                .bg(rgb(ui_theme::BG_STATUS))
+                .bg(rgb(ui_theme::bg_status()))
                 .border_t_1()
-                .border_color(rgb(ui_theme::BORDER_DIM))
+                .border_color(rgb(ui_theme::border_dim()))
                 .text_xs()
                 .font_family("monospace")
-                .text_color(rgb(ui_theme::TEXT_FAINT))
+                .text_color(rgb(ui_theme::text_faint()))
                 .child(launch)
                 .when(panes > 1, |d| d.child(format!("{panes} 分屏")))
                 .child(

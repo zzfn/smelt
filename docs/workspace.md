@@ -113,6 +113,20 @@ UI 线程每 30ms 对网格做快照并重绘。
 > 工具卡片、内嵌 diff、按钮审批、PLAN 进度条，列表里是紫点）。引擎是同一个 CLI，
 > 区别只在「看它的画面」还是「跟它讲协议」。项目行「+」下拉按这两个通道分组。
 >
+> 对话通道支持四家 agent（`settings::AcpAgentKind`，会话列表头「+Agent」下拉 /
+> 项目行「+」里选）：**Claude Code**（`@agentclientprotocol/claude-agent-acp`，
+> bunx 拉受管 bun 跑）、**GitHub Copilot**（CLI 自带 `copilot --acp`）、
+> **Codex**（Codex CLI 自身没有 ACP 入口，走 Zed 的 `@zed-industries/codex-acp`，
+> 登录态复用 `~/.codex`）、**Grok**（CLI 自带 `grok agent stdio`，凭据
+> `~/.grok/auth.json`）。四条启动命令各自可在设置 →「Agent 集成」页改；四家
+> 实测都握手成功且 `loadSession: true`，「重新开始」是协议级续接而非摆样子的
+> 新对话。
+>
+> 各家实测差异（决定了下面几个 UI 决策）：首块响应 Claude ~2.6s / Copilot ~7s /
+> Codex ~15s——所以回合跑着但还没出正文时，消息流末尾必须有个转着的 spinner，
+> 否则那十几秒是一整屏纯黑。`promptCapabilities.image` 只有 Grok 是 false，
+> 其余三家可以往对话里粘图片（⌘V，见下）。
+>
 > 2026-07 布局改版（起点是 claude.ai/design「桌面开发者客户端设计」稿，落地时按
 > 实测调整）：窗口为「会话列表 280px（按项目上下分组）→ 会话舞台 → inspector
 > 面板 344px + 图标条 56px」+ 底部 26px 状态栏；旧的左 Sidebar 与主区 TabBar 已
@@ -121,8 +135,9 @@ UI 线程每 30ms 对网格做快照并重绘。
 >
 > 舞台有两种覆盖模式：**详情**（从停靠面板点文件/变更 → 舞台只出内容或 diff，
 > 面板原样停靠）与**双栏全宽**（面板头 ⤢ → 树/列表 + 详情占满舞台，此时面板让位）；
-> 总览/任务/热力图/历史仍是整页覆盖。Esc 或返回条收回。主题强制深色
-> （色板见 `ui_theme.rs`）。
+> 总览/任务/热力图/历史仍是整页覆盖。Esc 或返回条收回。主题支持深色/浅色，
+> 设置 → 外观 → 主题模式切换（色板见 `ui_theme.rs`，切换入口
+> `settings::apply_theme_mode`）。
 
 ### 终端内（`TerminalView` 聚焦时，见 `terminal_view.rs`）
 

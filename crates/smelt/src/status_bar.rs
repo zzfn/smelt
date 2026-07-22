@@ -27,11 +27,11 @@ impl Workspace {
             .map(|s| s.status(cx))
             .unwrap_or(AgentStatus::Idle);
         let (agent_text, agent_color) = match cur_status {
-            AgentStatus::WaitingApproval => ("agent 等你批准", ui_theme::YELLOW),
-            AgentStatus::NeedsAttention => ("agent 需要处理", ui_theme::YELLOW),
-            AgentStatus::Running => ("agent 运行中", ui_theme::BLUE),
-            AgentStatus::Done => ("agent 完成", ui_theme::GREEN),
-            AgentStatus::Idle => ("agent 就绪", ui_theme::GREEN),
+            AgentStatus::WaitingApproval => ("agent 等你批准", ui_theme::yellow()),
+            AgentStatus::NeedsAttention => ("agent 需要处理", ui_theme::yellow()),
+            AgentStatus::Running => ("agent 运行中", ui_theme::blue()),
+            AgentStatus::Done => ("agent 完成", ui_theme::green()),
+            AgentStatus::Idle => ("agent 就绪", ui_theme::green()),
         };
 
         // 项目数 + 阻塞项目数（组内有等审批/需处理会话的项目）。
@@ -73,15 +73,15 @@ impl Workspace {
             .items_center()
             .gap_4()
             .px_3()
-            .bg(rgb(ui_theme::BG_STATUS))
+            .bg(rgb(ui_theme::bg_status()))
             .border_t_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .text_xs()
             .font_family("monospace")
-            .text_color(rgb(ui_theme::TEXT_MUTED))
+            .text_color(rgb(ui_theme::text_muted()))
             .children(
                 branch.map(|b| {
-                    div().text_color(rgb(ui_theme::ACCENT)).child(format!("⎇ {b}"))
+                    div().text_color(rgb(ui_theme::accent())).child(format!("⎇ {b}"))
                 }),
             )
             .child(
@@ -97,12 +97,12 @@ impl Workspace {
                 div()
                     .id("status-projects")
                     .text_color(if blocked > 0 {
-                        rgb(ui_theme::YELLOW)
+                        rgb(ui_theme::yellow())
                     } else {
-                        rgb(ui_theme::TEXT_MUTED)
+                        rgb(ui_theme::text_muted())
                     })
                     .cursor_pointer()
-                    .hover(|d| d.text_color(rgb(ui_theme::TEXT_BRIGHT)))
+                    .hover(|d| d.text_color(rgb(ui_theme::text_bright())))
                     .child(projects_text)
                     .on_click(move |_ev, window, cx| {
                         e_overview.update(cx, |ws, cx| {
@@ -116,7 +116,7 @@ impl Workspace {
                 div()
                     .id("status-version")
                     .cursor_pointer()
-                    .hover(|d| d.text_color(rgb(ui_theme::TEXT_MID)))
+                    .hover(|d| d.text_color(rgb(ui_theme::text_mid())))
                     .child(version)
                     .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                         cx.open_url(if has_update {

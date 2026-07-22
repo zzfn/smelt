@@ -47,9 +47,9 @@ impl TaskColumn {
 
     pub fn color(self) -> u32 {
         match self {
-            Self::Running | Self::Waiting => crate::ui_theme::BLUE,
-            Self::Backlog | Self::Ready => crate::ui_theme::TEXT_MUTED,
-            Self::Done => crate::ui_theme::GREEN,
+            Self::Running | Self::Waiting => crate::ui_theme::blue(),
+            Self::Backlog | Self::Ready => crate::ui_theme::text_muted(),
+            Self::Done => crate::ui_theme::green(),
         }
     }
 
@@ -1011,9 +1011,9 @@ impl Workspace {
                         .px_3()
                         .py_2()
                         .rounded_lg()
-                        .bg(rgba(0x4a9eff18))
+                        .bg(crate::ui_theme::tint(crate::ui_theme::blue(), 0x18))
                         .text_xs()
-                        .text_color(rgb(0x8fc7ff))
+                        .text_color(rgb(crate::ui_theme::blue()))
                         .child("已绑定侧栏选中的终端，运行会把指令发进该会话。"),
                 )
             })
@@ -1120,9 +1120,9 @@ impl Workspace {
             let t = cx.theme();
             (t.foreground, t.muted_foreground, t.border)
         };
-        let soft_bg: Hsla = rgba(0xffffff0d).into();
-        let card_bg = rgb(0x17181d);
-        let card_border = rgba(0xffffff12);
+        let soft_bg: Hsla = crate::ui_theme::overlay(0x0d).into();
+        let card_bg = rgb(crate::ui_theme::bg_card());
+        let card_border = crate::ui_theme::overlay(0x12);
 
         let mut all = TaskStore::load().tasks;
         all.sort_by_key(|t| (t.column.sidebar_rank(), std::cmp::Reverse(t.updated_at)));
@@ -1179,12 +1179,12 @@ impl Workspace {
                 )
         };
 
-        let c_blue: Hsla = rgb(0x4a9eff).into();
-        let c_gray: Hsla = rgb(0x8b93a7).into();
-        let c_green: Hsla = rgb(0x22c55e).into();
-        let blue_tint: Hsla = rgba(0x4a9eff28).into();
-        let gray_tint: Hsla = rgba(0x8b93a728).into();
-        let green_tint: Hsla = rgba(0x22c55e28).into();
+        let c_blue: Hsla = rgb(crate::ui_theme::blue()).into();
+        let c_gray: Hsla = rgb(crate::ui_theme::text_muted()).into();
+        let c_green: Hsla = rgb(crate::ui_theme::green()).into();
+        let blue_tint: Hsla = crate::ui_theme::tint(crate::ui_theme::blue(), 0x28).into();
+        let gray_tint: Hsla = crate::ui_theme::tint(crate::ui_theme::text_muted(), 0x28).into();
+        let green_tint: Hsla = crate::ui_theme::tint(crate::ui_theme::green(), 0x28).into();
 
         let summary = div()
             .flex()
@@ -1367,11 +1367,8 @@ impl Workspace {
         let proj = project_label(&task.project_cwd);
         let col = task.column;
         let col_color: Hsla = rgb(col.color()).into();
-        let col_tint: Hsla = match col {
-            TaskColumn::Running | TaskColumn::Waiting => rgba(0x4a9eff22).into(),
-            TaskColumn::Done => rgba(0x22c55e22).into(),
-            _ => rgba(0x8b93a722).into(),
-        };
+        // 徽章底 = 该列语义色的低透明度版本，与 `col.color()` 同源
+        let col_tint: Hsla = crate::ui_theme::tint(col.color(), 0x22).into();
         let body_prev = {
             let t = task.body.trim();
             if t.is_empty() {
@@ -1452,7 +1449,11 @@ impl Workspace {
             .border_color(card_border)
             .bg(card_bg)
             .shadow_sm()
-            .hover(|d| d.border_color(col_color).shadow_lg().bg(rgb(0x1c1e24)))
+            .hover(|d| {
+                d.border_color(col_color)
+                    .shadow_lg()
+                    .bg(rgb(crate::ui_theme::bg_hover()))
+            })
             .flex()
             .flex_col()
             .gap_3()
@@ -1501,18 +1502,24 @@ impl Workspace {
                                 .rounded_full()
                                 .px_2()
                                 .py_1()
-                                .bg(rgba(0xa78bfa22))
+                                .bg(crate::ui_theme::tint(crate::ui_theme::purple(), 0x22))
                                 .text_xs()
-                                .text_color(rgb(0xc4b5fd))
+                                .text_color(rgb(crate::ui_theme::purple()))
                                 .child(lab),
                         )
                     })
                     .when(auto_label.is_some(), |d| {
                         let lab = auto_label.unwrap_or("");
                         let (bg, fg): (Hsla, Hsla) = if task.auto_run {
-                            (rgba(0x22c55e22).into(), rgb(0x86efac).into())
+                            (
+                                crate::ui_theme::tint(crate::ui_theme::green(), 0x22).into(),
+                                rgb(crate::ui_theme::green()).into(),
+                            )
                         } else {
-                            (rgba(0x8b93a722).into(), muted)
+                            (
+                                crate::ui_theme::tint(crate::ui_theme::text_muted(), 0x22).into(),
+                                muted,
+                            )
                         };
                         d.child(
                             div()
@@ -1545,7 +1552,7 @@ impl Workspace {
                     div()
                         .p_2()
                         .rounded_lg()
-                        .bg(rgb(0x0d0d10))
+                        .bg(rgb(crate::ui_theme::bg_rail()))
                         .text_xs()
                         .text_color(muted)
                         .line_clamp(3)

@@ -18,7 +18,7 @@ use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::*;
 
 use crate::git_panel::main_repo_root_from_common_dir;
-use crate::settings::{active_launch_entries, icon_for_launch_command};
+use crate::settings::{active_launch_entries, icon_for_launch_command, AcpAgentKind};
 use crate::{
     pane_status, pane_title, ui_theme, AgentStatus, MainView, RenameTarget, SessionDrag,
     SessionKind, Workspace,
@@ -91,7 +91,7 @@ impl Workspace {
                 div()
                     .text_xs()
                     .font_semibold()
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .child(format!("SESSIONS · {}", self.sessions.len())),
             )
             .child(
@@ -100,17 +100,33 @@ impl Workspace {
                     .items_center()
                     .gap_2p5()
                     .child(
-                        div()
-                            .id("sess-new-agent")
+                        // 「+Agent」：接哪家 agent 由下拉选（Claude / Copilot /
+                        // Codex 都走 ACP 同一条通道）。用 Button 而不是 div——
+                        // dropdown_menu 只对 Button 实现，外观靠 ghost + 覆盖
+                        // text_color 贴回原来的纯文字样式。
+                        Button::new("sess-new-agent")
+                            .ghost()
+                            .xsmall()
+                            .label("+Agent")
                             .text_xs()
                             .font_semibold()
-                            .text_color(rgb(ui_theme::PURPLE))
-                            .cursor_pointer()
-                            .hover(|d| d.opacity(0.8))
-                            .child("+Agent")
-                            .on_click(move |_ev, window, cx| {
-                                let cwd = cwd_acp.clone();
-                                e_acp.update(cx, |ws, cx| ws.add_acp_session(cwd, window, cx));
+                            .text_color(rgb(ui_theme::purple()))
+                            .dropdown_menu(move |mut menu, _window, _cx| {
+                                for agent in AcpAgentKind::ALL {
+                                    let e_acp = e_acp.clone();
+                                    let cwd_acp = cwd_acp.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(agent.label())
+                                            .icon(IconName::Bot)
+                                            .on_click(move |_ev, window, cx| {
+                                                let cwd = cwd_acp.clone();
+                                                e_acp.update(cx, |ws, cx| {
+                                                    ws.add_acp_session(agent, cwd, window, cx)
+                                                });
+                                            }),
+                                    );
+                                }
+                                menu
                             }),
                     )
                     .child(
@@ -118,7 +134,7 @@ impl Workspace {
                             .id("sess-new-term")
                             .text_xs()
                             .font_semibold()
-                            .text_color(rgb(ui_theme::GREEN))
+                            .text_color(rgb(ui_theme::green()))
                             .cursor_pointer()
                             .hover(|d| d.opacity(0.8))
                             .child("+Term")
@@ -132,9 +148,9 @@ impl Workspace {
                         div()
                             .id("sess-history")
                             .text_xs()
-                            .text_color(rgb(ui_theme::TEXT_FAINT))
+                            .text_color(rgb(ui_theme::text_faint()))
                             .cursor_pointer()
-                            .hover(|d| d.text_color(rgb(ui_theme::TEXT_MID)))
+                            .hover(|d| d.text_color(rgb(ui_theme::text_mid())))
                             .child("历史")
                             .on_click(move |_ev, window, cx| {
                                 e_hist.update(cx, |ws, cx| {
@@ -199,7 +215,7 @@ impl Workspace {
                     // 得看得出是哪个。
                     .bg(ui_theme::tint(0xffffff, if is_active_group { 0x1e } else { 0x12 }))
                     .border_b_1()
-                    .border_color(rgb(ui_theme::BORDER_DIM))
+                    .border_color(rgb(ui_theme::border_dim()))
                     .cursor_pointer()
                     .hover(|d| d.bg(ui_theme::tint(0xffffff, 0x1c)))
                     .child(
@@ -207,7 +223,7 @@ impl Workspace {
                             .w(px(10.))
                             .flex_shrink_0()
                             .text_size(px(9.))
-                            .text_color(rgb(ui_theme::TEXT_FAINT))
+                            .text_color(rgb(ui_theme::text_faint()))
                             .child(if collapsed { "▸" } else { "▾" }),
                     )
                     .child(
@@ -228,7 +244,7 @@ impl Workspace {
                                     .flex_shrink_0()
                                     .text_size(px(12.5))
                                     .font_semibold()
-                                    .text_color(rgb(ui_theme::TEXT_BRIGHT))
+                                    .text_color(rgb(ui_theme::text_bright()))
                                     .child(group_name.clone()),
                             )
                             .children(branch_label.map(|b| {
@@ -237,7 +253,7 @@ impl Workspace {
                                     .truncate()
                                     .text_size(px(10.))
                                     .font_family("monospace")
-                                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                                    .text_color(rgb(ui_theme::text_faint()))
                                     .child(b)
                             })),
                     )
@@ -255,7 +271,7 @@ impl Workspace {
                         div()
                             .flex_shrink_0()
                             .text_size(px(10.))
-                            .text_color(rgb(ui_theme::TEXT_FAINT))
+                            .text_color(rgb(ui_theme::text_faint()))
                             .child(ixs.len().to_string()),
                     )
                     .child(
@@ -309,21 +325,25 @@ impl Workspace {
                                             ),
                                         );
                                     }
-                                    let e_acp = e_menu.clone();
-                                    let cwd_acp = cwd_opt.clone();
                                     menu = menu
                                         .separator()
-                                        .item(PopupMenuItem::label("对话 · smelt 原生界面"))
-                                        .item(
-                                            PopupMenuItem::new("Claude Code").icon(IconName::Bot).on_click(
-                                                move |_ev, window, cx| {
+                                        .item(PopupMenuItem::label("对话 · smelt 原生界面"));
+                                    // 三家 agent 走同一条 ACP 通道，菜单项从枚举派生：
+                                    // 加一家 agent 不用回来改这段。
+                                    for agent in AcpAgentKind::ALL {
+                                        let e_acp = e_menu.clone();
+                                        let cwd_acp = cwd_opt.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(agent.label())
+                                                .icon(IconName::Bot)
+                                                .on_click(move |_ev, window, cx| {
                                                     let cwd = cwd_acp.clone();
                                                     e_acp.update(cx, |ws, cx| {
-                                                        ws.add_acp_session(cwd, window, cx)
+                                                        ws.add_acp_session(agent, cwd, window, cx)
                                                     });
-                                                },
-                                            ),
+                                                }),
                                         );
+                                    }
                                     menu
                                 }
                             }),
@@ -395,7 +415,7 @@ impl Workspace {
                 .ml(px(17.))
                 .pl(px(10.))
                 .border_l_1()
-                .border_color(rgb(ui_theme::BORDER_DIM));
+                .border_color(rgb(ui_theme::border_dim()));
             for &ix in ixs {
                 let title = titles.get(ix).map(|(_, t)| t.clone()).unwrap_or_default();
                 let status = statuses.get(ix).copied().unwrap_or(AgentStatus::Idle);
@@ -431,7 +451,7 @@ impl Workspace {
                 let type_dot: AnyElement = div()
                     .size(px(7.))
                     .rounded_full()
-                    .bg(rgb(if is_acp { ui_theme::PURPLE } else { ui_theme::GREEN }))
+                    .bg(rgb(if is_acp { ui_theme::purple() } else { ui_theme::green() }))
                     .into_any_element();
 
                 let dragging = cx.has_active_drag();
@@ -457,7 +477,7 @@ impl Workspace {
                         .right(px(4.))
                         .h(px(5.))
                         .rounded(px(2.5))
-                        .bg(rgb(ui_theme::BLUE))
+                        .bg(rgb(ui_theme::blue()))
                         .map(|d| if at_top { d.top(px(-3.)) } else { d.bottom(px(-3.)) })
                         .with_animation(
                             anim_id,
@@ -480,13 +500,13 @@ impl Workspace {
                     .cursor_pointer()
                     .map(|d| {
                         if is_active {
-                            d.bg(rgb(ui_theme::BG_SELECTED))
+                            d.bg(rgb(ui_theme::bg_selected()))
                                 .border_1()
-                                .border_color(rgb(ui_theme::BORDER_SELECTED))
+                                .border_color(rgb(ui_theme::border_selected()))
                         } else {
                             d.border_1()
                                 .border_color(gpui::transparent_black())
-                                .hover(|d| d.bg(rgb(ui_theme::BG_HOVER)))
+                                .hover(|d| d.bg(rgb(ui_theme::bg_hover())))
                         }
                     })
                     .child(div().flex_shrink_0().child(type_dot))
@@ -495,7 +515,7 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .text_size(px(12.5))
-                            .text_color(rgb(ui_theme::TEXT_MID))
+                            .text_color(rgb(ui_theme::text_mid()))
                             .truncate()
                             .child(title.clone()),
                     )
@@ -505,7 +525,7 @@ impl Workspace {
                             .flex_shrink_0()
                             .text_size(px(10.))
                             .font_family("monospace")
-                            .text_color(rgb(ui_theme::TEXT_FAINT))
+                            .text_color(rgb(ui_theme::text_faint()))
                             .child(s)
                     }))
                     // 状态文字只在「要人管」时才出（空闲/运行中靠状态点表达就够，
@@ -654,9 +674,9 @@ impl Workspace {
                                 .cursor_pointer()
                                 .map(|d| {
                                     if is_current_view {
-                                        d.bg(rgb(ui_theme::BG_SELECTED))
+                                        d.bg(rgb(ui_theme::bg_selected()))
                                     } else {
-                                        d.hover(|d| d.bg(rgb(ui_theme::BG_HOVER)))
+                                        d.hover(|d| d.bg(rgb(ui_theme::bg_hover())))
                                     }
                                 })
                                 .child(
@@ -671,7 +691,7 @@ impl Workspace {
                                         .flex_1()
                                         .min_w_0()
                                         .text_size(px(10.))
-                                        .text_color(rgb(ui_theme::TEXT_MID))
+                                        .text_color(rgb(ui_theme::text_mid()))
                                         .truncate()
                                         .child(p_title),
                                 )
@@ -721,14 +741,14 @@ impl Workspace {
             .px_3()
             .py_1p5()
             .border_t_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .child(
                 div()
                     .id("open-project")
                     .text_xs()
-                    .text_color(rgb(ui_theme::TEXT_MUTED))
+                    .text_color(rgb(ui_theme::text_muted()))
                     .cursor_pointer()
-                    .hover(|d| d.text_color(rgb(ui_theme::TEXT_BRIGHT)))
+                    .hover(|d| d.text_color(rgb(ui_theme::text_bright())))
                     .child("+ 打开项目")
                     .on_click(move |_ev, _window, cx| {
                         e_open.update(cx, |ws, cx| ws.open_project(cx));
@@ -738,9 +758,9 @@ impl Workspace {
                 div()
                     .id("scratch-terminal")
                     .text_xs()
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .cursor_pointer()
-                    .hover(|d| d.text_color(rgb(ui_theme::TEXT_MID)))
+                    .hover(|d| d.text_color(rgb(ui_theme::text_mid())))
                     .child("临时终端")
                     .on_click(move |_ev, window, cx| {
                         e_scratch.update(cx, |ws, cx| ws.activate_or_new_scratch(window, cx));
@@ -753,9 +773,9 @@ impl Workspace {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(ui_theme::BG_ELEV))
+            .bg(rgb(ui_theme::bg_elev()))
             .border_r_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .child(header)
             .child(rows)
             .child(footer)

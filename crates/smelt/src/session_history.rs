@@ -15,6 +15,15 @@ fn project_dir(cwd: &str) -> String {
     cwd.replace('/', "-").replace('.', "-")
 }
 
+/// 某个会话的 transcript 文件路径（`<项目目录>/<会话 id>.jsonl`）。
+///
+/// ACP 的会话 id 就是 Claude Code 的 transcript 文件名（实测印证）；这个文件
+/// 存在与否 = 这段对话有没有真正落盘 = 续接有没有可能成功。acp.rs 靠它避开
+/// 注定失败的 `session/resume`（省下约 2 秒白等）。
+pub(crate) fn transcript_path(cwd: &str, session_id: &str) -> PathBuf {
+    projects_root().join(project_dir(cwd)).join(format!("{session_id}.jsonl"))
+}
+
 fn projects_root() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".claude").join("projects")
 }

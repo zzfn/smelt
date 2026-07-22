@@ -99,29 +99,29 @@ impl Workspace {
                 .cursor_pointer()
                 .map(|d| {
                     if active {
-                        d.bg(ui_theme::tint(ui_theme::ACCENT, 0x14))
+                        d.bg(ui_theme::tint(ui_theme::accent(), 0x14))
                             .border_l_2()
-                            .border_color(rgb(ui_theme::ACCENT))
+                            .border_color(rgb(ui_theme::accent()))
                     } else {
                         d.border_l_2()
                             .border_color(gpui::transparent_black())
-                            .hover(|d| d.bg(rgb(ui_theme::BG_HOVER)))
+                            .hover(|d| d.bg(rgb(ui_theme::bg_hover())))
                     }
                 })
                 .child(
                     div()
                         .size(px(7.))
                         .rounded_xs()
-                        .bg(if active { rgb(ui_theme::ACCENT) } else { rgb(ui_theme::BORDER_FOCUS) }),
+                        .bg(if active { rgb(ui_theme::accent()) } else { rgb(ui_theme::border_focus()) }),
                 )
                 .child(
                     div()
                         .text_size(px(9.))
                         .font_semibold()
                         .text_color(if active {
-                            rgb(ui_theme::TEXT_BRIGHT)
+                            rgb(ui_theme::text_bright())
                         } else {
-                            rgb(ui_theme::TEXT_FAINT)
+                            rgb(ui_theme::text_faint())
                         })
                         .child(tab.label()),
                 )
@@ -133,10 +133,10 @@ impl Workspace {
                             .right(px(7.))
                             .px(px(4.))
                             .rounded(px(8.))
-                            .bg(rgb(ui_theme::ACCENT))
+                            .bg(rgb(ui_theme::accent()))
                             .text_size(px(8.))
                             .font_semibold()
-                            .text_color(rgb(ui_theme::ON_ACCENT))
+                            .text_color(rgb(ui_theme::on_accent()))
                             .child(badge.to_string()),
                     )
                 })
@@ -154,9 +154,9 @@ impl Workspace {
             .flex()
             .flex_col()
             .pt_1()
-            .bg(rgb(ui_theme::BG_RAIL))
+            .bg(rgb(ui_theme::bg_rail()))
             .border_l_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .child(item(InspectorTab::Files, 0, open && cur == InspectorTab::Files, this.clone()))
             .child(item(InspectorTab::Git, git_changes, open && cur == InspectorTab::Git, this.clone()))
             .child(item(InspectorTab::Tasks, 0, open && cur == InspectorTab::Tasks, this.clone()))
@@ -181,21 +181,21 @@ impl Workspace {
             .justify_between()
             .px_3()
             .border_b_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .child(
                 div()
                     .text_xs()
                     .font_semibold()
-                    .text_color(rgb(ui_theme::TEXT_MUTED))
+                    .text_color(rgb(ui_theme::text_muted()))
                     .child(title),
             )
             .children(tab.stage_view().map(|view| {
                 div()
                     .id(("inspector-expand", tab as usize))
                     .text_xs()
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .cursor_pointer()
-                    .hover(|d| d.text_color(rgb(ui_theme::TEXT_MID)))
+                    .hover(|d| d.text_color(rgb(ui_theme::text_mid())))
                     .child("展开 ⤢")
                     .on_click(move |_ev, window, cx| {
                         this.update(cx, |ws, cx| ws.set_stage_override(Some(view), window, cx));
@@ -223,9 +223,9 @@ impl Workspace {
             .flex()
             .flex_col()
             .min_h_0()
-            .bg(rgb(ui_theme::BG_ELEV))
+            .bg(rgb(ui_theme::bg_elev()))
             .border_l_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .child(body)
     }
 
@@ -244,7 +244,7 @@ impl Workspace {
                     .id("inspector-task-new")
                     .text_xs()
                     .font_semibold()
-                    .text_color(rgb(ui_theme::ACCENT))
+                    .text_color(rgb(ui_theme::accent()))
                     .cursor_pointer()
                     .hover(|d| d.opacity(0.8))
                     .child(format!("+ 新建 · {count}"))
@@ -269,7 +269,7 @@ impl Workspace {
                     .flex()
                     .justify_center()
                     .text_sm()
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .child("还没有任务"),
             );
         }
@@ -292,8 +292,8 @@ impl Workspace {
                 .id(("inspector-task", tix))
                 .rounded(px(9.))
                 .border_1()
-                .border_color(rgb(ui_theme::BORDER_MID))
-                .bg(if done { rgb(ui_theme::BG_PANEL) } else { rgb(ui_theme::BG_CARD) })
+                .border_color(rgb(ui_theme::border_mid()))
+                .bg(if done { rgb(ui_theme::bg_panel()) } else { rgb(ui_theme::bg_card()) })
                 .when(done, |d| d.opacity(0.55))
                 .overflow_hidden()
                 .flex()
@@ -311,7 +311,7 @@ impl Workspace {
                             div()
                                 .text_sm()
                                 .font_semibold()
-                                .text_color(rgb(ui_theme::TEXT_BRIGHT))
+                                .text_color(rgb(ui_theme::text_bright()))
                                 .child(if t.title.is_empty() {
                                     "（未命名任务）".to_string()
                                 } else {
@@ -332,9 +332,9 @@ impl Workspace {
                                             .text_xs()
                                             .font_semibold()
                                             .text_color(if has_session {
-                                                rgb(ui_theme::PURPLE)
+                                                rgb(ui_theme::purple())
                                             } else {
-                                                rgb(ui_theme::GREEN)
+                                                rgb(ui_theme::green())
                                             })
                                             .child(action_label),
                                     )
@@ -417,18 +417,18 @@ impl Workspace {
             .justify_between()
             .px_3()
             .border_b_1()
-            .border_color(rgb(ui_theme::BORDER_DIM))
+            .border_color(rgb(ui_theme::border_dim()))
             .child(
                 div()
                     .text_xs()
                     .font_semibold()
-                    .text_color(rgb(ui_theme::TEXT_MUTED))
+                    .text_color(rgb(ui_theme::text_muted()))
                     .child("SKILLS"),
             )
             .children(skills.as_ref().map(|s| {
                 div()
                     .text_size(px(10.))
-                    .text_color(rgb(ui_theme::TEXT_FAINT))
+                    .text_color(rgb(ui_theme::text_faint()))
                     .child(s.len().to_string())
             }));
 
@@ -449,7 +449,7 @@ impl Workspace {
                         .flex()
                         .justify_center()
                         .text_sm()
-                        .text_color(rgb(ui_theme::TEXT_FAINT))
+                        .text_color(rgb(ui_theme::text_faint()))
                         .child("加载中…"),
                 );
             }
@@ -461,7 +461,7 @@ impl Workspace {
                         .flex_col()
                         .items_center()
                         .gap_1()
-                        .text_color(rgb(ui_theme::TEXT_FAINT))
+                        .text_color(rgb(ui_theme::text_faint()))
                         .child(div().text_sm().child("还没有 skill"))
                         .child(
                             div()
@@ -483,14 +483,14 @@ impl Workspace {
                                 .pt_1p5()
                                 .text_size(px(10.))
                                 .font_semibold()
-                                .text_color(rgb(ui_theme::TEXT_FAINT))
+                                .text_color(rgb(ui_theme::text_faint()))
                                 .child(if sk.project_scope { "项目级" } else { "用户级" }),
                         );
                     }
                     let dot = if sk.project_scope {
-                        rgb(ui_theme::ACCENT)
+                        rgb(ui_theme::accent())
                     } else {
-                        rgb(ui_theme::BLUE)
+                        rgb(ui_theme::blue())
                     };
                     let e_use = this.clone();
                     let cmd = format!("/{}", sk.name);
@@ -499,15 +499,15 @@ impl Workspace {
                             .id(("inspector-skill", six))
                             .rounded(px(8.))
                             .border_1()
-                            .border_color(rgb(ui_theme::BORDER_MID))
-                            .bg(rgb(ui_theme::BG_CARD))
+                            .border_color(rgb(ui_theme::border_mid()))
+                            .bg(rgb(ui_theme::bg_card()))
                             .px_2p5()
                             .py_2()
                             .flex()
                             .flex_col()
                             .gap_1()
                             .cursor_pointer()
-                            .hover(|d| d.border_color(rgb(ui_theme::BORDER_FOCUS)))
+                            .hover(|d| d.border_color(rgb(ui_theme::border_focus())))
                             .child(
                                 div()
                                     .flex()
@@ -521,7 +521,7 @@ impl Workspace {
                                             .text_xs()
                                             .font_semibold()
                                             .font_family("monospace")
-                                            .text_color(rgb(ui_theme::TEXT_BRIGHT))
+                                            .text_color(rgb(ui_theme::text_bright()))
                                             .truncate()
                                             .child(sk.name.clone()),
                                     ),
@@ -531,7 +531,7 @@ impl Workspace {
                                     div()
                                         .text_size(px(10.))
                                         .line_height(px(14.))
-                                        .text_color(rgb(ui_theme::TEXT_MUTED))
+                                        .text_color(rgb(ui_theme::text_muted()))
                                         // 描述常是一长段触发条件，卡片里只留两行的量。
                                         .max_h(px(28.))
                                         .overflow_hidden()
@@ -560,7 +560,7 @@ impl Workspace {
             ("外观", SETTINGS_PAGE_APPEARANCE),
             ("桌面宠物", 1),
             ("启动", 2),
-            ("Claude 集成", 3),
+            ("Agent 集成", 3),
             ("更新", crate::SETTINGS_PAGE_UPDATE),
             ("远程", 5),
         ];
@@ -574,9 +574,9 @@ impl Workspace {
                     .py_2()
                     .rounded(px(7.))
                     .text_sm()
-                    .text_color(rgb(ui_theme::TEXT_MID))
+                    .text_color(rgb(ui_theme::text_mid()))
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(ui_theme::BG_HOVER)).text_color(rgb(ui_theme::TEXT_BRIGHT)))
+                    .hover(|d| d.bg(rgb(ui_theme::bg_hover())).text_color(rgb(ui_theme::text_bright())))
                     .child(label)
                     .on_click(move |_ev, window, cx| {
                         e.update(cx, |ws, cx| {

@@ -18,6 +18,7 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{h_flex, v_flex, ActiveTheme};
 
 use crate::git_log::{Edge, GitLogState, GraphRow, LogScope};
+use crate::ui_theme;
 use crate::{placeholder_view, Workspace};
 
 /// 每行高度。与提交列表逐行对齐，图和文字必须共用同一个值。
@@ -31,10 +32,14 @@ const GRAPH_PAD: f32 = 8.0;
 
 /// 分支线配色：按列号取模。刻意避开红/绿——那两个颜色在 diff 里表示增删，
 /// 用在分支线上会让人误读。
-const LANE_COLORS: [u32; 6] = [0x7dcfff, 0xbb9af7, 0xe0af68, 0x2ac3de, 0xff9e64, 0x9ece6a];
+/// 深浅两套：深色沿用原来的亮色系；浅色整体压深，否则细线在近白底上看不见。
+const LANE_COLORS_DARK: [u32; 6] = [0x7dcfff, 0xbb9af7, 0xe0af68, 0x2ac3de, 0xff9e64, 0x9ece6a];
+const LANE_COLORS_LIGHT: [u32; 6] = [0x1f7aa8, 0x7a4aa8, 0x9a6b0a, 0x117a8a, 0xb85c1f, 0x4a7a1f];
 
 fn lane_color(i: usize) -> Hsla {
-    rgb(LANE_COLORS[i % LANE_COLORS.len()]).into()
+    let ring =
+        if ui_theme::is_light() { &LANE_COLORS_LIGHT } else { &LANE_COLORS_DARK };
+    rgb(ring[i % ring.len()]).into()
 }
 
 /// 图区总宽度。至少留 3 列的位置，免得历史前几行只有一列时图区窄得贴着文字跳动。
@@ -216,8 +221,8 @@ pub fn git_log_view(
                                 .px_1()
                                 .rounded_sm()
                                 .text_xs()
-                                .bg(rgb(0x232b3d))
-                                .text_color(rgb(0x8ea0c4))
+                                .bg(ui_theme::tint(ui_theme::blue(), 0x33))
+                                .text_color(rgb(ui_theme::text_mid()))
                                 .child(r.clone())
                         }))
                         .child(div().flex_1().min_w_0().truncate().text_color(fg).child(c.subject.clone()))
@@ -544,7 +549,7 @@ pub fn branch_tree(
                             .w(px(6.))
                             .flex_none()
                             .text_xs()
-                            .text_color(rgb(0x9ece6a))
+                            .text_color(rgb(ui_theme::green()))
                             .child(if is_head { "●" } else { "" }),
                     )
                     // 分支名常常比这一栏宽（feature/xxx-yyy 之类），截断后挂
