@@ -415,11 +415,6 @@ impl AcpView {
         self.agent
     }
 
-    /// agent 报上来的斜杠命令（`/` 补全的候选源，见 acp_completion.rs）。
-    pub fn available_commands(&self) -> &[(String, String)] {
-        &self.available_commands
-    }
-
     /// cwd 下的文件清单（首次调用才真去列，之后走缓存）。
     fn file_list(&mut self) -> std::rc::Rc<Vec<String>> {
         if let Some(cached) = &self.file_cache {
@@ -2150,19 +2145,6 @@ fn assistant_avatar() -> impl IntoElement {
         .text_xs()
         .font_semibold()
         .child("C")
-}
-
-/// 输入框工具栏的小胶囊：上下文/命令数量这类元信息用它展示，浅底圆角，视觉上比
-/// 正文文字更轻。
-fn toolbar_pill(label: impl Into<gpui::SharedString>) -> impl IntoElement {
-    div()
-        .px_2p5()
-        .py_0p5()
-        .rounded_full()
-        .bg(ui_theme::overlay(0x18))
-        .text_xs()
-        .text_color(gpui::rgb(ui_theme::text_muted()))
-        .child(label.into())
 }
 
 /// 工具输出默认只展开这么多行，其余折叠到「展开全部 N 行」后面。
