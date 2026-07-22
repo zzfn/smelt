@@ -54,7 +54,11 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       });
     },
     onMessage(msg) {
-      void handleSignal(msg);
+      handleSignal(msg).catch((e) => {
+        // 重连竞速下这里仍可能因为别的原因抛错（比如 SDP 解析失败）；吞掉避免
+        // unhandled rejection 冒到控制台，让上层重连逻辑按正常失败路径重试。
+        console.warn("rtc signal handling failed", e);
+      });
     },
     onClose() {
       if (!intentionalClose) fail("signaling closed");
@@ -211,6 +215,10 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     if (!pc) return;
 
     if (payload.kind === "offer") {
+      // resetPc()/ensurePc() 之后 signalingState 才是 "stable"；重连竞速时可能
+      // 收到上一轮协商的过期 offer（新 pc 已经在别的状态了），套用会直接抛
+      // InvalidStateError，丢弃即可——host 端很快会因新一轮 peer_joined 重发。
+      if (pc.signalingState !== "stable") return;
       await pc.setRemoteDescription({ type: "offer", sdp: payload.sdp });
       remoteDescSet = true;
       await flushIce();
@@ -222,6 +230,9 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
         payload: { kind: "answer", sdp: answer.sdp || "" },
       });
     } else if (payload.kind === "answer") {
+      // 同上：只有当前 pc 确实处于「已发 offer、等 answer」时才认这条 answer，
+      // 否则是重连竞速下的过期消息（旧一轮的 answer 追上了新建的 pc）。
+      if (pc.signalingState !== "have-local-offer") return;
       await pc.setRemoteDescription({ type: "answer", sdp: payload.sdp });
       remoteDescSet = true;
       await flushIce();
