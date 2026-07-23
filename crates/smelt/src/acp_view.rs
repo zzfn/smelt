@@ -1,6 +1,7 @@
 //! ACP 会话的消息流视图：第二种会话类型的 GPUI 皮肤。
 //!
-//! 与 acp.rs 的分工：那边是连接层（不许引 gpui），这边持 `AcpHandle` 消费事件、
+//! 与 `smelt_core::acp_conn` 的分工：那边是连接层（不许引 gpui，已经搬进
+//! smelt-core 给 smeltd 未来托管 ACP 会话铺路），这边持 `AcpHandle` 消费事件、
 //! 渲染消息流 + 权限审批卡片 + 输入框，并把 phase 翻译进 `DaemonStates` 全局——
 //! 四档着色 / Dock 角标 / 应用内通知全部复用终端会话的既有链路，零新增。
 
@@ -20,7 +21,7 @@ use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, Plan, PlanEntryStatus, SessionId, ToolCallId,
 };
 
-use crate::acp::{
+use smelt_core::acp_conn::{
     spawn_acp, AcpCommand, AcpEvent, AcpHandle, AcpLaunch, ElicitField, ElicitFieldKind,
     ElicitationResponder, ModelState, PermissionResponder, ReadyKind,
 };
@@ -599,10 +600,10 @@ impl AcpView {
         if text.trim().is_empty() && self.pending_images.is_empty() {
             return;
         }
-        let images: Vec<crate::acp::PromptImage> = self
+        let images: Vec<smelt_core::acp_conn::PromptImage> = self
             .pending_images
             .iter()
-            .map(|im| crate::acp::PromptImage {
+            .map(|im| smelt_core::acp_conn::PromptImage {
                 mime: image_mime(im.format).to_string(),
                 data_b64: base64_encode(&im.bytes),
             })
@@ -2301,7 +2302,7 @@ fn tool_content_parts(
         .iter()
         .filter_map(|c| match c {
             ToolCallContent::Content(inner) => {
-                let text = crate::acp::content_text(&inner.content);
+                let text = smelt_core::acp_conn::content_text(&inner.content);
                 (!text.trim().is_empty()).then(|| ToolOutputPart::Text(text))
             }
             ToolCallContent::Diff(d) => Some(ToolOutputPart::Diff {

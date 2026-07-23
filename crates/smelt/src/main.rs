@@ -5,7 +5,8 @@
 //!
 //! 运行： cargo run --bin smelt
 
-mod acp;
+// ACP 连接层已经搬进 smelt_core::acp_conn（给 smeltd 未来托管 ACP 会话铺路），
+// 这里不再 mod acp;，用的地方直接引 smelt_core::acp_conn。
 mod acp_completion;
 mod acp_view;
 mod agent;
@@ -1283,6 +1284,8 @@ struct Workspace {
     signal_http_input: Option<Entity<gpui_component::input::InputState>>,
     /// 启动项列表编辑器（设置页「启动」分组懒创建）。
     launch_inputs: Option<settings::LaunchInputs>,
+    /// 手动添加 workspace 列表编辑器（设置页「Agent 集成」分组懒创建）。
+    profile_inputs: Option<settings::ProfileInputs>,
     /// 设置面板的有状态组件（懒创建）：不透明度滑块 + 字体大小滑块 + 背景色 / 宠物色取色器。
     opacity_slider: Option<Entity<SliderState>>,
     font_size_slider: Option<Entity<SliderState>>,
@@ -1338,6 +1341,9 @@ struct Workspace {
     /// 历史会话页「会话」子页当前选中查看哪家 agent 的历史（Claude/Copilot/Codex/
     /// Grok 分 tab，各自存储格式不同，见 session_history.rs 头部注释）。
     history_agent: settings::AcpAgentKind,
+    /// 选中的是手动添加的 workspace profile（而不是某个基础 agent 槽位）时是
+    /// `Some(profile_id)`；`history_agent` 这时候是该 profile 底层接的种类。
+    history_profile: Option<String>,
     /// 记忆列表缓存（cwd → (取得时刻, 数据)），跟 session_list 同一套 TTL 模板。
     memory_list: HashMap<String, (Instant, Rc<Vec<claude_memory::MemoryEntry>>)>,
     /// 正在后台扫描记忆的 cwd（防重复并发 spawn）。
@@ -1612,6 +1618,7 @@ impl Workspace {
             resume_gen: 0,
             history_pane: HistoryPane::Sessions,
             history_agent: settings::AcpAgentKind::Claude,
+            history_profile: None,
             memory_list: HashMap::new(),
             memory_list_inflight: HashSet::new(),
             memory_selected: None,
@@ -1619,6 +1626,7 @@ impl Workspace {
             llm_subs: Vec::new(),
             signal_http_input: None,
             launch_inputs: None,
+            profile_inputs: None,
             opacity_slider: None,
             font_size_slider: None,
             bg_color_picker: None,
@@ -2015,11 +2023,12 @@ impl Workspace {
     fn add_acp_session(
         &mut self,
         agent: settings::AcpAgentKind,
+        cmd_override: Option<String>,
         cwd: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cmd = settings::acp_cmd_for(agent, cx);
+        let cmd = cmd_override.unwrap_or_else(|| settings::acp_cmd_for(agent, cx));
         let view = cx.new(|cx| acp_view::AcpView::start(window, cx, agent, cmd, cwd));
         let _acp_persist_sub = Some(self.subscribe_acp_persist(&view, cx));
         self.sessions.push(Session {
@@ -2066,6 +2075,7 @@ impl Workspace {
     pub fn resume_acp_session(
         &mut self,
         agent: settings::AcpAgentKind,
+        cmd_override: Option<String>,
         cwd: String,
         resume_id: String,
         path: PathBuf,
@@ -2088,7 +2098,7 @@ impl Workspace {
         self.resume_gen = self.resume_gen.wrapping_add(1);
         let my_gen = self.resume_gen;
 
-        let cmd = settings::acp_cmd_for(agent, cx);
+        let cmd = cmd_override.unwrap_or_else(|| settings::acp_cmd_for(agent, cx));
         // 先把历史内容读出来转成本地快照——`session/resume`（不重放历史，见 acp.rs
         // 里 apply_event 对 ReadyKind::ResumedKeepHistory 的注释）信任的就是这份本地
         // 快照，给个空的会话开出来就是一片空白（真实教训：第一版就是这么写的，
@@ -3621,13 +3631,16 @@ impl Workspace {
             .map(|ix| {
                 let cwd_opt = self.sessions[ix].cwd(cx);
                 if let Some(c) = cwd_opt.clone() {
-                    self.ensure_session_list(settings::AcpAgentKind::Claude, c, cx);
+                    self.ensure_session_list(settings::AcpAgentKind::Claude, None, c, cx);
                 }
                 let live = cwd_opt
                     .as_deref()
                     .and_then(|c| {
-                        self.session_list
-                            .get(&session_history::session_list_key(settings::AcpAgentKind::Claude, c))
+                        self.session_list.get(&session_history::session_list_key(
+                            settings::AcpAgentKind::Claude,
+                            None,
+                            c,
+                        ))
                     })
                     .and_then(|(_, list)| list.first());
                 // 状态通道（hook 事实）优先；jsonl 作补充。
@@ -4775,9 +4788,13 @@ impl Workspace {
                         }
                         MainView::History => {
                             let cwd = self.cur().and_then(|s| s.cwd(cx));
-                            let list_key = cwd
-                                .as_ref()
-                                .map(|c| session_history::session_list_key(self.history_agent, c));
+                            let list_key = cwd.as_ref().map(|c| {
+                                session_history::session_list_key(
+                                    self.history_agent,
+                                    self.history_profile.as_deref(),
+                                    c,
+                                )
+                            });
                             let sessions = list_key
                                 .as_ref()
                                 .and_then(|k| self.session_list.get(k).map(|(_, d)| d.clone()));
@@ -4794,6 +4811,7 @@ impl Workspace {
                             history_view(
                                 self.history_pane,
                                 self.history_agent,
+                                self.history_profile.clone(),
                                 cwd,
                                 list_state,
                                 &self.session_detail,
@@ -4945,7 +4963,10 @@ impl Render for Workspace {
         if self.stage_override == Some(MainView::History) {
             if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
                 match self.history_pane {
-                    HistoryPane::Sessions => self.ensure_session_list(self.history_agent, root, cx),
+                    HistoryPane::Sessions => {
+                        let pid = self.history_profile.clone();
+                        self.ensure_session_list(self.history_agent, pid, root, cx)
+                    }
                     HistoryPane::Memories => self.ensure_memory_list(root, cx),
                 }
             }
@@ -6005,7 +6026,7 @@ fn main() {
         let current_ws_for_quit = current_ws.clone();
         cx.on_app_quit(move |cx| {
             settings::stop_webrtc_bridge_on_quit(cx);
-            let handles: Vec<acp::AcpHandle> = current_ws_for_quit
+            let handles: Vec<smelt_core::acp_conn::AcpHandle> = current_ws_for_quit
                 .borrow()
                 .as_ref()
                 .and_then(|w| w.upgrade())
@@ -6025,7 +6046,7 @@ fn main() {
                 .unwrap_or_default();
             async move {
                 for h in handles {
-                    acp::wait_for_shutdown(h, Duration::from_secs(3)).await;
+                    smelt_core::acp_conn::wait_for_shutdown(h, Duration::from_secs(3)).await;
                 }
             }
         })

@@ -13,8 +13,10 @@ use std::time::{Duration, Instant};
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 use gpui::InteractiveElement;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::Input;
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::progress::Progress;
 use gpui_component::radio::{Radio, RadioGroup};
@@ -275,6 +277,11 @@ pub struct AgentUiConfig {
     /// Grok ACP 会话的启动命令。
     #[serde(default = "default_acp_grok_cmd")]
     pub acp_grok_cmd: String,
+    /// 手动添加的 workspace（同一家 agent 可以有好几个，比如 Claude 的默认
+    /// `.claude` 和自定义的 `.claude-quant` 并存）。四个基础 agent 槽位不变、
+    /// 走各自默认路径；这里只装"额外"的。
+    #[serde(default)]
+    pub profiles: Vec<AcpProfile>,
 }
 
 impl AgentUiConfig {
@@ -296,6 +303,47 @@ impl AgentUiConfig {
             AcpAgentKind::Codex => self.acp_codex_cmd = cmd,
             AcpAgentKind::Grok => self.acp_grok_cmd = cmd,
         }
+    }
+
+    pub fn find_profile(&self, id: &str) -> Option<&AcpProfile> {
+        self.profiles.iter().find(|p| p.id == id)
+    }
+}
+
+/// 手动添加的一个 workspace：底层还是四家基础 agent 之一，只是换了个数据目录
+/// （比如 Claude 的 `CLAUDE_CONFIG_DIR`）。命令不用手填——按 `kind` 的出厂命令
+/// 加一段 `ENV=workspace_dir` 前缀自动拼出来（见 `command()`），用户只需要选
+/// agent 类型 + 填目录，不用记环境变量名和 shell 语法。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AcpProfile {
+    /// 稳定 id（新建时生成，不随 label/kind 改变），历史会话页拿它当 tab key、
+    /// 区分"同一个 kind 下的哪一个 workspace"。
+    pub id: String,
+    /// 底层 agent 种类，存 `AcpAgentKind::id()`（跟 `AcpSaved.agent` 同一份规则，
+    /// 认不出就回退 Claude）。
+    pub kind_id: String,
+    /// 设置页 / 历史页 tab 上显示的名字，比如「Claude Quant」。
+    pub label: String,
+    /// workspace 目录，允许 `~` 开头（展开逻辑跟 build_agent 共用一份，见
+    /// `smelt_core::workspace_override`）。
+    pub workspace_dir: String,
+}
+
+impl AcpProfile {
+    pub fn kind(&self) -> AcpAgentKind {
+        AcpAgentKind::from_id(&self.kind_id).unwrap_or(AcpAgentKind::Claude)
+    }
+
+    /// 该 profile 底层 agent 用来覆盖数据目录的环境变量名。
+    pub fn env_var(&self) -> &'static str {
+        smelt_core::workspace_override::config_dir_env_var(&self.kind_id).unwrap_or("CLAUDE_CONFIG_DIR")
+    }
+
+    /// 自动拼出的完整启动命令：`ENV=workspace_dir <该 kind 的出厂命令>`。
+    /// 不持久化——`kind` 的出厂命令以后升级版本号，已存在的 profile 也跟着变，
+    /// 不用用户手动同步。
+    pub fn command(&self) -> String {
+        format!("{}={} {}", self.env_var(), self.workspace_dir, self.kind().default_cmd())
     }
 }
 
@@ -444,6 +492,7 @@ impl Default for AgentUiConfig {
             acp_copilot_cmd: default_acp_copilot_cmd(),
             acp_codex_cmd: default_acp_codex_cmd(),
             acp_grok_cmd: default_acp_grok_cmd(),
+            profiles: Vec::new(),
         }
     }
 }
@@ -1666,6 +1715,13 @@ pub struct LaunchInputs {
     _subs: Vec<Subscription>,
 }
 
+/// 手动添加 workspace 列表编辑器：每项一对 label/workspace_dir 输入框；agent
+/// 种类走下拉选择（离散值，不需要输入框），选完直接存盘不用另外的 InputState。
+pub struct ProfileInputs {
+    rows: Vec<(Entity<gpui_component::input::InputState>, Entity<gpui_component::input::InputState>)>,
+    _subs: Vec<Subscription>,
+}
+
 /// 独立设置窗口的根 view：只是个薄壳，真正状态都还在传进来的 Workspace 实体上，
 /// 每次渲染转手调 `render_settings_content`。
 ///
@@ -1981,6 +2037,102 @@ impl Workspace {
             }
         }, cx);
         self.reset_launch_inputs();
+        cx.notify();
+    }
+
+    /// 手动添加 workspace 条数变了就重建输入框（增删后调用）。
+    pub fn reset_profile_inputs(&mut self) {
+        self.profile_inputs = None;
+    }
+
+    /// 懒创建 workspace 列表编辑器（需要 window）。
+    pub fn ensure_profile_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = cx.global::<AgentUiConfig>().profiles.len();
+        let stale = self.profile_inputs.as_ref().is_none_or(|i| i.rows.len() != count);
+        if stale {
+            self.init_profile_inputs(window, cx);
+        }
+    }
+
+    fn init_profile_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::input::{InputEvent, InputState};
+
+        let profiles = cx.global::<AgentUiConfig>().profiles.clone();
+        let save_on = |ev: &InputEvent| matches!(ev, InputEvent::Change | InputEvent::Blur);
+        let mut rows = Vec::new();
+        let mut subs = Vec::new();
+        for (i, p) in profiles.iter().enumerate() {
+            let id = p.id.clone();
+            let label_input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("显示名称").default_value(p.label.clone())
+            });
+            let dir_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("workspace 目录，如 ~/.claude-quant")
+                    .default_value(p.workspace_dir.clone())
+            });
+            let id_for_label = id.clone();
+            subs.push(cx.subscribe(&label_input, move |_, s, ev: &InputEvent, cx| {
+                if save_on(ev) {
+                    let v = s.read(cx).value().to_string();
+                    let id = id_for_label.clone();
+                    apply_agent_ui(move |c| {
+                        if let Some(p) = c.profiles.iter_mut().find(|p| p.id == id) {
+                            p.label = v;
+                        }
+                    }, cx);
+                }
+            }));
+            let id_for_dir = id.clone();
+            subs.push(cx.subscribe(&dir_input, move |_, s, ev: &InputEvent, cx| {
+                if save_on(ev) {
+                    let v = s.read(cx).value().to_string();
+                    let id = id_for_dir.clone();
+                    apply_agent_ui(move |c| {
+                        if let Some(p) = c.profiles.iter_mut().find(|p| p.id == id) {
+                            p.workspace_dir = v;
+                        }
+                    }, cx);
+                }
+            }));
+            let _ = i;
+            rows.push((label_input, dir_input));
+        }
+        self.profile_inputs = Some(ProfileInputs { rows, _subs: subs });
+    }
+
+    /// 新增一个手动 workspace：默认接 Claude（用户改目录之前就得选个 agent，
+    /// Claude 是最常见的场景，跟「新建 ACP 对话」菜单的默认排位一致）。
+    pub fn add_profile(&mut self, cx: &mut Context<Self>) {
+        apply_agent_ui(|c| {
+            c.profiles.push(AcpProfile {
+                id: uuid::Uuid::new_v4().to_string(),
+                kind_id: AcpAgentKind::Claude.id().to_string(),
+                label: "新 workspace".into(),
+                workspace_dir: String::new(),
+            });
+        }, cx);
+        self.reset_profile_inputs();
+        cx.notify();
+    }
+
+    pub fn remove_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        apply_agent_ui(|c| {
+            if index < c.profiles.len() {
+                c.profiles.remove(index);
+            }
+        }, cx);
+        self.reset_profile_inputs();
+        cx.notify();
+    }
+
+    /// 改某个 workspace 接的 agent 种类（下拉菜单选中项回调）。
+    pub fn set_profile_kind(&mut self, index: usize, kind: AcpAgentKind, cx: &mut Context<Self>) {
+        apply_agent_ui(move |c| {
+            if let Some(p) = c.profiles.get_mut(index) {
+                p.kind_id = kind.id().to_string();
+            }
+        }, cx);
         cx.notify();
     }
 
@@ -2749,6 +2901,175 @@ impl Workspace {
                 .item(acp_cmd_setting_item(AcpAgentKind::Copilot))
                 .item(acp_cmd_setting_item(AcpAgentKind::Codex))
                 .item(acp_cmd_setting_item(AcpAgentKind::Grok))
+                .item(
+                    SettingItem::render({
+                        let profile_editor_entity = entity.clone();
+                        move |_, window, cx: &mut App| {
+                            let muted = cx.theme().muted_foreground;
+                            let border = cx.theme().border;
+                            let fg = cx.theme().foreground;
+                            let popover = cx.theme().popover;
+                            let secondary = cx.theme().secondary;
+                            let danger = cx.theme().danger;
+                            let danger_fg = cx.theme().danger_foreground;
+                            let field_w = {
+                                let vw = f32::from(window.viewport_size().width);
+                                let w = (vw - 250. - 80.).clamp(360., 720.);
+                                px(w)
+                            };
+                            profile_editor_entity.update(cx, |ws, cx| {
+                                ws.ensure_profile_inputs(window, cx);
+                                let Some(inputs) = ws.profile_inputs.as_ref() else {
+                                    return div().into_any_element();
+                                };
+                                let mut col = v_flex()
+                                    .w(field_w)
+                                    .gap_3()
+                                    .child(
+                                        v_flex()
+                                            .w(field_w)
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_semibold()
+                                                    .text_color(fg)
+                                                    .child("手动添加 workspace"),
+                                            )
+                                            .child(
+                                                div().w(field_w).text_sm().text_color(muted).child(
+                                                    "同一家 agent 可以同时用好几个 workspace（比如 Claude \
+                                                     默认的 ~/.claude 之外再开一个 ~/.claude-quant）。选好\
+                                                     agent 类型、填上目录，启动命令自动拼好，不用自己写 \
+                                                     shell 语法。「新建对话」菜单和历史会话页都会多出对应\
+                                                     的入口。",
+                                                ),
+                                            ),
+                                    );
+
+                                let kind_w = px(120.);
+                                let name_w = px(140.);
+                                let del_w = px(28.);
+                                let dir_w = field_w - kind_w - name_w - del_w - px(56.);
+                                let mono = terminal_view::font_family();
+
+                                let mut list = v_flex()
+                                    .w(field_w)
+                                    .gap_2()
+                                    .p_3()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(secondary)
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .gap_2()
+                                            .items_center()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(div().w(kind_w).child("Agent"))
+                                            .child(div().w(name_w).child("名称"))
+                                            .child(div().w(dir_w).child("Workspace 目录"))
+                                            .child(div().w(del_w)),
+                                    );
+
+                                let profiles = cx.global::<AgentUiConfig>().profiles.clone();
+                                for (ix, ((label, dir), p)) in
+                                    inputs.rows.iter().zip(profiles.iter()).enumerate()
+                                {
+                                    let row_ix = ix;
+                                    let kind_entity = profile_editor_entity.clone();
+                                    let del_entity = profile_editor_entity.clone();
+                                    let current_kind = p.kind();
+                                    list = list.child(
+                                        h_flex()
+                                            .id(("profile-row", row_ix))
+                                            .w_full()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                Button::new(("profile-kind", row_ix))
+                                                    .ghost()
+                                                    .small()
+                                                    .w(kind_w)
+                                                    .label(current_kind.short_label())
+                                                    .dropdown_menu(move |mut menu, _window, _cx| {
+                                                        for kind in AcpAgentKind::ALL {
+                                                            let kind_entity = kind_entity.clone();
+                                                            menu = menu.item(
+                                                                PopupMenuItem::new(kind.label())
+                                                                    .on_click(move |_ev, _window, cx| {
+                                                                        kind_entity.update(cx, |ws, cx| {
+                                                                            ws.set_profile_kind(
+                                                                                row_ix, kind, cx,
+                                                                            );
+                                                                        });
+                                                                    }),
+                                                            );
+                                                        }
+                                                        menu
+                                                    }),
+                                            )
+                                            .child(Input::new(label).w(name_w))
+                                            .child(
+                                                Input::new(dir).w(dir_w).font_family(mono.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("del-profile", row_ix))
+                                                    .size(del_w)
+                                                    .flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_md()
+                                                    .cursor_pointer()
+                                                    .text_sm()
+                                                    .text_color(muted)
+                                                    .hover(|s| s.bg(danger).text_color(danger_fg))
+                                                    .child("×")
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        move |_, _, cx: &mut App| {
+                                                            del_entity.update(cx, |ws, cx| {
+                                                                ws.remove_profile(row_ix, cx);
+                                                            });
+                                                        },
+                                                    ),
+                                            ),
+                                    );
+                                }
+                                col = col.child(list);
+                                let add_entity = profile_editor_entity.clone();
+                                col.child(
+                                    div()
+                                        .id("add-profile")
+                                        .h(px(36.))
+                                        .w(field_w)
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_lg()
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .text_color(fg)
+                                        .bg(popover)
+                                        .border_1()
+                                        .border_color(border)
+                                        .hover(|s| s.bg(border))
+                                        .child("+ 添加 workspace")
+                                        .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                                            add_entity.update(cx, |ws, cx| ws.add_profile(cx));
+                                        }),
+                                )
+                                .into_any_element()
+                            })
+                        }
+                    })
+                    .keywords(["workspace", "claude-quant", "config dir", "多工作区", "agent"]),
+                )
                 .item(SettingItem::render(move |_, _, cx: &mut App| {
                     let installed = claude_hooks_installed();
                     let (fg, muted, border) = {

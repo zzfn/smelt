@@ -111,7 +111,7 @@ impl Workspace {
                             .text_xs()
                             .font_semibold()
                             .text_color(rgb(ui_theme::purple()))
-                            .dropdown_menu(move |mut menu, _window, _cx| {
+                            .dropdown_menu(move |mut menu, _window, cx| {
                                 for agent in AcpAgentKind::ALL {
                                     let e_acp = e_acp.clone();
                                     let cwd_acp = cwd_acp.clone();
@@ -121,7 +121,24 @@ impl Workspace {
                                             .on_click(move |_ev, window, cx| {
                                                 let cwd = cwd_acp.clone();
                                                 e_acp.update(cx, |ws, cx| {
-                                                    ws.add_acp_session(agent, cwd, window, cx)
+                                                    ws.add_acp_session(agent, None, cwd, window, cx)
+                                                });
+                                            }),
+                                    );
+                                }
+                                let profiles = cx.global::<crate::settings::AgentUiConfig>().profiles.clone();
+                                for p in profiles {
+                                    let e_acp = e_acp.clone();
+                                    let cwd_acp = cwd_acp.clone();
+                                    let cmd = p.command();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(p.label.clone())
+                                            .icon(IconName::Bot)
+                                            .on_click(move |_ev, window, cx| {
+                                                let cwd = cwd_acp.clone();
+                                                let cmd = cmd.clone();
+                                                e_acp.update(cx, |ws, cx| {
+                                                    ws.add_acp_session(p.kind(), Some(cmd), cwd, window, cx)
                                                 });
                                             }),
                                     );
@@ -328,7 +345,7 @@ impl Workspace {
                                     menu = menu
                                         .separator()
                                         .item(PopupMenuItem::label("对话 · smelt 原生界面"));
-                                    // 三家 agent 走同一条 ACP 通道，菜单项从枚举派生：
+                                    // 四家 agent 走同一条 ACP 通道，菜单项从枚举派生：
                                     // 加一家 agent 不用回来改这段。
                                     for agent in AcpAgentKind::ALL {
                                         let e_acp = e_menu.clone();
@@ -339,7 +356,32 @@ impl Workspace {
                                                 .on_click(move |_ev, window, cx| {
                                                     let cwd = cwd_acp.clone();
                                                     e_acp.update(cx, |ws, cx| {
-                                                        ws.add_acp_session(agent, cwd, window, cx)
+                                                        ws.add_acp_session(agent, None, cwd, window, cx)
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    // 手动添加的 workspace profile（同一家 agent 的
+                                    // 另一个数据目录）追加在后面，用自动拼好的命令。
+                                    let profiles = cx.global::<crate::settings::AgentUiConfig>().profiles.clone();
+                                    for p in profiles {
+                                        let e_acp = e_menu.clone();
+                                        let cwd_acp = cwd_opt.clone();
+                                        let cmd = p.command();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(p.label.clone())
+                                                .icon(IconName::Bot)
+                                                .on_click(move |_ev, window, cx| {
+                                                    let cwd = cwd_acp.clone();
+                                                    let cmd = cmd.clone();
+                                                    e_acp.update(cx, |ws, cx| {
+                                                        ws.add_acp_session(
+                                                            p.kind(),
+                                                            Some(cmd),
+                                                            cwd,
+                                                            window,
+                                                            cx,
+                                                        )
                                                     });
                                                 }),
                                         );

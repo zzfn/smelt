@@ -5,9 +5,13 @@
 //! 本 crate 不许出现 GPUI 依赖。
 
 pub mod acp_chat;
+pub mod acp_conn;
 pub mod block_on;
+pub mod claude_paths;
+pub mod login_env;
 pub mod osc;
 pub mod permission_menu;
 pub mod remote_gateway;
 pub mod term_text;
 pub mod title_spinner;
+pub mod workspace_override;

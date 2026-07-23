@@ -1,15 +1,17 @@
-//! ACP（Agent Client Protocol）会话后端：第二种会话类型的连接层。
+//! ACP（Agent Client Protocol）连接层：JSON-RPC over stdio 驱动跟子进程 agent
+//! 的连接，不含任何 GPUI——本来就是 `smelt` crate 里 acp.rs 的原文搬过来的，
+//! 移动的唯一理由是给 smeltd 托管 ACP 会话铺路（这个 crate 本来就是
+//! GUI/守护共用层，smeltd 加个 `agent-client-protocol` 依赖就能直接复用这里
+//! 的连接驱动逻辑，不用重写一遍）。
 //!
-//! 职责边界（见 docs/project-report.md 第 5 节与 plans 里的接入方案）：
+//! 职责边界（原 acp.rs 的约定继续有效）：
 //! - 每个 ACP 会话一条专用 OS 线程 `smol::block_on` 驱动整个连接（spawn 子进程、
-//!   JSON-RPC over stdio、事件翻译），与全库「专用线程 + smol::channel + UI 线程
-//!   drain」的惯用法一致；
-//! - 本模块**不许引 gpui**——未来 smeltd 托管 ACP 子进程时要原样下沉 smelt-core，
-//!   GPUI Entity/渲染都圈在 acp_view.rs；
+//!   JSON-RPC over stdio、事件翻译）；
 //! - 一切失败（找不到命令 / 握手失败 / 子进程退出）都以 `AcpEvent::Fatal` 从事件
 //!   通道出来，`spawn_acp` 本身永不阻塞、永不 panic 调用方。
 
-use std::sync::{Arc, Mutex, OnceLock};
+
+use std::sync::{Arc, Mutex};
 
 use std::collections::BTreeMap;
 
@@ -482,7 +484,15 @@ async fn run_connection(
                     return true;
                 }
                 launch.cwd.as_deref().is_some_and(|c| {
-                    crate::session_history::transcript_path(c, &sid.to_string()).exists()
+                    // 启动命令可能带 `CLAUDE_CONFIG_DIR=...` 前缀（多 workspace
+                    // profile），transcript 得去它指向的目录找，不能只看进程
+                    // 全局环境变量——那只反映"默认" workspace 那一份。
+                    let override_dir = crate::workspace_override::env_override_from_cmd(
+                        &launch.cmd,
+                        "CLAUDE_CONFIG_DIR",
+                    );
+                    crate::claude_paths::transcript_path(c, &sid.to_string(), override_dir.as_deref())
+                        .exists()
                 })
             });
             if let Some(sid) = launch.resume_session_id.clone().filter(|_| resumable) {
@@ -750,11 +760,32 @@ fn build_agent(
     // agent 起来后找它自己的子工具又缺路径。
     let search_path = extended_search_path();
     let path_env = format!("PATH={search_path}");
+    // 命令字符串允许开头带 shell 风格的 `VAR=value` 前缀（比如
+    // `CLAUDE_CONFIG_DIR=~/.claude-quant claude --dangerously-skip-permissions`，
+    // 让同一家 agent 的多个 workspace 各开一条「设置 → Agent 集成」里的独立
+    // 启动命令）——`AcpAgent::from_args` 本来就认这个语法（内部 parse_env_var
+    // 逐个 token 解析，遇到第一个不是 `VAR=value` 形状的 token 才当作程序名），
+    // 这里的 PATH 注入用的正是同一条路。真正要做的是"先把这些前缀跳过去找到
+    // 真正的程序名"，不然会把 `CLAUDE_CONFIG_DIR=...` 整个当成程序名去查 PATH，
+    // 报"未找到命令"（这是之前真实的行为，不是假设）。
+    let mut tokens = cmd.split_whitespace();
+    let mut user_env: Vec<String> = Vec::new();
+    let mut prog_token = None;
+    for tok in tokens.by_ref() {
+        match crate::workspace_override::split_env_assignment(tok) {
+            Some((name, value)) => {
+                user_env.push(format!("{name}={}", crate::workspace_override::expand_tilde(value)))
+            }
+            None => {
+                prog_token = Some(tok);
+                break;
+            }
+        }
+    }
     // 命令名先解析成绝对路径再交给 SDK：spawn 直接 exec、不依赖任何 PATH；
     // 找不到就提前返回人话，而不是让 SDK 甩 `os error 2` 天书。带 `/` 的
     // （受管 bun 的绝对路径）跳过，本来就不查。
-    let mut tokens = cmd.split_whitespace();
-    let resolved: Vec<String> = match tokens.next() {
+    let resolved: Vec<String> = match prog_token {
         Some(prog) => {
             let prog = if prog.contains('/') {
                 prog.to_string()
@@ -772,7 +803,9 @@ fn build_agent(
         }
         None => Vec::new(),
     };
-    let args = std::iter::once(path_env.as_str()).chain(resolved.iter().map(String::as_str));
+    let args = std::iter::once(path_env.as_str())
+        .chain(user_env.iter().map(String::as_str))
+        .chain(resolved.iter().map(String::as_str));
     let agent = AcpAgent::from_args(args)?.with_debug(move |line, direction| {
         if matches!(direction, LineDirection::Stderr) {
             let mut tail = stderr_tail.lock().unwrap();
@@ -968,7 +1001,7 @@ fn resolve_runtime_command(cmd: &str, status: &dyn Fn(&str)) -> Result<String, S
         }
         Err(e) => {
             // 受管失败：系统里用户自己装过 bun 就用系统的。
-            let sys_has = std::env::split_paths(login_shell_path())
+            let sys_has = std::env::split_paths(crate::login_env::login_path())
                 .any(|p| p.join(head).is_file());
             if sys_has {
                 Ok(cmd.to_string())
@@ -986,7 +1019,7 @@ fn resolve_runtime_command(cmd: &str, status: &dyn Fn(&str)) -> Result<String, S
 /// 注释）。顺序：login PATH 在前（用户显式配的优先），标准安装位在后兜底；
 /// 重复目录无所谓，resolve 取第一个命中即止。
 fn extended_search_path() -> String {
-    let mut path = login_shell_path().to_string();
+    let mut path = crate::login_env::login_path().to_string();
     let mut push = |p: String| {
         path.push(':');
         path.push_str(&p);
@@ -1024,78 +1057,10 @@ fn resolve_in_path(program: &str, path: &str) -> Option<String> {
     None
 }
 
-/// 交互式 login shell 里的 PATH（进程存活期只探一次）。
-///
-/// **为什么必须交互式（`-i`）**：非交互 login shell（`zsh -lc`）只读
-/// `.zshenv`/`.zprofile`/`.zlogin`，**不读 `.zshrc`**——而绝大多数人的 PATH 注入
-/// （各家 CLI、nvm、bun、volta …）都写在 `.zshrc`。少了它，Finder 启动的 GUI 取到
-/// 的 PATH 会漏掉一大批目录，导致明明装了、终端里能跑的 CLI（实测 grok 装在
-/// `~/.grok/bin`）被 `resolve_in_path` 判成「未找到命令」。加 `-i` 让它读 `.zshrc`，
-/// 跟用户终端里的 PATH 对齐。
-///
-/// **代价与去噪**：交互式 shell 启动会执行 shell-integration 脚本，往 stdout 打一段
-/// OSC 转义序列（形如 `\e]1337;…;shell=zsh`）。直接读会把这串噪音粘进 PATH 的第一
-/// 段、正好毁掉第一个目录（就是新装 CLI 常在的位置）。所以用一对唯一标记把 `$PATH`
-/// 夹住，再从输出里只抠中间那段，前后的噪音一律丢弃（见 `extract_marked_path`）。
-fn login_shell_path() -> &'static str {
-    static PATH: OnceLock<String> = OnceLock::new();
-    PATH.get_or_init(|| {
-        std::process::Command::new("/bin/zsh")
-            .args([
-                "-ilc",
-                "printf %s __SMELT_PATH_BEGIN__; printf %s \"$PATH\"; printf %s __SMELT_PATH_END__",
-            ])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| extract_marked_path(&String::from_utf8_lossy(&o.stdout)))
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
-    })
-}
-
-/// 从交互式 shell 的输出里抠出 `__SMELT_PATH_BEGIN__` 与 `__SMELT_PATH_END__` 之间
-/// 的 PATH，丢掉 shell-integration 打在前后的 OSC 噪音。找不到标记就返回 None
-/// （交给调用方回退到进程自身的 PATH）。
-fn extract_marked_path(raw: &str) -> Option<String> {
-    const BEGIN: &str = "__SMELT_PATH_BEGIN__";
-    const END: &str = "__SMELT_PATH_END__";
-    let start = raw.find(BEGIN)? + BEGIN.len();
-    let rest = &raw[start..];
-    let stop = rest.find(END)?;
-    Some(rest[..stop].trim().to_string())
-}
-
-#[cfg(test)]
-mod path_env_tests {
-    use super::extract_marked_path;
-
-    /// 交互式 zsh 会在 `$PATH` 前粘一段 shell-integration 的 OSC 噪音（实测形如
-    /// `\e]1337;…;shell=zsh`）。抠取逻辑必须只取标记之间的内容——第一段目录（新装
-    /// CLI 常在这里，如 grok 的 `~/.grok/bin`）绝不能被噪音吃掉。这正是把 `-lc` 改
-    /// 成 `-ilc` 后若不去噪就会踩的坑，锁死防回归。
-    #[test]
-    fn strips_shell_integration_noise_before_path() {
-        let raw = "\u{1b}]1337;RemoteHost=me@host\u{1b}\\\u{1b}]1337;ShellIntegrationVersion=14;shell=zsh\
-                   __SMELT_PATH_BEGIN__/Users/me/.grok/bin:/usr/bin:/bin__SMELT_PATH_END__";
-        let got = extract_marked_path(raw).expect("应能抠出 PATH");
-        assert_eq!(got, "/Users/me/.grok/bin:/usr/bin:/bin");
-        assert!(got.starts_with("/Users/me/.grok/bin"), "第一段目录不能被 OSC 噪音污染");
-    }
-
-    /// 没有标记（shell 直接失败、没跑到 printf）返回 None，让调用方回退到进程 PATH。
-    #[test]
-    fn returns_none_without_markers() {
-        assert!(extract_marked_path("/usr/bin:/bin").is_none());
-        assert!(extract_marked_path("").is_none());
-    }
-
-    /// 只有起始标记、没有结束标记（输出被截断）也不 panic，返回 None。
-    #[test]
-    fn returns_none_when_end_marker_missing() {
-        assert!(extract_marked_path("noise__SMELT_PATH_BEGIN__/usr/bin").is_none());
-    }
-}
+// login shell 的 PATH 探测（连同各家 agent 的自定义 workspace 目录变量一起）
+// 挪进了 `crate::login_env`——不止 PATH 这一个变量要用同一套"起交互式 shell
+// 才能读到 .zshrc export"的机制，claude_paths.rs 的 CLAUDE_CONFIG_DIR 判断
+// 也要用它，不能各起一次慢 shell。
 
 #[cfg(test)]
 mod elicit_parse_tests {

@@ -15,34 +15,14 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+// 项目目录编码 / transcript 路径 / 记忆目录：唯一权威来源现在是 smelt_core::
+// claude_paths（ACP 连接层挪进 smelt-core 后，续接可行性预检也要用同一份规则，
+// 不能这边一份那边一份）。这里整段 re-export，本文件里原有的裸函数名用法
+// 不用改。
+pub(crate) use smelt_core::claude_paths::{memory_dir, project_dir, projects_root};
+
 fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Utc))
-}
-
-/// 项目目录编码规则：Claude Code 把项目路径里的 `/` 和 `.` 都换成 `-`
-/// （已经拿 codux 的实现 `project_path.replace('/', '-').replace('.', '-')` 印证过，
-/// 跟本机实测的编码目录名完全对得上）。
-fn project_dir(cwd: &str) -> String {
-    cwd.replace('/', "-").replace('.', "-")
-}
-
-/// 某个会话的 transcript 文件路径（`<项目目录>/<会话 id>.jsonl`）。
-///
-/// ACP 的会话 id 就是 Claude Code 的 transcript 文件名（实测印证）；这个文件
-/// 存在与否 = 这段对话有没有真正落盘 = 续接有没有可能成功。acp.rs 靠它避开
-/// 注定失败的 `session/resume`（省下约 2 秒白等）。
-pub(crate) fn transcript_path(cwd: &str, session_id: &str) -> PathBuf {
-    projects_root().join(project_dir(cwd)).join(format!("{session_id}.jsonl"))
-}
-
-fn projects_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".claude").join("projects")
-}
-
-/// 某个项目的记忆目录（`<项目目录>/memory`）。编码规则只有这一份，claude_memory.rs
-/// 从这里取，别再复制一遍 project_dir——规则一旦变，两处会悄悄不一致。
-pub(crate) fn memory_dir(cwd: &str) -> PathBuf {
-    projects_root().join(project_dir(cwd)).join("memory")
 }
 
 /// 一份历史会话的概览（列表用）。
@@ -82,8 +62,12 @@ pub struct SessionDetail {
 
 /// 列出某个项目目录下的所有历史会话，按最近活跃时间降序。
 /// 只读扫描，可能要几十毫秒（视会话数量），调用方应放后台线程跑。
-pub fn list_sessions(cwd: &str) -> Vec<SessionSummary> {
-    let dir = projects_root().join(project_dir(cwd));
+///
+/// `override_dir`：多 workspace 场景下手动添加的 profile 显式指定的
+/// `CLAUDE_CONFIG_DIR`（见 `smelt_core::claude_paths::projects_root`），
+/// `None` 就是默认 workspace，行为不变。
+pub fn list_sessions(cwd: &str, override_dir: Option<&str>) -> Vec<SessionSummary> {
+    let dir = projects_root(override_dir).join(project_dir(cwd));
     let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
     let mut out: Vec<SessionSummary> = entries
         .flatten()
@@ -273,12 +257,25 @@ fn truncate(s: &str, max_chars: usize) -> String {
 // 只能按日期分区遍历、逐份看第一行 session_meta 里的 cwd 是否匹配——文件多的话
 // 比 Claude 那版慢，调用方本来就放后台线程跑，可以接受。
 
-fn codex_sessions_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".codex").join("sessions")
+fn codex_sessions_root(override_dir: Option<&str>) -> PathBuf {
+    codex_home(override_dir).join("sessions")
 }
 
-pub fn list_codex_sessions(cwd: &str) -> Vec<SessionSummary> {
-    let root = codex_sessions_root();
+/// `CODEX_HOME` 设了就整段替换默认的 `~/.codex`（同 claude_paths.rs 的
+/// `CLAUDE_CONFIG_DIR` 处理，走同一份 `smelt_core::login_env` 探测）。
+/// `override_dir` 优先于全局探测——多 workspace profile 的显式指定。
+fn codex_home(override_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = smelt_core::login_env::codex_home() {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".codex")
+}
+
+pub fn list_codex_sessions(cwd: &str, override_dir: Option<&str>) -> Vec<SessionSummary> {
+    let root = codex_sessions_root(override_dir);
     let mut out = Vec::new();
     for year in read_dir_ok(&root) {
         for month in read_dir_ok(&year) {
@@ -459,12 +456,23 @@ pub fn load_codex_session_detail(path: &Path) -> Option<SessionDetail> {
 // 时间/消息数（不用像 Claude/Codex 那样扫整份 transcript 才能拿到概览，列表这块
 // 反而是四家里最快的），`chat_history.jsonl` 才是完整对话内容。
 
-fn grok_sessions_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".grok").join("sessions")
+fn grok_sessions_root(override_dir: Option<&str>) -> PathBuf {
+    grok_home(override_dir).join("sessions")
 }
 
-pub fn list_grok_sessions(cwd: &str) -> Vec<SessionSummary> {
-    let root = grok_sessions_root();
+/// `GROK_HOME` 设了就整段替换默认的 `~/.grok`。`override_dir` 同上，优先级最高。
+fn grok_home(override_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = smelt_core::login_env::grok_home() {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".grok")
+}
+
+pub fn list_grok_sessions(cwd: &str, override_dir: Option<&str>) -> Vec<SessionSummary> {
+    let root = grok_sessions_root(override_dir);
     let mut out = Vec::new();
     for project_dir in read_dir_ok(&root) {
         if !project_dir.is_dir() {
@@ -601,8 +609,25 @@ pub fn load_grok_session_detail(session_dir: &Path) -> Option<SessionDetail> {
 // `key: value`，没有嵌套/列表，手写小解析器就够，不为这一个文件引入 yaml 依赖）
 // 给 cwd/标题/时间，`events.jsonl` 才是完整对话内容。
 
-fn copilot_sessions_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".copilot").join("session-state")
+fn copilot_sessions_root(override_dir: Option<&str>) -> PathBuf {
+    copilot_home(override_dir).join("session-state")
+}
+
+/// `COPILOT_HOME` 优先（官方推荐用法，整段替换默认 `~/.copilot`），没设再看
+/// `XDG_CONFIG_HOME`（这种情况下基准目录是 `$XDG_CONFIG_HOME/copilot`），
+/// 都没设才落到默认位置。`override_dir`（多 workspace profile）优先级最高，
+/// 直接就是完整的 Copilot 数据目录（不用再拼 `/copilot` 子目录）。
+fn copilot_home(override_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = smelt_core::login_env::copilot_home() {
+        return PathBuf::from(dir);
+    }
+    if let Some(xdg) = smelt_core::login_env::xdg_config_home() {
+        return PathBuf::from(xdg).join("copilot");
+    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".copilot")
 }
 
 /// 只认得住扁平 `key: value` 这一种形状——Copilot 目前这个文件就是这样（实测），
@@ -614,8 +639,8 @@ fn parse_flat_yaml(text: &str) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-pub fn list_copilot_sessions(cwd: &str) -> Vec<SessionSummary> {
-    let root = copilot_sessions_root();
+pub fn list_copilot_sessions(cwd: &str, override_dir: Option<&str>) -> Vec<SessionSummary> {
+    let root = copilot_sessions_root(override_dir);
     let mut out = Vec::new();
     for session_dir in read_dir_ok(&root) {
         if let Some(s) = summarize_copilot_session(&session_dir, cwd) {
@@ -782,6 +807,10 @@ pub enum HistoryPane {
 pub fn history_view(
     pane: HistoryPane,
     agent: AcpAgentKind,
+    // 选中的是手动添加的 workspace profile 而不是某个基础 agent 槽位时是
+    // `Some(profile_id)`——决定去哪个目录读数据（见 `ensure_session_list`），
+    // `agent` 这时候是该 profile 底层接的种类（供解析器选用）。
+    profile_id: Option<String>,
     cwd: Option<String>,
     list: HistoryListState,
     detail: &Option<(std::path::PathBuf, Rc<SessionDetail>)>,
@@ -817,7 +846,10 @@ pub fn history_view(
     }
 
     // 会话来源分 tab：四家 agent 各自的本地存储格式完全不同（见文件头注释），
-    // 没法合并成一份列表，只能让用户自己选看哪家。
+    // 没法合并成一份列表，只能让用户自己选看哪家。手动添加的 workspace profile
+    // 追加在基础四家后面——同一个 kind 的解析器复用，只是数据目录不同。
+    let current_profile = profile_id.clone();
+    let profiles = cx.global::<crate::settings::AgentUiConfig>().profiles.clone();
     let agent_switcher = h_flex()
         .flex_none()
         .gap_1()
@@ -825,7 +857,32 @@ pub fn history_view(
         .py_1p5()
         .border_b_1()
         .border_color(c_border)
-        .children(AcpAgentKind::ALL.map(|a| agent_tab_button(a, agent, accent, fg, muted, cx)));
+        .children(AcpAgentKind::ALL.map(|a| {
+            agent_tab_button(
+                a,
+                None,
+                a.short_label().into(),
+                agent,
+                current_profile.clone(),
+                accent,
+                fg,
+                muted,
+                cx,
+            )
+        }))
+        .children(profiles.into_iter().map(|p| {
+            agent_tab_button(
+                p.kind(),
+                Some(p.id.clone()),
+                p.label.clone().into(),
+                agent,
+                current_profile.clone(),
+                accent,
+                fg,
+                muted,
+                cx,
+            )
+        }));
 
     // 选中会话的路径：list 和 detail 各自渲染都要用它判断"这行是不是当前打开的"，
     // 先从 detail 里取出来，避免下面重复解构。
@@ -836,6 +893,13 @@ pub fn history_view(
         HistoryListState::Ready(s) => Some(s.clone()),
         _ => None,
     };
+
+    // 当前 tab 若是手动添加的 workspace profile，续接要用它自动拼好的命令
+    // （带 workspace 覆盖前缀），不能用底层 kind 的默认命令——不然续接出来的
+    // 会话又落回默认 workspace，看不到这条历史。
+    let cmd_override = profile_id.as_deref().and_then(|id| {
+        cx.global::<crate::settings::AgentUiConfig>().find_profile(id).map(|p| p.command())
+    });
 
     let list_body: AnyElement = match (&list, &sessions) {
         (HistoryListState::Loading, _) => placeholder_view("加载中…", muted).into_any_element(),
@@ -858,6 +922,7 @@ pub fn history_view(
                 let resume_id = s.resume_id.clone();
                 let row_cwd = cwd.clone();
                 let ws_for_resume = workspace.clone();
+                let row_cmd_override = cmd_override.clone();
                 col = col.child(
                     div()
                         .id(("session-row", ix))
@@ -883,6 +948,7 @@ pub fn history_view(
                             let resume_id = resume_id.clone();
                             let row_cwd = row_cwd.clone();
                             let resume_path = resume_path.clone();
+                            let row_cmd_override = row_cmd_override.clone();
                             menu = menu.item(PopupMenuItem::new("继续").on_click(
                                 move |_ev, window, cx| {
                                     // 没选中项目时历史页本来就是空的，理论到不了这里，
@@ -890,9 +956,11 @@ pub fn history_view(
                                     let Some(cwd) = row_cwd.clone() else { return };
                                     let resume_id = resume_id.clone();
                                     let resume_path = resume_path.clone();
+                                    let cmd_override = row_cmd_override.clone();
                                     ws.update(cx, |this, cx| {
                                         this.resume_acp_session(
-                                            agent, cwd, resume_id, resume_path, window, cx,
+                                            agent, cmd_override, cwd, resume_id, resume_path,
+                                            window, cx,
                                         );
                                     });
                                 },
@@ -1048,15 +1116,20 @@ pub fn history_view(
 #[allow(clippy::too_many_arguments)]
 fn agent_tab_button(
     target: AcpAgentKind,
+    target_profile: Option<String>,
+    label: SharedString,
     current: AcpAgentKind,
+    current_profile: Option<String>,
     accent: Hsla,
     fg: Hsla,
     muted: Hsla,
     cx: &mut Context<Workspace>,
 ) -> Stateful<Div> {
-    let selected = target == current;
+    let selected = target == current && target_profile == current_profile;
+    let elem_id: SharedString =
+        target_profile.as_deref().map(|id| format!("profile:{id}")).unwrap_or_else(|| target.id().to_string()).into();
     div()
-        .id(target.id())
+        .id(elem_id)
         .px_3()
         .py_1()
         .rounded_md()
@@ -1065,12 +1138,13 @@ fn agent_tab_button(
         .text_color(if selected { fg } else { muted })
         .when(selected, |d| d.bg(accent.opacity(0.18)))
         .when(!selected, |d| d.hover(|s| s.text_color(fg)))
-        .child(target.short_label())
+        .child(label)
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
-                if this.history_agent != target {
+                if this.history_agent != target || this.history_profile != target_profile {
                     this.history_agent = target;
+                    this.history_profile = target_profile.clone();
                     this.session_detail = None;
                     cx.notify();
                 }
@@ -1216,17 +1290,20 @@ fn memory_body(
 use crate::settings::AcpAgentKind;
 
 /// 历史会话缓存 key：四家 agent 各存各的，同一个 cwd 换个 tab 是完全不同的数据，
-/// 光用 cwd 当 key 会把 Claude 的列表和 Codex 的列表互相顶掉。
-pub(crate) fn session_list_key(agent: AcpAgentKind, cwd: &str) -> String {
-    format!("{}:{cwd}", agent.id())
+/// 光用 cwd 当 key 会把 Claude 的列表和 Codex 的列表互相顶掉。手动添加的
+/// workspace profile 跟同 kind 的默认 workspace 也是两份完全不同的数据，
+/// `profile_id` 折进 key 里，同一个 kind 下的不同 profile 才不会互相顶掉
+/// （`profile_id` 本身已经唯一决定了 override 目录，不用再单独编码目录值）。
+pub(crate) fn session_list_key(agent: AcpAgentKind, profile_id: Option<&str>, cwd: &str) -> String {
+    format!("{}:{}:{cwd}", agent.id(), profile_id.unwrap_or("default"))
 }
 
-fn list_sessions_for(agent: AcpAgentKind, cwd: &str) -> Vec<SessionSummary> {
+fn list_sessions_for(agent: AcpAgentKind, override_dir: Option<&str>, cwd: &str) -> Vec<SessionSummary> {
     match agent {
-        AcpAgentKind::Claude => list_sessions(cwd),
-        AcpAgentKind::Codex => list_codex_sessions(cwd),
-        AcpAgentKind::Grok => list_grok_sessions(cwd),
-        AcpAgentKind::Copilot => list_copilot_sessions(cwd),
+        AcpAgentKind::Claude => list_sessions(cwd, override_dir),
+        AcpAgentKind::Codex => list_codex_sessions(cwd, override_dir),
+        AcpAgentKind::Grok => list_grok_sessions(cwd, override_dir),
+        AcpAgentKind::Copilot => list_copilot_sessions(cwd, override_dir),
     }
 }
 
@@ -1240,11 +1317,23 @@ pub(crate) fn load_session_detail_for(agent: AcpAgentKind, path: &Path) -> Optio
 }
 
 impl Workspace {
-    /// 历史会话页：确保当前 agent + 项目的会话列表缓存新鲜（>10s 或缺失就后台
-    /// 重新扫描）。总览卡片那边固定传 `AcpAgentKind::Claude`，跟历史页的 tab
-    /// 切换共用同一份缓存/同一套读写路径。
-    pub fn ensure_session_list(&mut self, agent: AcpAgentKind, cwd: String, cx: &mut Context<Self>) {
-        let key = session_list_key(agent, &cwd);
+    /// 历史会话页：确保当前 agent（+ 可能选中的 workspace profile）+ 项目的会话
+    /// 列表缓存新鲜（>10s 或缺失就后台重新扫描）。总览卡片那边固定传
+    /// `(AcpAgentKind::Claude, None)`，跟历史页的 tab 切换共用同一份缓存/同一套
+    /// 读写路径。
+    pub fn ensure_session_list(
+        &mut self,
+        agent: AcpAgentKind,
+        profile_id: Option<String>,
+        cwd: String,
+        cx: &mut Context<Self>,
+    ) {
+        let override_dir = profile_id.as_deref().and_then(|id| {
+            cx.global::<crate::settings::AgentUiConfig>()
+                .find_profile(id)
+                .map(|p| p.workspace_dir.clone())
+        });
+        let key = session_list_key(agent, profile_id.as_deref(), &cwd);
         let fresh = self
             .session_list
             .get(&key)
@@ -1255,9 +1344,10 @@ impl Workspace {
         self.session_list_inflight.insert(key.clone());
         cx.spawn(async move |this, cx| {
             let c = cwd.clone();
+            let od = override_dir.clone();
             let sessions = cx
                 .background_executor()
-                .spawn(async move { list_sessions_for(agent, &c) })
+                .spawn(async move { list_sessions_for(agent, od.as_deref(), &c) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.session_list_inflight.remove(&key);
@@ -1326,16 +1416,37 @@ mod tests {
     static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// 在锁保护下临时把 HOME 指向 `home`，跑完 `f` 再复原。
+    /// 除了 HOME，四个 workspace 覆盖变量也得在测试期间清空——`login_env` 的
+    /// 访问器现在优先直查进程自身环境（见该模块注释），`cargo test` 是从
+    /// 开发者的真实 shell 里跑起来的，会原样继承那边 export 的
+    /// `CLAUDE_CONFIG_DIR` 等值，不清空的话这几个测试会读到开发机的真实
+    /// workspace 目录而不是这里搭的假 HOME 沙盒（真实踩过这个坑，不是假设）。
+    const OVERRIDE_VARS: [&str; 5] =
+        ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "COPILOT_HOME", "XDG_CONFIG_HOME"];
+
     fn with_home<R>(home: &Path, f: impl FnOnce() -> R) -> R {
         let _guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("HOME");
+        let prev_home = std::env::var_os("HOME");
+        let prev_overrides: Vec<Option<std::ffi::OsString>> =
+            OVERRIDE_VARS.iter().map(|v| std::env::var_os(v)).collect();
         unsafe {
             std::env::set_var("HOME", home);
+            for v in OVERRIDE_VARS {
+                std::env::remove_var(v);
+            }
         }
         let result = f();
-        match prev {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            for (v, prev) in OVERRIDE_VARS.iter().zip(prev_overrides) {
+                match prev {
+                    Some(val) => std::env::set_var(v, val),
+                    None => std::env::remove_var(v),
+                }
+            }
         }
         result
     }
@@ -1366,7 +1477,7 @@ mod tests {
             &[r#"{"type":"user","timestamp":"2026-07-05T00:00:00Z","message":{"content":"second session"}}"#],
         );
 
-        let sessions = with_home(&tmp, || list_sessions("/x/y"));
+        let sessions = with_home(&tmp, || list_sessions("/x/y", None));
         std::fs::remove_dir_all(&tmp).unwrap();
 
         assert_eq!(sessions.len(), 2);
@@ -1432,7 +1543,7 @@ mod tests {
             &[r#"{"timestamp":"2026-07-01T00:00:00Z","type":"session_meta","payload":{"id":"cx-2","cwd":"/other"}}"#],
         );
 
-        let sessions = with_home(&tmp, || list_codex_sessions("/proj"));
+        let sessions = with_home(&tmp, || list_codex_sessions("/proj", None));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "实际问题"); // 合成的 environment_context 不该被当标题
         assert_eq!(sessions[0].message_count, 2);
@@ -1473,7 +1584,7 @@ mod tests {
             ],
         );
 
-        let sessions = with_home(&tmp, || list_grok_sessions("/proj"));
+        let sessions = with_home(&tmp, || list_grok_sessions("/proj", None));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "聊聊策略");
         assert_eq!(sessions[0].message_count, 2);
@@ -1508,7 +1619,7 @@ mod tests {
             ],
         );
 
-        let sessions = with_home(&tmp, || list_copilot_sessions("/proj"));
+        let sessions = with_home(&tmp, || list_copilot_sessions("/proj", None));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "调试问题");
         assert_eq!(sessions[0].message_count, 2);

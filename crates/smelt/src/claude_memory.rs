@@ -32,7 +32,10 @@ pub struct MemoryEntry {
 /// 列出某个项目的全部记忆，最近写入的排在前面（跟历史会话「最近活跃在前」一致）。
 /// 读不到目录就返回空 Vec——没有记忆是正常状态，不是错误。
 pub fn list_memories(cwd: &str) -> Vec<MemoryEntry> {
-    list_memories_in(&memory_dir(cwd))
+    // 记忆浏览暂不支持多 workspace（见 session_history.rs 文件头的调研结论：
+    // 三家非 Claude agent 的记忆要么读不到要么存储格式不可靠，这块先不做），
+    // 固定用默认 workspace。
+    list_memories_in(&memory_dir(cwd, None))
 }
 
 /// 对着一个具体目录列记忆。跟 list_memories 分开只为让测试能绕开 `~/.claude`
