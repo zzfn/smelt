@@ -14,9 +14,14 @@ listening-port=3478
 # pkey=/etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem
 
 fingerprint
-lt-cred-mech
-# 静态用户：install-coturn.sh 会改成随机密码
-user=smelt:CHANGE_ME_STRONG_PASSWORD
+# REST API 临时凭证（install-coturn.sh 用的就是这个）：这份密钥只在这里和
+# smelt-signal 的 SMELT_TURN_SECRET 两处存在，从不下发给客户端；smelt-signal
+# 每次 hello_ok 用它现算一个短时效的用户名/密码，泄露了也会自动过期。
+# 旧版 lt-cred-mech + 固定 user=用户名:密码 的写法见文末注释——那种模式两边
+# 密码必须人肉保持一致，改错/漏改都是静默失败（连不上但两个服务都正常启动，
+# 不会报错），不建议再用。
+use-auth-secret
+static-auth-secret=CHANGE_ME_RANDOM_SECRET
 realm=signal.example.com
 
 # 腾讯云必须填「弹性公网 IP」（不是内网 IP）
@@ -38,3 +43,11 @@ no-loopback-peers
 # 进程用户（Debian/Ubuntu 包自带 turnserver 用户）
 # proc-user=turnserver
 # proc-group=turnserver
+
+# —— 旧版静态长期凭证写法（不建议）——
+# lt-cred-mech
+# user=smelt:CHANGE_ME_STRONG_PASSWORD
+# 这份 user= 密码会被 smelt-signal 原样发给每一个连上的客户端（写进
+# SMELT_ICE_SERVERS），且这里的密码必须跟 smelt-signal.env 里的手动保持
+# 完全一致——踩过一次两边分叉导致所有人连不上的坑，才换成上面的 REST API
+# 模式，除非有特殊原因不建议切回来。

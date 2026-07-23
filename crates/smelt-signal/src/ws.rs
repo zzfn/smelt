@@ -81,7 +81,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         send_json(
                             &out_tx,
                             ServerMsg::HelloOk {
-                                ice_servers: (*state.ice_servers).clone(),
+                                ice_servers: state.ice_servers_for_hello(),
                             },
                         );
                         if ok.peer_online {

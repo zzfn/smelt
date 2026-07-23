@@ -156,7 +156,10 @@ cargo run -p smelt-signal
 |------|------|------|
 | `SMELT_SIGNAL_BIND` | `127.0.0.1:7878` | 监听地址 |
 | `SMELT_ROOM_TTL_SECS` | `3600` | 房间默认存活 |
-| `SMELT_ICE_SERVERS` | 四公共 STUN（见下） | JSON 数组，下发给 `hello_ok` |
+| `SMELT_ICE_SERVERS` | 四公共 STUN（见下） | JSON 数组，下发给 `hello_ok`（STUN 用；TURN 见下） |
+| `SMELT_TURN_SECRET` | 无 | 配了才现算临时 TURN 凭证追加进 ICE 列表；必须跟 coturn 的 `static-auth-secret=` 一致 |
+| `SMELT_TURN_HOST` | 无 | `host:port`，如 `signal.example.com:3478`；配了 `SMELT_TURN_SECRET` 就必须配这个 |
+| `SMELT_TURN_TTL_SECS` | 同 `SMELT_ROOM_TTL_SECS` | 临时 TURN 凭证有效期（秒） |
 
 **默认公共 STUN（未设环境变量时）：**
 
@@ -166,7 +169,9 @@ cargo run -p smelt-signal
 4. `stun:stun.l.google.com:19302`（Google 兜底）
 
 仅 STUN 约 7～8 成能直连；**手机蜂窝 / 对称 NAT 需要 TURN**。  
-生产：同机 coturn + 写入 `SMELT_ICE_SERVERS`，见 [`deploy/signal/coturn.md`](../deploy/signal/coturn.md)。  
+生产：同机 coturn + 配 `SMELT_TURN_SECRET`/`SMELT_TURN_HOST`（REST API 临时
+凭证，`smelt-signal` 每次 `hello_ok` 现算，不是写死一个密码发给所有客户端），
+见 [`deploy/signal/coturn.md`](../deploy/signal/coturn.md)。  
 房间内存存、短时效，进程重启清空。
 
 **公网部署（腾讯云 Ubuntu 等）：** 见 [`deploy/signal/README.md`](../deploy/signal/README.md)  

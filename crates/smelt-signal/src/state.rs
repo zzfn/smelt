@@ -8,7 +8,8 @@ use rand::RngCore;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::protocol::{IceServerConfig, Role, ServerMsg};
+use crate::protocol::{IceServerConfig, IceUrls, Role, ServerMsg};
+use crate::turn_rest::{self, TurnRestConfig};
 
 pub type Outbound = mpsc::UnboundedSender<String>;
 
@@ -20,7 +21,11 @@ const MAX_CREATE_PER_MINUTE: u32 = 120;
 #[derive(Clone)]
 pub struct AppState {
     pub rooms: Arc<DashMap<String, Room>>,
+    /// 静态 ICE 列表（公共 STUN，也可以是没配 SMELT_TURN_SECRET 时的旧式静态
+    /// TURN）。配了 turn_rest 时，每次 hello_ok 会在这份静态列表之外再现算
+    /// 追加一条临时 TURN。
     pub ice_servers: Arc<Vec<IceServerConfig>>,
+    pub turn_rest: Option<Arc<TurnRestConfig>>,
     pub default_ttl: Duration,
     create_window: Arc<std::sync::Mutex<(Instant, u32)>>,
 }
@@ -37,13 +42,36 @@ pub struct PeerSlot {
 }
 
 impl AppState {
-    pub fn new(ice_servers: Vec<IceServerConfig>, default_ttl: Duration) -> Self {
+    pub fn new(
+        ice_servers: Vec<IceServerConfig>,
+        turn_rest: Option<TurnRestConfig>,
+        default_ttl: Duration,
+    ) -> Self {
         Self {
             rooms: Arc::new(DashMap::new()),
             ice_servers: Arc::new(ice_servers),
+            turn_rest: turn_rest.map(Arc::new),
             default_ttl,
             create_window: Arc::new(std::sync::Mutex::new((Instant::now(), 0))),
         }
+    }
+
+    /// 每次 hello_ok 调用一次：静态列表 + （如果配了）现算的临时 TURN 凭证。
+    /// 现算而不是缓存，是因为凭证本身带过期时间戳，缓存了就失去意义。
+    pub fn ice_servers_for_hello(&self) -> Vec<IceServerConfig> {
+        let mut list = (*self.ice_servers).clone();
+        if let Some(cfg) = &self.turn_rest {
+            let cred = turn_rest::mint(cfg);
+            list.push(IceServerConfig {
+                urls: IceUrls::Many(vec![
+                    format!("turn:{}?transport=udp", cfg.host),
+                    format!("turn:{}?transport=tcp", cfg.host),
+                ]),
+                username: Some(cred.username),
+                credential: Some(cred.credential),
+            });
+        }
+        list
     }
 
     pub fn create_room(&self, ttl: Option<Duration>) -> Result<CreateRoomResult, CreateRoomErr> {

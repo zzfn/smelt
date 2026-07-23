@@ -23,6 +23,10 @@ rand = "0.8"
 dashmap = "6"
 futures-util = "0.3"
 base64 = "0.22"
+# coturn REST API 临时 TURN 凭证（use-auth-secret 模式）：HMAC-SHA1 是协议本身
+# 定的算法，不是我们选的降级。
+hmac = "0.12"
+sha1 = "0.10"
 # 公网信令同域托管 remote-web SPA（跨网手机只打开 signal 域名）
 rust-embed = { version = "8.7", features = ["debug-embed"] }
 

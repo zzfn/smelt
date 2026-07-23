@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 在已有 smelt-signal 的 Ubuntu（腾讯云等）上安装 coturn，并写入 SMELT_ICE_SERVERS。
+# 在已有 smelt-signal 的 Ubuntu（腾讯云等）上安装 coturn，配成 REST API 临时
+# 凭证模式（use-auth-secret），写入 SMELT_TURN_SECRET / SMELT_TURN_HOST。
 #
 # 用法（上机 root / sudo）：
 #   PUBLIC_IP=1.2.3.4 DOMAIN=signal.example.com bash install-coturn.sh
@@ -7,10 +8,11 @@
 #   PUBLIC_IP=1.2.3.4 bash install-coturn.sh
 #
 # 环境变量：
-#   PUBLIC_IP   必填，弹性公网 IP
-#   DOMAIN      可选，有则 ICE 用域名（stun:/turn:DOMAIN:3478）
-#   TURN_USER   默认 smelt
-#   TURN_PASS   默认随机生成并打印一次
+#   PUBLIC_IP     必填，弹性公网 IP
+#   DOMAIN        可选，有则 ICE 用域名（stun:/turn:DOMAIN:3478）
+#   TURN_SECRET   默认随机生成并打印一次——这是 smelt-signal 和 coturn 之间
+#                 唯一要共享的密钥，从不下发给客户端（对比旧版直接把 TURN
+#                 密码发给所有人的静态凭证模式，见 coturn.md）
 #   RELAY_MIN / RELAY_MAX  默认 49152 / 49251
 #   SKIP_SIGNAL_ENV=1  只装 coturn，不改 smelt-signal 环境
 set -euo pipefail
@@ -22,19 +24,18 @@ die() { echo "✗ $*" >&2; exit 1; }
 
 PUBLIC_IP="${PUBLIC_IP:-}"
 DOMAIN="${DOMAIN:-}"
-TURN_USER="${TURN_USER:-smelt}"
-TURN_PASS="${TURN_PASS:-}"
+TURN_SECRET="${TURN_SECRET:-}"
 RELAY_MIN="${RELAY_MIN:-49152}"
 RELAY_MAX="${RELAY_MAX:-49251}"
 SKIP_SIGNAL_ENV="${SKIP_SIGNAL_ENV:-0}"
 
 [[ -n "$PUBLIC_IP" ]] || die "请设置 PUBLIC_IP=你的弹性公网IP"
 
-if [[ -z "$TURN_PASS" ]]; then
-  TURN_PASS="$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)"
-  GENERATED_PASS=1
+if [[ -z "$TURN_SECRET" ]]; then
+  TURN_SECRET="$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)"
+  GENERATED_SECRET=1
 else
-  GENERATED_PASS=0
+  GENERATED_SECRET=0
 fi
 
 if [[ -n "$DOMAIN" ]]; then
@@ -56,8 +57,12 @@ cat >/etc/turnserver.conf <<EOF
 listening-ip=0.0.0.0
 listening-port=3478
 fingerprint
-lt-cred-mech
-user=${TURN_USER}:${TURN_PASS}
+# REST API 临时凭证：不再是固定 user=用户名:密码，密钥只在这里和
+# smelt-signal 的 SMELT_TURN_SECRET 两处存在，从不下发给客户端，凭证短
+# 时效自动过期。旧式 lt-cred-mech + 固定 user= 见 coturn.md 里的说明——
+# 那种模式两边密码必须人肉保持一致，改错/漏改都是静默失败，不建议再用。
+use-auth-secret
+static-auth-secret=${TURN_SECRET}
 realm=${REALM}
 external-ip=${PUBLIC_IP}
 min-port=${RELAY_MIN}
@@ -90,30 +95,27 @@ else
 fi
 
 if [[ "$SKIP_SIGNAL_ENV" != "1" ]]; then
-  log ">>> 4/5 写入 smelt-signal SMELT_ICE_SERVERS"
+  log ">>> 4/5 写入 smelt-signal SMELT_TURN_SECRET / SMELT_TURN_HOST"
   mkdir -p /etc/smelt
   ENV_FILE=/etc/smelt/smelt-signal.env
   touch "$ENV_FILE"
-  # 公共 STUN + 本机 TURN（JSON 单行，无空格，方便 EnvironmentFile）
-  ICE_JSON=$(cat <<JSON
-[{"urls":"stun:${ICE_HOST}:3478"},{"urls":["turn:${ICE_HOST}:3478?transport=udp","turn:${ICE_HOST}:3478?transport=tcp"],"username":"${TURN_USER}","credential":"${TURN_PASS}"},{"urls":"stun:stun.qq.com:3478"},{"urls":"stun:stun.miwifi.com:3478"},{"urls":"stun:stun.cloudflare.com:3478"},{"urls":"stun:stun.l.google.com:19302"}]
-JSON
-)
-  # 去掉换行
-  ICE_JSON="$(echo "$ICE_JSON" | tr -d '\n')"
 
-  if grep -q '^SMELT_ICE_SERVERS=' "$ENV_FILE" 2>/dev/null; then
-    # 用临时文件替换该行（避免 sed 与 JSON 引号搏斗）
-    grep -v '^SMELT_ICE_SERVERS=' "$ENV_FILE" >"${ENV_FILE}.tmp" || true
-    mv "${ENV_FILE}.tmp" "$ENV_FILE"
-  fi
-  printf 'SMELT_ICE_SERVERS=%s\n' "$ICE_JSON" >>"$ENV_FILE"
+  for KEY in SMELT_TURN_SECRET SMELT_TURN_HOST; do
+    if grep -q "^${KEY}=" "$ENV_FILE" 2>/dev/null; then
+      grep -v "^${KEY}=" "$ENV_FILE" >"${ENV_FILE}.tmp" || true
+      mv "${ENV_FILE}.tmp" "$ENV_FILE"
+    fi
+  done
+  {
+    printf 'SMELT_TURN_SECRET=%s\n' "$TURN_SECRET"
+    printf 'SMELT_TURN_HOST=%s:3478\n' "$ICE_HOST"
+  } >>"$ENV_FILE"
 
   if systemctl is-enabled smelt-signal &>/dev/null || systemctl is-active smelt-signal &>/dev/null; then
     systemctl restart smelt-signal
     log "smelt-signal 已 restart"
   else
-    log "未检测到 smelt-signal.service，请自行 restart 并确保 EnvironmentFile 含 SMELT_ICE_SERVERS"
+    log "未检测到 smelt-signal.service，请自行 restart 并确保 EnvironmentFile 含 SMELT_TURN_SECRET/SMELT_TURN_HOST"
   fi
 else
   log ">>> 4/5 SKIP_SIGNAL_ENV=1，跳过信号环境"
@@ -122,14 +124,17 @@ fi
 log ">>> 5/5 完成"
 echo
 echo "======== 保存以下信息 ========"
-echo "TURN user:     $TURN_USER"
-if [[ "$GENERATED_PASS" == "1" ]]; then
-  echo "TURN password: $TURN_PASS   ← 仅此一次打印，请存密码管理器"
+if [[ "$GENERATED_SECRET" == "1" ]]; then
+  echo "TURN secret:  $TURN_SECRET   ← 仅此一次打印，请存密码管理器"
 else
-  echo "TURN password: (你提供的 TURN_PASS)"
+  echo "TURN secret:  (你提供的 TURN_SECRET)"
 fi
-echo "ICE host:      $ICE_HOST"
+echo "ICE host:      $ICE_HOST:3478"
 echo "Relay ports:   UDP ${RELAY_MIN}-${RELAY_MAX}"
+echo
+echo "注：这份 secret 只存在于 /etc/turnserver.conf 和 smelt-signal.env 两处，"
+echo "从不下发给客户端——不是发给手机/浏览器的 TURN 密码，不要跟旧版的"
+echo "TURN_USER/TURN_PASS 弄混。"
 echo
 echo "腾讯云安全组请放行："
 echo "  UDP+TCP 3478"
@@ -139,6 +144,7 @@ echo "自检（本机）："
 echo "  ss -ulnp | grep 3478 || netstat -ulnp | grep 3478"
 echo "  journalctl -u coturn -n 30 --no-pager   # 或 turnserver"
 echo
-echo "信令侧确认 ICE 已带 turn（重启 signal 后新建房间再连）："
+echo "信令侧确认 turn_rest 已启用（重启 signal 后新建房间再连）："
+echo "  journalctl -u smelt-signal -n 20 --no-pager | grep turn_rest"
 echo "  手机/浏览器 WebRTC 日志应出现 relay 候选（对称 NAT / 蜂窝时）"
 echo "=============================="

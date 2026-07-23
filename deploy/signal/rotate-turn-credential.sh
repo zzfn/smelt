@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# 手动轮换 coturn 的静态 TURN 密码。
+# 手动轮换 coturn 的 REST API 共享密钥（static-auth-secret）。
 #
-# lt-cred-mech 的长期凭证没有过期时间：hello_ok 把它发给每一个连上信令的客户端，
-# 泄露了就能被当公开中继一直用到你换密码为止。这个脚本不解决"静态凭证"本身的
-# 问题（真要解决得换 coturn REST API 临时凭证），只是把风险敞口从"无限期"收窄到
-# "两次轮换之间"——建议定期手动跑，或自己包一个 cron。
+# 换成 REST API 临时凭证模式（use-auth-secret）之后，这个脚本已经不是"堵漏"
+# 用的了——凭证本身短时效自动过期，泄露了也用不了多久，两边（turnserver.conf
+# 和 smelt-signal.env）也不会像旧版 lt-cred-mech 那样因为手动改错而悄悄分叉。
+# 轮换这份共享密钥纯粹是防御纵深（怀疑密钥被看到过、定期例行轮换），不是必须
+# 操作，不跑也不影响正常使用。
 #
 # 用法（root/sudo，机器上已经跑过 install-coturn.sh）：
 #   sudo bash rotate-turn-credential.sh
-#   # 或指定新密码：
-#   sudo TURN_PASS=新密码 bash rotate-turn-credential.sh
+#   # 或指定新密钥：
+#   sudo TURN_SECRET=新密钥 bash rotate-turn-credential.sh
 set -euo pipefail
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -23,31 +24,18 @@ ENV_FILE=/etc/smelt/smelt-signal.env
 [[ -f "$CONF" ]] || die "找不到 $CONF，先跑 install-coturn.sh"
 [[ -f "$ENV_FILE" ]] || die "找不到 $ENV_FILE"
 
-TURN_USER="$(grep -oP '^user=\K[^:]+' "$CONF" || true)"
-[[ -n "$TURN_USER" ]] || die "读不到 $CONF 里的 user=，配置格式和 install-coturn.sh 生成的不一致？"
+grep -q '^use-auth-secret' "$CONF" || die \
+  "$CONF 里没有 use-auth-secret——还在用旧版 lt-cred-mech？重新跑一遍 install-coturn.sh 迁移到 REST API 模式再用这个脚本"
 
-OLD_ICE_LINE="$(grep '^SMELT_ICE_SERVERS=' "$ENV_FILE" || true)"
-[[ -n "$OLD_ICE_LINE" ]] || die "读不到 $ENV_FILE 里的 SMELT_ICE_SERVERS=，改用 install-coturn.sh 重装"
-
-# 从现有 SMELT_ICE_SERVERS 里抠出 turn: 的 host（install-coturn.sh 写入时用的是
-# DOMAIN 或 PUBLIC_IP），保证轮换后 ICE host 不变，只换密码。
-ICE_HOST="$(echo "$OLD_ICE_LINE" | grep -oP '"turn:\K[^:"?]+' | head -1)"
-[[ -n "$ICE_HOST" ]] || die "解析不出当前 ICE host，SMELT_ICE_SERVERS 格式被手改过？"
-
-TURN_PASS="${TURN_PASS:-$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)}"
+TURN_SECRET="${TURN_SECRET:-$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)}"
 
 log ">>> 1/3 更新 $CONF"
-sed -i "s/^user=.*/user=${TURN_USER}:${TURN_PASS}/" "$CONF"
+sed -i "s/^static-auth-secret=.*/static-auth-secret=${TURN_SECRET}/" "$CONF"
 
-log ">>> 2/3 重建 $ENV_FILE 的 SMELT_ICE_SERVERS"
-ICE_JSON=$(cat <<JSON
-[{"urls":"stun:${ICE_HOST}:3478"},{"urls":["turn:${ICE_HOST}:3478?transport=udp","turn:${ICE_HOST}:3478?transport=tcp"],"username":"${TURN_USER}","credential":"${TURN_PASS}"},{"urls":"stun:stun.qq.com:3478"},{"urls":"stun:stun.miwifi.com:3478"},{"urls":"stun:stun.cloudflare.com:3478"},{"urls":"stun:stun.l.google.com:19302"}]
-JSON
-)
-ICE_JSON="$(echo "$ICE_JSON" | tr -d '\n')"
-grep -v '^SMELT_ICE_SERVERS=' "$ENV_FILE" >"${ENV_FILE}.tmp" || true
+log ">>> 2/3 更新 $ENV_FILE 的 SMELT_TURN_SECRET"
+grep -v '^SMELT_TURN_SECRET=' "$ENV_FILE" >"${ENV_FILE}.tmp" || true
 mv "${ENV_FILE}.tmp" "$ENV_FILE"
-printf 'SMELT_ICE_SERVERS=%s\n' "$ICE_JSON" >>"$ENV_FILE"
+printf 'SMELT_TURN_SECRET=%s\n' "$TURN_SECRET" >>"$ENV_FILE"
 
 log ">>> 3/3 重启 coturn + smelt-signal"
 systemctl restart coturn 2>/dev/null || systemctl restart turnserver 2>/dev/null || die "找不到 coturn/turnserver systemd unit"
@@ -58,9 +46,9 @@ else
 fi
 
 echo
-echo "======== 新密码（仅此一次打印，请存密码管理器） ========"
-echo "TURN user:     $TURN_USER"
-echo "TURN password: $TURN_PASS"
+echo "======== 新密钥（仅此一次打印，请存密码管理器） ========"
+echo "TURN secret: $TURN_SECRET"
 echo "========================================================"
 echo
-echo "旧密码已失效；用旧凭证连着的中继流量下次重连会失败（属预期）。"
+echo "旧密钥算出来的临时凭证立即失效；正在用旧凭证的中继连接下次重连/ICE"
+echo "restart 会失败（属预期，重新走一遍 hello 就能拿到新凭证）。"
