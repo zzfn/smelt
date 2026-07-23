@@ -56,6 +56,10 @@ pub enum ClientMsg {
         from: Role,
         payload: Value,
     },
+    /// 现算的 TURN 凭证有过期时间；hello 只在建连那一刻拿一次 ice_servers，
+    /// 长连接不刷新的话，凭证会在会话中途悄悄过期。定期发这个要一份新的，
+    /// 不影响已经在用的 room/peer 状态。
+    RefreshIce,
     Ping,
     /// 浏览器可能回 pong；服务端也可发 ping
     Pong,
@@ -65,6 +69,10 @@ pub enum ClientMsg {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ServerMsg {
     HelloOk {
+        ice_servers: Vec<IceServerConfig>,
+    },
+    /// 回应 `RefreshIce`：新算的一份，跟 HelloOk 里那份格式一样。
+    IceServers {
         ice_servers: Vec<IceServerConfig>,
     },
     PeerJoined {

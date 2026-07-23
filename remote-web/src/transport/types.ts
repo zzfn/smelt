@@ -26,12 +26,15 @@ export type SignalingHello = {
 export type SignalingMessage =
   | SignalingHello
   | { op: "hello_ok"; ice_servers: IceServerConfig[] }
+  /** 主动发 refresh_ice 的回应：现算的临时 TURN 凭证过期时间到了要续一份 */
+  | { op: "ice_servers"; ice_servers: IceServerConfig[] }
   | { op: "peer_joined"; role: "client" | "host" }
   | { op: "peer_left"; role: "client" | "host" }
   | { op: "signal"; from: "client" | "host"; payload: SignalPayload }
   | { op: "err"; msg: string }
   | { op: "ping" }
-  | { op: "pong" };
+  | { op: "pong" }
+  | { op: "refresh_ice" };
 
 export type SignalPayload =
   /** restart=true：同一 PeerConnection 上的 ICE 重协商，host 侧不重建 PC/DataChannel */

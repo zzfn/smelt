@@ -133,7 +133,13 @@ remote-web/src/transport/
 { "op": "signal", "from": "client"|"host", "payload": { "kind": "offer"|"answer"|"ice", ... } }
 { "op": "err", "msg": "..." }
 { "op": "ping" } / { "op": "pong" }
+{ "op": "refresh_ice" }                                    // 客户端主动要一份新的现算 TURN 凭证
+{ "op": "ice_servers", "ice_servers": [...] }               // 回应 refresh_ice，格式同 hello_ok
 ```
+
+现算的 TURN 临时凭证有过期时间，长连接不刷新会在会话中途悄悄过期。host（`smelt-bridge`）
+与 client（`remote-web`）都会在 hello 成功后每 10 分钟自动发一次 `refresh_ice`，只更新本地
+缓存/`RTCPeerConnection.setConfiguration`，不影响正在用的连接，供下次 ICE restart / 重建使用。
 
 ### 信令服务（`crates/smelt-signal`，已实现）
 

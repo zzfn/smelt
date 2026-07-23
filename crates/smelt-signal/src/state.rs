@@ -165,19 +165,21 @@ impl AppState {
         Ok(JoinOk { peer_online })
     }
 
-    /// 把消息投递给房间内另一角色。
-    pub fn relay_to_other(&self, room_id: &str, from: Role, msg: &ServerMsg) {
+    /// 把消息投递给房间内另一角色。返回 false 表示对端不在线（房间不存在也算），
+    /// 调用方可以据此判断是不是"消息发出去了但没人收"这种排查线索。
+    pub fn relay_to_other(&self, room_id: &str, from: Role, msg: &ServerMsg) -> bool {
         let Some(entry) = self.rooms.get(room_id) else {
-            return;
+            return false;
         };
         let target = match from.other() {
             Role::Host => entry.host.as_ref(),
             Role::Client => entry.client.as_ref(),
         };
-        if let Some(peer) = target {
-            let json = msg.to_json();
-            let _ = peer.tx.send(json);
-        }
+        let Some(peer) = target else {
+            return false;
+        };
+        let json = msg.to_json();
+        peer.tx.send(json).is_ok()
     }
 
     pub fn leave(&self, room_id: &str, role: Role) {

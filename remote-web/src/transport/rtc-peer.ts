@@ -32,6 +32,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
     if (intentionalClose) return;
     if (phase === "failed" || phase === "closed") return;
     setPhase("failed", reason);
+    stopRefreshTimer();
     opts.onClose?.(reason);
   };
 
@@ -44,6 +45,25 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
   const pendingIce: RTCIceCandidateInit[] = [];
   let remoteDescSet = false;
 
+  // TURN REST 临时凭证有过期时间（常见 1h），长连接不刷新中途会悄悄过期，
+  // 下次 ICE restart/重建时被拒——是"偶发需要手动开关才能恢复"的一个已知诱因。
+  // 每 10 分钟续一份，远小于常见 TTL。
+  const REFRESH_ICE_EVERY_MS = 10 * 60 * 1000;
+  let refreshTimer: number | null = null;
+  function startRefreshTimer() {
+    stopRefreshTimer();
+    refreshTimer = window.setInterval(() => {
+      if (intentionalClose) return;
+      signal.send({ op: "refresh_ice" });
+    }, REFRESH_ICE_EVERY_MS);
+  }
+  function stopRefreshTimer() {
+    if (refreshTimer !== null) {
+      window.clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+
   const signal = connectSignaling(opts.signalUrl, {
     onOpen() {
       signal.send({
@@ -52,6 +72,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
         room: opts.room,
         secret: opts.secret,
       });
+      startRefreshTimer();
     },
     onMessage(msg) {
       handleSignal(msg).catch((e) => {
@@ -74,6 +95,17 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
       case "hello_ok": {
         iceServers = iceServersFromHello(msg);
         ensurePc();
+        break;
+      }
+      case "ice_servers": {
+        // 只换缓存给以后的 restartIce()/新 pc 用；正在跑的连接不用动，
+        // RTCPeerConnection.setConfiguration 对已协商完成的传输不会重新拨号。
+        iceServers = iceServersFromHello(msg);
+        try {
+          pc?.setConfiguration({ iceServers });
+        } catch {
+          /* 部分浏览器在特定状态下拒绝 setConfiguration，忽略即可，下次 restart 时新 pc 仍会带上新值 */
+        }
         break;
       }
       case "peer_joined": {
@@ -371,6 +403,7 @@ export async function connectRtc(opts: RtcConnectOptions): Promise<RtcSession> {
   function close() {
     intentionalClose = true;
     setPhase("closed");
+    stopRefreshTimer();
     resetPc();
     signal.close();
   }

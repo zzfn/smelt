@@ -13,6 +13,7 @@ use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -147,6 +148,14 @@ impl HostPeer {
 
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             info!(?s, "pc state");
+            Box::pin(async {})
+        }));
+
+        // pc state 只反映"整体连上没连上"；某个用户连不上/中途断，几乎都得靠这条
+        // 才能分清是"打洞失败一直 checking/failed"还是"connected 后又断开"——
+        // 排查远程用户的场景时，这条经常是唯一能远程拿到的线索。
+        pc.on_ice_connection_state_change(Box::new(move |s: RTCIceConnectionState| {
+            info!(?s, "ice connection state");
             Box::pin(async {})
         }));
 
@@ -315,6 +324,7 @@ fn wire_dc(cfg: Arc<Config>, d: Arc<RTCDataChannel>) {
     }));
 
     d.on_close(Box::new(move || {
+        info!("dc closed");
         let sess = Arc::clone(&sess_close);
         Box::pin(async move {
             dc::on_dc_closed(sess).await;

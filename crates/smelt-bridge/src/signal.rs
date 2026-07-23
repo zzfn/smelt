@@ -1,7 +1,7 @@
 //! 建房 + WebSocket 信令（host）。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -60,6 +60,11 @@ enum WireIn {
     HelloOk {
         ice_servers: Vec<IceServerJson>,
     },
+    /// 回应我们主动发的 `refresh_ice`：只换缓存，不碰正在用的 PeerConnection
+    /// ——它已经用旧凭证连上了，新凭证只用于之后的 ICE restart / 重建。
+    IceServers {
+        ice_servers: Vec<IceServerJson>,
+    },
     PeerJoined {
         role: String,
     },
@@ -110,18 +115,45 @@ pub async fn run_host(cfg: Arc<Config>, room: String, secret: String) -> Result<
     // stream.next() 上：进程活着但已经聋了，房间也没人清理，症状是"看起来在跑，
     // 但手机怎么连都没反应"。用固定间隔发 ping，超过一个窗口收不到任何数据（含
     // 服务器的 pong/relay）就判定连接已死，返回 Err 让上层重连。
+    //
+    // 注意：判定"空闲"必须只看真实收到的消息，不能被我们自己发 ping 这件事
+    // 重置——之前的实现是每轮循环现建一个 `timeout(IDLE_TIMEOUT, stream.next())`，
+    // ping 分支每 20s 触发一次 `continue`，PING_EVERY < IDLE_TIMEOUT 导致每次
+    // continue 都会在下一轮里重新起一个全新的 50s 窗口，等于这个超时永远没机会
+    // 走到头——用 `last_activity` 独立计时，只有真正收到数据才推进它。
     const PING_EVERY: Duration = Duration::from_secs(20);
     const IDLE_TIMEOUT: Duration = Duration::from_secs(50);
     let mut ping_tick = tokio::time::interval(PING_EVERY);
     ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // TURN REST 临时凭证有过期时间（默认与房间 TTL 一致，常见 1h）；长连接不刷新
+    // 就会在会话中途悄悄过期，ICE restart/重建时被拒。每 10 分钟换一份新的缓存，
+    // 远小于常见 TTL，留足安全边际，且只换缓存不碰已建立的连接。
+    const REFRESH_ICE_EVERY: Duration = Duration::from_secs(600);
+    let mut refresh_tick = tokio::time::interval(REFRESH_ICE_EVERY);
+    refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    refresh_tick.tick().await; // 第一下立即触发，跳过
+
+    let mut last_activity = Instant::now();
+
     loop {
+        let remaining = IDLE_TIMEOUT.saturating_sub(last_activity.elapsed());
+        if remaining.is_zero() {
+            bail!(
+                "signaling idle timeout（{}s 没收到任何消息，判定连接已死）",
+                IDLE_TIMEOUT.as_secs()
+            );
+        }
         let next = tokio::select! {
             _ = ping_tick.tick() => {
                 let _ = out_tx.send(r#"{"op":"ping"}"#.into());
                 continue;
             }
-            r = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => r,
+            _ = refresh_tick.tick() => {
+                let _ = out_tx.send(r#"{"op":"refresh_ice"}"#.into());
+                continue;
+            }
+            r = tokio::time::timeout(remaining, stream.next()) => r,
         };
         let msg = match next {
             Ok(Some(msg)) => msg,
@@ -131,6 +163,7 @@ pub async fn run_host(cfg: Arc<Config>, room: String, secret: String) -> Result<
                 IDLE_TIMEOUT.as_secs()
             ),
         };
+        last_activity = Instant::now();
         let msg = msg.context("ws read")?;
         let text = match msg {
             Message::Text(t) => t.to_string(),
@@ -149,6 +182,10 @@ pub async fn run_host(cfg: Arc<Config>, room: String, secret: String) -> Result<
             WireIn::HelloOk { ice_servers: ice } => {
                 ice_servers = ice;
                 info!(n = ice_servers.len(), "hello_ok");
+            }
+            WireIn::IceServers { ice_servers: ice } => {
+                ice_servers = ice;
+                info!(n = ice_servers.len(), "ice servers refreshed");
             }
             WireIn::PeerJoined { role } => {
                 info!(%role, "peer_joined");

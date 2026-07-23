@@ -5,7 +5,7 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::protocol::{ClientMsg, Role, ServerMsg};
 use crate::state::{AppState, Outbound};
@@ -63,7 +63,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let parsed: ClientMsg = match serde_json::from_str(&text) {
             Ok(m) => m,
             Err(e) => {
-                warn!(%e, "bad signaling json");
+                // text 里可能带 secret，不整条打；len 足够定位是不是被截断/编码坏了
+                warn!(%e, len = text.len(), "bad signaling json");
                 send_json(&out_tx, ServerMsg::err("bad json"));
                 continue;
             }
@@ -72,6 +73,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         match parsed {
             ClientMsg::Hello { role, room, secret } => {
                 if joined.is_some() {
+                    warn!(room = %room, role = role.as_str(), "hello rejected: already joined on this connection");
                     send_json(&out_tx, ServerMsg::err("already joined"));
                     continue;
                 }
@@ -99,9 +101,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 &ServerMsg::PeerJoined { role },
                             );
                         }
-                        debug!(room = %room, role = role.as_str(), "hello ok");
+                        // 特意用 info：这是排查"某个用户连不上"最关键的一条——出问题时
+                        // 先看这条有没有出现，没出现说明 hello 压根没到，问题在更早的
+                        // 网络/DNS/证书层；出现了但后面没有 signal 转发，问题在双方
+                        // WebRTC 协商本身。
+                        info!(room = %room, role = role.as_str(), peer_online = ok.peer_online, "hello ok");
                     }
                     Err(e) => {
+                        // 同样特意用 info：这条直接说明是"密钥不对/房间过期/房间不存在"
+                        // 里的哪一种，比让用户口头描述"连不上"准得多。
+                        info!(room = %room, role = role.as_str(), reason = e.msg(), "hello rejected");
                         send_json(&out_tx, ServerMsg::err(e.msg()));
                     }
                 }
@@ -115,10 +124,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     send_json(&out_tx, ServerMsg::err("from role mismatch"));
                     continue;
                 }
-                state.relay_to_other(
-                    room,
-                    role,
-                    &ServerMsg::Signal { from, payload },
+                let kind = payload.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                if !state.relay_to_other(room, role, &ServerMsg::Signal { from, payload: payload.clone() }) {
+                    // 对端不在线：offer/answer/ice 全部有去无回，客户端会一直等，
+                    // 表现就是"卡在正在建立跨网连接"。这条能直接告诉你是不是这个原因。
+                    info!(room = %room, role = role.as_str(), kind, "signal relay dropped: peer not online");
+                }
+            }
+            ClientMsg::RefreshIce => {
+                if joined.is_none() {
+                    send_json(&out_tx, ServerMsg::err("not joined"));
+                    continue;
+                }
+                send_json(
+                    &out_tx,
+                    ServerMsg::IceServers {
+                        ice_servers: state.ice_servers_for_hello(),
+                    },
                 );
             }
             ClientMsg::Ping => {
@@ -132,7 +154,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     if let Some((room, role)) = joined {
         state.leave(&room, role);
-        debug!(room = %room, role = role.as_str(), "ws closed, left room");
+        info!(room = %room, role = role.as_str(), "ws closed, left room");
     }
     drop(out_tx);
     drop(ctrl_tx);
