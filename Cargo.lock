@@ -7218,7 +7218,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smelt"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "agent-client-protocol",
  "alacritty_terminal",
@@ -7254,7 +7254,7 @@ dependencies = [
 
 [[package]]
 name = "smelt-bridge"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "base64",
@@ -7274,7 +7274,7 @@ dependencies = [
 
 [[package]]
 name = "smelt-core"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -7289,7 +7289,7 @@ dependencies = [
 
 [[package]]
 name = "smelt-signal"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "axum",
  "base64",
@@ -7309,7 +7309,7 @@ dependencies = [
 
 [[package]]
 name = "smeltd"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
