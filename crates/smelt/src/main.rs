@@ -1308,6 +1308,10 @@ struct Workspace {
     /// 每个 root 常驻的文件监听器（root → watcher）。watcher 必须存活才会继续收事件，
     /// 故存在 Workspace 里跟应用同生命周期；只建一次，见 ensure_git_watch。
     git_watchers: HashMap<String, RecommendedWatcher>,
+    /// 每个 root 上次「进 Git 页自动 fetch」的时刻：进 Git 页会主动 fetch 一次刷新
+    /// ahead/behind，但 render 每帧都满足「在 Git 页」，靠这个时间戳去抖（同一 root
+    /// 60s 内不重复自动 fetch），避免每帧狂发网络请求。
+    git_autofetch_at: HashMap<String, Instant>,
     /// 热力图缓存（root → (取得时刻, 数据)）：`git log` 扫 90 天历史比 status 更慢，
     /// 同样绝不在 render 里同步跑，后台算完缓存，render 只读。
     hotspot_data: HashMap<String, (Instant, Rc<Vec<hotspot::HotspotEntry>>)>,
@@ -1602,6 +1606,7 @@ impl Workspace {
             branches_inflight: HashSet::new(),
             git_dirty: Arc::new(Mutex::new(HashSet::new())),
             git_watchers: HashMap::new(),
+            git_autofetch_at: HashMap::new(),
             hotspot_data: HashMap::new(),
             hotspot_inflight: HashSet::new(),
             session_list: HashMap::new(),
@@ -4865,6 +4870,15 @@ impl Render for Workspace {
             .detach();
         }
 
+        // 侧栏 GIT 角标全页面实时：保证当前项目的文件监听已建立。角标常驻显示，但
+        // git_status 数据原本只在 Files/Git 页 render 时刷新，切到终端等页面就冻结。
+        // ensure_git_watch 建监听后，仓库一有改动就主动重拉 git_status（见其 250ms 检查
+        // 循环），角标在任何页面都即时跟手——事件驱动，文件不变时零开销，不搞轮询。
+        // 内部按 root 去重，每帧调只是一次 HashMap 查找。
+        if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
+            self.ensure_git_watch(root, cx);
+        }
+
         // 组件 toast：app 前台但没在看的 pane 有新通知时弹一条（右上角浮层，5s
         // 自动消失）。完全切到别的 app 时不弹 toast，走 terminal_view.rs 里的系统
         // 通知；正在看的那个 pane 直接吃掉待发消息，不弹——你自己看得见。
@@ -4928,6 +4942,18 @@ impl Render for Workspace {
             || (self.inspector_open && self.inspector_tab == inspector::InspectorTab::Git)
         {
             if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
+                // 进 Git 页主动 fetch 一次，让 ahead/behind 反映远端最新。render 每帧都会
+                // 进这个分支，靠 git_autofetch_at 去抖——同一仓库 60s 内只自动 fetch 一次，
+                // 避免每帧狂发网络请求。fetch 成功后 run_git_op 会 invalidate_git_status，
+                // 顺带把 ahead/behind 重算出来。
+                let fetch_due = self
+                    .git_autofetch_at
+                    .get(&root)
+                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
+                if fetch_due {
+                    self.git_autofetch_at.insert(root.clone(), Instant::now());
+                    self.git_fetch_silent(cx);
+                }
                 self.ensure_git_watch(root.clone(), cx);
                 self.ensure_git_status(root.clone(), cx);
                 self.ensure_branches(root, cx);

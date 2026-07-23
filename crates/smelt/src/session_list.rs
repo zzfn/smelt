@@ -24,6 +24,10 @@ use crate::{
     SessionKind, Workspace,
 };
 
+/// 会话行 hover group 名：行 `.group()` + 右端操作条 `.group_hover()` 配对，
+/// 鼠标移到行才显形「拖拽 / 关闭」；选中行则常显。跟 inspector 任务卡片同一套路。
+const SESS_ROW_GROUP: &str = "sess-row-hover";
+
 /// 会话行副标题里的状态文案（与菜单栏下拉同一套口径）。
 fn status_text(status: AgentStatus) -> &'static str {
     match status {
@@ -457,6 +461,10 @@ impl Workspace {
                 let e_rename = this.clone();
                 let e_drop = this.clone();
                 let drag_title: SharedString = title.clone().into();
+                // 分屏组（无父行）要复用「拖拽排序 / 关闭整会话」，但这俩会被下面的
+                // 父行 on_drag / close 按钮吃掉所有权，先给分屏分支留一份克隆。
+                let e_close_grp = this.clone();
+                let drag_title_grp = drag_title.clone();
 
                 // 类型标识：agent 紫圆点 / 终端绿方块。
                 // 会话标记一律圆点（项目是方块），颜色区分类型：紫 = agent
@@ -502,6 +510,7 @@ impl Workspace {
 
                 let row = div()
                     .id(("sess-row", ix))
+                    .group(SESS_ROW_GROUP)
                     .relative()
                     .flex()
                     .items_center()
@@ -511,16 +520,28 @@ impl Workspace {
                     .py(px(2.))
                     .rounded(px(6.))
                     .cursor_pointer()
+                    // Discord 选中态：微亮底 + 左侧白色圆角竖条(pill)，不再用 blurple
+                    // 描边。常态透明、hover 微亮；pill 只在选中时出（下面 absolute 子元素）。
                     .map(|d| {
                         if is_active {
                             d.bg(rgb(ui_theme::bg_selected()))
-                                .border_1()
-                                .border_color(rgb(ui_theme::border_selected()))
                         } else {
-                            d.border_1()
-                                .border_color(gpui::transparent_black())
-                                .hover(|d| d.bg(rgb(ui_theme::bg_hover())))
+                            d.hover(|d| d.bg(rgb(ui_theme::bg_hover())))
                         }
+                    })
+                    // 选中 pill：贴行左缘的白色圆角竖条，比行矮、上下 inset 留边居中。
+                    // 深色近白 / 浅色近黑，text_bright 天然满足。
+                    .when(is_active, |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .left(px(-6.))
+                                .top(px(4.))
+                                .bottom(px(4.))
+                                .w(px(3.))
+                                .rounded_full()
+                                .bg(rgb(ui_theme::text_bright())),
+                        )
                     })
                     .child(div().flex_shrink_0().child(type_dot))
                     .child(
@@ -528,7 +549,12 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .text_size(px(14.))
-                            .text_color(rgb(ui_theme::text_mid()))
+                            // 选中行标题提亮到 bright（Discord 选中频道名变白）。
+                            .text_color(rgb(if is_active {
+                                ui_theme::text_bright()
+                            } else {
+                                ui_theme::text_mid()
+                            }))
                             .truncate()
                             .child(title.clone()),
                     )
@@ -558,11 +584,14 @@ impl Workspace {
                             .bg(ui_theme::session_dot_color(status)),
                     )
                     .child(
-                        // 右端：拖拽手柄（大热区、无图标）+ 关闭按钮。
+                        // 右端：拖拽手柄 + 关闭。常态透明、hover 或该行选中才显形
+                        //（Discord 频道行那样常态极简、操作藏起来）。group 名见行 `.group()`。
                         div()
                             .flex_shrink_0()
                             .flex()
                             .items_center()
+                            .when(!is_active, |d| d.opacity(0.0))
+                            .group_hover(SESS_ROW_GROUP, |s| s.opacity(1.0))
                             .child(
                                 div()
                                     .id(("sess-drag", ix))
@@ -660,27 +689,44 @@ impl Workspace {
                         .when(hint_before, |row| row.child(indicator(("sess-ind-b", ix), true)))
                         .when(hint_after, |row| row.child(indicator(("sess-ind-a", ix), false)))
                     });
-                group_body = group_body.child(row);
-
-                // 分屏子行：>1 个 pane 时一 pane 一行（再缩进一级），点击切到该 pane。
-                if self.sessions[ix].pane_count() > 1 {
+                // 单 pane 会话：整会话就是这一行（上面构建的 row）。
+                // 分屏会话：不显示会话名父行；把同一 tab 的多个 pane 用内层括线
+                // 圈在一起平铺，会话级操作（拖拽排序 / 关闭整会话 / drop 提示）
+                // 挂到 pane 组容器上，pane 行本身只管「切到该 pane」。
+                if self.sessions[ix].pane_count() <= 1 {
+                    group_body = group_body.child(row);
+                } else {
                     let leaves = self.sessions[ix].term_leaves();
                     let active_pane_id = self.sessions[ix].anchor_id();
+                    // 组内重名的 pane 标题补序号，避免「smelt 里又一个 smelt」。
+                    let raw_titles: Vec<String> =
+                        leaves.iter().map(|v| pane_title(v, cx).to_string()).collect();
+
+                    // 内层括线：比项目引导线再内缩一档，左侧圆角竖线把同一 tab 的
+                    // 几个 pane 圈成一组（视觉上 ≈ ╭…╰ 括号）。
+                    // pane 行跟普通会话行同缩进、同字号，不再内缩变小；「成组」只由
+                    // 左侧一条括线表达（见下方 pane_group 的 absolute 竖线）。
+                    let mut pane_rows = div().flex().flex_col().gap(px(1.));
                     for (lix, view) in leaves.into_iter().enumerate() {
-                        let p_title = pane_title(&view, cx);
+                        let base = raw_titles[lix].clone();
+                        let dup = raw_titles.iter().filter(|t| **t == base).count() > 1;
+                        let p_title = if dup {
+                            format!("{} · {}", base, lix + 1)
+                        } else {
+                            base
+                        };
                         let p_status = pane_status(&view, cx);
                         let is_current_view = ix == active && view.entity_id() == active_pane_id;
                         let e_pane_act = this.clone();
                         let e_pane_menu = this.clone();
                         let pane = view.clone();
                         let menu_pane = view.clone();
-                        group_body = group_body.child(
+                        pane_rows = pane_rows.child(
                             div()
                                 .id(("sess-pane-row", ix * 100 + lix))
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .ml(px(30.))
                                 .px_2()
                                 .py(px(2.))
                                 .rounded(px(6.))
@@ -695,7 +741,7 @@ impl Workspace {
                                 .child(
                                     div()
                                         .flex_shrink_0()
-                                        .size(px(5.))
+                                        .size(px(6.))
                                         .rounded_full()
                                         .bg(ui_theme::session_dot_color(p_status)),
                                 )
@@ -703,8 +749,13 @@ impl Workspace {
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(ui_theme::text_mid()))
+                                        .text_size(px(14.))
+                                        // 当前 pane 提亮，其余用中灰——和会话行选中态同口径。
+                                        .text_color(rgb(if is_current_view {
+                                            ui_theme::text_bright()
+                                        } else {
+                                            ui_theme::text_mid()
+                                        }))
                                         .truncate()
                                         .child(p_title),
                                 )
@@ -738,6 +789,121 @@ impl Workspace {
                                 }),
                         );
                     }
+
+                    // 组容器：relative + group 名，让操作条 hover 才显形；承载 drop 层。
+                    let mut pane_group = div()
+                        .id(("sess-pane-group", ix))
+                        .group(SESS_ROW_GROUP)
+                        .relative()
+                        // 成组的唯一标记：贴左缘一条圆角竖线，把这几个 pane 圈在一起，
+                        // 不挤占内容宽度（pane 行仍与普通会话行左对齐、同字号）。
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(1.))
+                                .top(px(2.))
+                                .bottom(px(2.))
+                                .w(px(9.))
+                                // 圆弧括号 ╭…╰：只描左/上/下三条边 + 整体圆角，右边开口，
+                                // 顶底两个圆角拐角把这组 pane「抱」起来（不挤占内容宽度）。
+                                .border_l_1()
+                                .border_t_1()
+                                .border_b_1()
+                                .border_color(rgb(ui_theme::border_loud()))
+                                .rounded(px(7.)),
+                        )
+                        .child(pane_rows);
+
+                    // 会话级操作条：拖拽手柄（整会话排序）+ 关闭整会话，贴组右上角。
+                    let ops = div()
+                        .absolute()
+                        .top(px(2.))
+                        .right(px(6.))
+                        .flex()
+                        .items_center()
+                        .opacity(0.0)
+                        .group_hover(SESS_ROW_GROUP, |s| s.opacity(1.0))
+                        .child(
+                            div()
+                                .id(("sess-grp-drag", ix))
+                                .w(px(14.))
+                                .h(px(18.))
+                                .cursor_grab()
+                                .on_drag(
+                                    SessionDrag { id: entity_id, title: drag_title_grp },
+                                    {
+                                        let e_clear = e_drop.clone();
+                                        move |drag, _, _, cx| {
+                                            e_clear.update(cx, |ws, _| ws.sess_drop_hint = None);
+                                            cx.new(|_| drag.clone())
+                                        }
+                                    },
+                                ),
+                        )
+                        .children(can_close.then(|| {
+                            Button::new(("close-session-grp", ix))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::CircleX)
+                                .on_click(move |_ev, _w, cx| {
+                                    cx.stop_propagation();
+                                    e_close_grp.update(cx, |ws, cx| ws.close_session(ix, cx));
+                                })
+                        }));
+                    pane_group = pane_group.child(ops);
+
+                    // drop 接收层：拖别的会话到这组前/后（沿用父行那套，键在会话 entity_id）。
+                    if dragging {
+                        let e_before = e_drop.clone();
+                        let e_after = e_drop.clone();
+                        pane_group = pane_group.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .child(
+                                    div()
+                                        .id(("sess-grp-drop-before", ix))
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h_1_2()
+                                        .on_drag_move(make_hint(true, e_before.clone()))
+                                        .on_drop(move |drag: &SessionDrag, _window, cx| {
+                                            let dragged = drag.id;
+                                            e_before.update(cx, |ws, cx| {
+                                                ws.sess_drop_hint = None;
+                                                ws.move_session_near(dragged, entity_id, true, cx)
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id(("sess-grp-drop-after", ix))
+                                        .absolute()
+                                        .bottom_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h_1_2()
+                                        .on_drag_move(make_hint(false, e_after.clone()))
+                                        .on_drop(move |drag: &SessionDrag, _window, cx| {
+                                            let dragged = drag.id;
+                                            e_after.update(cx, |ws, cx| {
+                                                ws.sess_drop_hint = None;
+                                                ws.move_session_near(dragged, entity_id, false, cx)
+                                            });
+                                        }),
+                                ),
+                        );
+                    }
+                    if hint_before {
+                        pane_group = pane_group.child(indicator(("sess-ind-b", ix), true));
+                    }
+                    if hint_after {
+                        pane_group = pane_group.child(indicator(("sess-ind-a", ix), false));
+                    }
+
+                    group_body = group_body.child(pane_group);
                 }
             }
             rows = rows.child(group_body);

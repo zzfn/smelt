@@ -2229,6 +2229,9 @@ impl Workspace {
             return;
         }
         self.git_watchers.insert(root.clone(), watcher);
+        // 立刻拉一次初值：之后纯靠文件事件驱动（下面 250ms 循环），但首帧得先有数据，
+        // 否则文件一直不变时侧栏 GIT 角标永远出不来。
+        self.ensure_git_status(root.clone(), cx);
 
         let dirty = self.git_dirty.clone();
         cx.spawn(async move |this, cx| loop {
@@ -2237,10 +2240,12 @@ impl Workspace {
             if !hit {
                 continue;
             }
-            // 只标脏 + 唤醒重绘：真正的重新拉取仍交给 ensure_git_status（render 里
-            // 每帧都会调），这里不用重复实现一遍 git status 调用。
+            // 文件变了：标脏并主动重拉 git_status，角标 / Git 页在任何页面都即时刷新，
+            // 不再依赖「当前正停在 Files/Git 页、render 每帧才调 ensure_git_status」。
+            // ensure_git_status 内部有 inflight 去重，重复唤醒不会叠并发。
             let r = this.update(cx, |this, cx| {
                 this.invalidate_git_status(&root);
+                this.ensure_git_status(root.clone(), cx);
                 cx.notify();
             });
             if r.is_err() {
@@ -2995,8 +3000,9 @@ impl Workspace {
     /// 后台跑一条 git 操作，回来刷新状态 / 报错。fetch·pull·stash 共用这个骨架
     /// （照 push_only）。`name` 是进行中显示的操作名（「拉取」等）；`op` 在后台
     /// 线程里执行，返回 `Result<(),String>`；`reload_log` = 操作会改历史（pull）
-    /// 时顺带重拉 log。
-    fn run_git_op<F>(&mut self, name: &'static str, reload_log: bool, op: F, cx: &mut Context<Self>)
+    /// 时顺带重拉 log；`silent` = 失败不弹顶部错误通知（自动 fetch 用，避免离线/
+    /// 无凭据时反复刷屏）。
+    fn run_git_op<F>(&mut self, name: &'static str, reload_log: bool, silent: bool, op: F, cx: &mut Context<Self>)
     where
         F: FnOnce(&str) -> Result<(), String> + Send + 'static,
     {
@@ -3019,7 +3025,13 @@ impl Workspace {
                             this.reload_git_log(root.clone(), cx);
                         }
                     }
-                    Err(err) => this.background_error = Some(err),
+                    // silent（自动 fetch）：失败不弹顶部错误通知，避免离线 / 无凭据时
+                    // 每次进 Git 页刷屏；只有手动操作失败才提示。
+                    Err(err) => {
+                        if !silent {
+                            this.background_error = Some(err);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -3027,24 +3039,29 @@ impl Workspace {
         .detach();
     }
 
-    /// `git fetch --all --prune`：更新远端追踪，刷新 ahead/behind。
+    /// `git fetch --all --prune`：更新远端追踪，刷新 ahead/behind。手动触发，失败弹错误。
     pub fn git_fetch(&mut self, cx: &mut Context<Self>) {
-        self.run_git_op("获取", false, fetch_remote, cx);
+        self.run_git_op("获取", false, false, fetch_remote, cx);
+    }
+
+    /// 同 git_fetch，但失败静默：进 Git 页自动 fetch 用，离线 / 无凭据时不刷屏报错。
+    pub fn git_fetch_silent(&mut self, cx: &mut Context<Self>) {
+        self.run_git_op("获取", false, true, fetch_remote, cx);
     }
 
     /// `git pull --rebase`：拉取并 rebase 本地提交（历史变了 → 重拉 log）。
     pub fn git_pull(&mut self, cx: &mut Context<Self>) {
-        self.run_git_op("拉取", true, pull_rebase, cx);
+        self.run_git_op("拉取", true, false, pull_rebase, cx);
     }
 
     /// `git stash push -u`：暂存全部改动（含未跟踪）。
     pub fn git_stash_push(&mut self, cx: &mut Context<Self>) {
-        self.run_git_op("暂存", false, stash_push, cx);
+        self.run_git_op("暂存", false, false, stash_push, cx);
     }
 
     /// `git stash pop`：弹出最近一条 stash。
     pub fn git_stash_pop(&mut self, cx: &mut Context<Self>) {
-        self.run_git_op("恢复暂存", false, stash_pop, cx);
+        self.run_git_op("恢复暂存", false, false, stash_pop, cx);
     }
 
     /// 点「丢弃全部改动」：先弹确认，不直接动文件（照 start_discard_file）。
