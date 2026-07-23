@@ -1,6 +1,7 @@
 //! 建房 + WebSocket 信令（host）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -104,7 +105,32 @@ pub async fn run_host(cfg: Arc<Config>, room: String, secret: String) -> Result<
     let mut ice_servers: Vec<IceServerJson> = Vec::new();
     let mut peer: Option<rtc::HostPeer> = None;
 
-    while let Some(msg) = stream.next().await {
+    // 这条信令 WS 常年空闲（等对端发 offer），中间可能经过代理/NAT；连接被中间设备
+    // 悄悄丢弃时两边都收不到任何 FIN/RST——不主动探活的话，下面这个循环会永远卡在
+    // stream.next() 上：进程活着但已经聋了，房间也没人清理，症状是"看起来在跑，
+    // 但手机怎么连都没反应"。用固定间隔发 ping，超过一个窗口收不到任何数据（含
+    // 服务器的 pong/relay）就判定连接已死，返回 Err 让上层重连。
+    const PING_EVERY: Duration = Duration::from_secs(20);
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(50);
+    let mut ping_tick = tokio::time::interval(PING_EVERY);
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let next = tokio::select! {
+            _ = ping_tick.tick() => {
+                let _ = out_tx.send(r#"{"op":"ping"}"#.into());
+                continue;
+            }
+            r = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => r,
+        };
+        let msg = match next {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break, // 对端正常关闭
+            Err(_) => bail!(
+                "signaling idle timeout（{}s 没收到任何消息，判定连接已死）",
+                IDLE_TIMEOUT.as_secs()
+            ),
+        };
         let msg = msg.context("ws read")?;
         let text = match msg {
             Message::Text(t) => t.to_string(),

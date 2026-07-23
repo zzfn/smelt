@@ -14,9 +14,10 @@ mod signal;
 
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -158,9 +159,31 @@ async fn async_main() -> Result<()> {
     println!("==========================================");
     println!();
 
-    // 2) 信令 + RTC（阻塞直到结束）
-    signal::run_host(cfg, room_id, secret).await?;
-    Ok(())
+    // 2) 信令 + RTC（阻塞直到结束）。run_host 探测到信令 WS 空闲太久没收到任何
+    // 消息（见 signal.rs 的 idle timeout）会返回 Err——多数情况是网络抖动/中间
+    // 代理悄悄丢连接，不是房间本身失效，原地用同一个 room/secret 重连大概率
+    // 能恢复，用户不用重新扫码。只有服务器明确说房间不存在/过期才是真的没救
+    // 了，直接退出让上层（GUI）知道需要重新走一遍分享流程。
+    const MAX_RECONNECT_ATTEMPTS: u32 = 8;
+    let mut attempt: u32 = 0;
+    loop {
+        match signal::run_host(cfg.clone(), room_id.clone(), secret.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                let fatal = msg.contains("room not found")
+                    || msg.contains("room expired")
+                    || msg.contains("invalid secret");
+                attempt += 1;
+                if fatal || attempt > MAX_RECONNECT_ATTEMPTS {
+                    return Err(e);
+                }
+                let backoff = Duration::from_secs(2u64.saturating_pow(attempt.min(5)).min(30));
+                warn!(attempt, %e, backoff_secs = backoff.as_secs(), "signaling lost, reconnecting");
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
 }
 
 fn build_share_url(cfg: &Config, room: &str, secret: &str) -> String {
