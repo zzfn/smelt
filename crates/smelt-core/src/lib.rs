@@ -6,8 +6,13 @@
 
 pub mod acp_chat;
 pub mod acp_conn;
+pub mod agent_kind;
+pub mod agent_status;
 pub mod block_on;
 pub mod claude_paths;
+pub mod daemon_state;
+pub mod font_config;
+pub mod json_store;
 pub mod login_env;
 pub mod osc;
 pub mod permission_menu;

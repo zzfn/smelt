@@ -1,0 +1,22 @@
+# 共享 GPUI UI 基建：主 GUI 和未来的 acp-view 渲染层都要用的一批组件/工具
+# （语义色板、markdown+mermaid 渲染、@/ 补全、ACP agent UI 偏好数据模型）。
+# 允许引 GPUI（跟 smelt-core 的边界不同）——这里不是 GUI 无关的纯逻辑，而是
+# 「不属于哪个具体页面、被多处复用」的 UI 层基建。
+[package]
+name = "smelt-ui"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+smelt-core = { path = "../smelt-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", features = ["tree-sitter-languages"] }
+# mermaid 代码块画图，见 markdown_mermaid.rs 文件头注释；版本锁定理由同处。
+rusty-mermaid = { version = "=0.2.0", features = ["svg"] }
+sha2 = "0.10"

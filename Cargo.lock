@@ -7246,9 +7246,26 @@ dependencies = [
  "serde_json",
  "sha2",
  "similar",
+ "smelt-acp-view",
  "smelt-core",
+ "smelt-ui",
  "smol",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "smelt-acp-view"
+version = "0.6.3"
+dependencies = [
+ "agent-client-protocol",
+ "base64",
+ "chrono",
+ "gpui",
+ "gpui-component",
+ "smelt-core",
+ "smelt-ui",
+ "smol",
  "uuid",
 ]
 
@@ -7307,6 +7324,20 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "smelt-ui"
+version = "0.6.3"
+dependencies = [
+ "dirs 5.0.1",
+ "gpui",
+ "gpui-component",
+ "rusty-mermaid",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smelt-core",
 ]
 
 [[package]]

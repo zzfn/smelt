@@ -7,8 +7,16 @@
 
 // ACP 连接层已经搬进 smelt_core::acp_conn（给 smeltd 未来托管 ACP 会话铺路），
 // 这里不再 mod acp;，用的地方直接引 smelt_core::acp_conn。
-mod acp_completion;
-mod acp_view;
+//
+// acp_completion / acp_view / markdown_mermaid / ui_theme / json_store 同理都已
+// 搬出主 crate（acp_view.rs 独立成 smelt-acp-view，其余几个是它和主 GUI 共用的
+// UI 基建，搬进 smelt-ui / smelt-core，见各自文件头注释）。这里用同名 `use`
+// 重新导出成原来的模块路径，全库既有的 `crate::ui_theme::x()` 之类写法不用
+// 逐处改——跟 session_history.rs 对 claude_paths 的重导出是同一个套路。
+pub(crate) use smelt_core::json_store;
+pub(crate) use smelt_ui::markdown_mermaid;
+pub(crate) use smelt_ui::ui_theme;
+pub(crate) use smelt_acp_view::acp_view;
 mod agent;
 mod claude_memory;
 mod dock;
@@ -18,8 +26,6 @@ mod git_log_view;
 mod git_panel;
 mod hotspot;
 mod inspector;
-mod json_store;
-mod markdown_mermaid;
 mod mem_usage;
 use smelt_core::osc;
 // 权限菜单解析：唯一真源，与 smeltd 共用 smelt-core 里的同一份（smeltd 解析后随
@@ -39,7 +45,6 @@ mod tasks;
 mod toast;
 mod terminal;
 mod terminal_view;
-mod ui_theme;
 mod updater;
 mod usage_stats;
 
@@ -231,36 +236,10 @@ enum GitTab {
     Log,
 }
 
-/// 会话里 agent 的状态（用于总览页状态徽章）。借鉴 codex 的 ThreadStatus 细分：
-/// 「需要处理」不再一锅烩，等审批和一般等待是不同等级的行动召唤。
-/// 排列顺序即优先级（值越小越靠前 / 越紧急）。
-#[derive(Clone, Copy, PartialEq)]
-enum AgentStatus {
-    /// Claude 等你批准操作（通知文本含 permission/权限等）→ 最高优先，红色。
-    WaitingApproval,
-    /// 其他需要处理：等输入 / 响铃 / 自定义通知 → 橙色。
-    NeedsAttention,
-    /// 标题以 Braille spinner 开头 → 运行中，蓝色。
-    Running,
-    /// 任务刚完成、你还没回应过 → 「有结果可看」，绿色。
-    Done,
-    /// 其余 → 空闲，灰色。
-    Idle,
-}
-
-impl AgentStatus {
-    /// 优先级序（越小越紧急），与声明序一致：排序、聚合（项目 rail 的组内
-    /// 最高优先级状态点）共用。
-    fn rank(self) -> u8 {
-        match self {
-            AgentStatus::WaitingApproval => 0,
-            AgentStatus::NeedsAttention => 1,
-            AgentStatus::Running => 2,
-            AgentStatus::Done => 3,
-            AgentStatus::Idle => 4,
-        }
-    }
-}
+// 会话里 agent 的状态（总览页状态徽章 / 侧栏状态点）：搬进 smelt-core（跟
+// ui_theme 共用同一份判断，见 agent_status.rs），这里重导出成原来的裸名字，
+// 全库既有的 `AgentStatus::x` 写法不用逐处改。
+pub(crate) use smelt_core::agent_status::AgentStatus;
 
 /// 总览页筛选：基于 AgentStatus / 状态通道，不猜 TUI。
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -272,21 +251,11 @@ enum OverviewFilter {
     Running,
 }
 
-/// 守护上报的会话状态镜像（全局单例，跨窗口共享）。key = smeltd session id
-/// （每个 pane 一个，见 TerminalView.session_id——不是每个 GUI Session 一个）。
-/// 由 main.rs 启动时那条常驻 subscribe 转发任务维护，`Session::status`/`pane_status`
-/// 读它；daemon 没有对应 id 的数据（老版本守护/还没收到第一条上报）就退化到 OSC 猜测。
-#[derive(Clone, Default)]
-struct DaemonStates(Arc<Mutex<HashMap<String, terminal::DaemonSessionState>>>);
-
-impl Global for DaemonStates {}
-
-/// 状态通道待弹出的应用内 Notification（subscribe 线程无 Window，render 时 drain）。
-#[derive(Clone, Default)]
-struct PendingAgentNotifs(Arc<Mutex<Vec<(String, String, bool)>>>);
-// (title, message, is_approval)
-
-impl Global for PendingAgentNotifs {}
+// DaemonStates（守护上报的会话状态镜像，全局单例）/ PendingAgentNotifs（状态
+// 通道待弹出的应用内 Notification）：ACP 视图独立成 smelt-acp-view 后要跨
+// crate 读写，搬进 smelt-ui（daemon_states_global.rs）共享，这里重导出成原来
+// 的裸名字。
+pub(crate) use smelt_ui::daemon_states_global::{DaemonStates, PendingAgentNotifs};
 
 /// 取某个 pane 对应的守护状态；没有全局单例（比如极早期尚未走到注册那一步）或
 /// 那个 session id 还没有数据都返回 None。

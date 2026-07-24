@@ -1,0 +1,21 @@
+# ACP 会话消息流视图：第二种会话类型的 GPUI 渲染层，独立成 crate 便于未来
+# smeltd 托管 ACP（连接层 smelt-core::acp_conn）之外单独演进/复用这层皮肤。
+[package]
+name = "smelt-acp-view"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+smelt-core = { path = "../smelt-core" }
+smelt-ui = { path = "../smelt-ui" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", features = ["tree-sitter-languages"] }
+agent-client-protocol = { version = "=1.3.0", features = ["unstable_elicitation"] }
+smol = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+# ACP 对话粘贴图片：协议要 base64 后的字节（见 PromptImage）。
+base64 = "0.22"

@@ -25,16 +25,16 @@ use smelt_core::acp_conn::{
     spawn_acp, AcpCommand, AcpEvent, AcpHandle, AcpLaunch, ElicitField, ElicitFieldKind,
     ElicitationResponder, ModelState, PermissionResponder, ReadyKind,
 };
-use crate::settings::AcpAgentKind;
-use crate::terminal::{DaemonPhase, DaemonSessionState};
-use crate::ui_theme;
+use smelt_core::agent_kind::AcpAgentKind;
+use smelt_core::daemon_state::{DaemonPhase, DaemonSessionState};
+use smelt_ui::ui_theme;
 
 /// 消息流数据模型（AcpEntry/ToolOutputPart/ToolKind/ToolCallStatus）与 diff/
 /// markdown 围栏这批纯逻辑现在都活在 `smelt_core::acp_chat`——不依赖 GPUI 也不
 /// 依赖 agent_client_protocol，未来 web/mobile 端渲染同一份对话时不用重新实现
 /// 一遍「怎么把协议事件变成可展示内容」。这里整段 re-export，文件里大量既有的
 /// 裸 `AcpEntry::...` 用法不用逐处改路径。
-pub(crate) use smelt_core::acp_chat::{
+pub use smelt_core::acp_chat::{
     diff_line_stats, diff_lines, is_interrupt_marker, strip_code_fence, AcpEntry, DiffLineTag,
     ToolCallStatus, ToolKind, ToolOutputPart,
 };
@@ -86,7 +86,7 @@ struct CompletionPopup {
     /// 触发 token 在输入框文本里的字节范围（含 `@`/`/`），接受候选时按它替换。
     start: usize,
     end: usize,
-    items: Vec<crate::acp_completion::Candidate>,
+    items: Vec<smelt_ui::acp_completion::Candidate>,
     selected: usize,
 }
 
@@ -274,7 +274,7 @@ impl AcpView {
         // 没生效」。
         // 取的是**本会话这个 agent** 那一条配置：多 agent 之后死拿 acp_cmd 会让
         // Copilot / Codex 会话一点「重新开始」就变成 Claude 会话。
-        if let Some(cfg) = cx.try_global::<crate::settings::AgentUiConfig>() {
+        if let Some(cfg) = cx.try_global::<smelt_ui::agent_ui_config::AgentUiConfig>() {
             self.cmd = cfg.acp_cmd_for(self.agent);
         }
         self.permission = None;
@@ -302,7 +302,7 @@ impl AcpView {
     /// ACP 有自己的相位机，不能经 DaemonStates 那套五态绕一圈拿——`Starting`
     /// 和 `Ended` 在映射里都会塌成「空闲」，于是「正在启动」的横幅底下顶着一个
     /// 「空闲」胶囊，自相矛盾。
-    pub(crate) fn phase_label(&self) -> (&'static str, u32) {
+    pub fn phase_label(&self) -> (&'static str, u32) {
         match &self.phase {
             AcpPhase::Starting => ("启动中", ui_theme::blue()),
             AcpPhase::Idle => ("空闲", ui_theme::text_faint()),
@@ -315,7 +315,7 @@ impl AcpView {
 
     /// 切到本会话时的自动续接：冷恢复占位（Ended + 有旧 session id）第一次被
     /// 激活就 restart，像终端一样「点开就是活的」。只触发一次，见字段注释。
-    pub(crate) fn maybe_auto_resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn maybe_auto_resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.auto_resume_pending {
             return;
         }
@@ -439,7 +439,7 @@ impl AcpView {
         let list = self
             .cwd
             .as_deref()
-            .map(crate::acp_completion::list_files)
+            .map(smelt_ui::acp_completion::list_files)
             .unwrap_or_else(|| std::rc::Rc::new(Vec::new()));
         self.file_cache = Some(list.clone());
         list
@@ -463,7 +463,7 @@ impl AcpView {
         if !text.is_char_boundary(cursor) {
             return;
         }
-        let Some(trigger) = crate::acp_completion::detect_trigger(&text[..cursor]) else {
+        let Some(trigger) = smelt_ui::acp_completion::detect_trigger(&text[..cursor]) else {
             if self.completion.is_some() {
                 self.completion = None;
                 cx.notify();
@@ -471,11 +471,11 @@ impl AcpView {
             return;
         };
         let files = match trigger.kind {
-            crate::acp_completion::Kind::At => self.file_list(),
-            crate::acp_completion::Kind::Slash => std::rc::Rc::new(Vec::new()),
+            smelt_ui::acp_completion::Kind::At => self.file_list(),
+            smelt_ui::acp_completion::Kind::Slash => std::rc::Rc::new(Vec::new()),
         };
         let items =
-            crate::acp_completion::candidates(&trigger, &files, &self.available_commands);
+            smelt_ui::acp_completion::candidates(&trigger, &files, &self.available_commands);
         self.completion = (!items.is_empty()).then(|| CompletionPopup {
             start: trigger.start,
             end: cursor,
@@ -571,7 +571,7 @@ impl AcpView {
 
     /// 把一段文本塞进输入框并聚焦（SKILLS 面板点一条 skill 用）。
     /// 不自动发送——skill 后面常还要补一句话，发不发由人定。
-    pub(crate) fn insert_prompt_text(
+    pub fn insert_prompt_text(
         &mut self,
         text: &str,
         window: &mut Window,
@@ -663,7 +663,7 @@ impl AcpView {
         if let Some(h) = self.handle.take() {
             let _ = h.cmd_tx.try_send(AcpCommand::Shutdown);
         }
-        if let Some(states) = cx.try_global::<crate::DaemonStates>() {
+        if let Some(states) = cx.try_global::<smelt_ui::daemon_states_global::DaemonStates>() {
             states.0.lock().unwrap().remove(&self.sid);
         }
     }
@@ -676,7 +676,7 @@ impl AcpView {
     /// 连接线程会被系统一起带走，根本没机会 Drop，子进程就变孤儿（真实教训：
     /// Copilot 这类 agent 的孤儿子进程还占着旧登录会话，下次「重新开始」新起
     /// 一个进程会撞上它，报出 Authentication required 这种看着不相关的错）。
-    pub(crate) fn take_handle_for_quit(&mut self) -> Option<AcpHandle> {
+    pub fn take_handle_for_quit(&mut self) -> Option<AcpHandle> {
         if let Some(h) = self.handle.as_ref() {
             let _ = h.cmd_tx.try_send(AcpCommand::Shutdown);
         }
@@ -822,11 +822,11 @@ impl AcpView {
                 self.phase = AcpPhase::AwaitingApproval;
                 // 应用内通知（镜像 main.rs 状态转发循环的推送；设置可关）。
                 let notify_on = cx
-                    .try_global::<crate::settings::AgentUiConfig>()
+                    .try_global::<smelt_ui::agent_ui_config::AgentUiConfig>()
                     .map(|c| c.notify_awaiting)
                     .unwrap_or(true);
                 if notify_on {
-                    if let Some(p) = cx.try_global::<crate::PendingAgentNotifs>() {
+                    if let Some(p) = cx.try_global::<smelt_ui::daemon_states_global::PendingAgentNotifs>() {
                         p.0.lock().unwrap().push(("等你批准".to_string(), question, true));
                     }
                 }
@@ -840,11 +840,11 @@ impl AcpView {
                 });
                 self.phase = AcpPhase::AwaitingChoice;
                 let notify_on = cx
-                    .try_global::<crate::settings::AgentUiConfig>()
+                    .try_global::<smelt_ui::agent_ui_config::AgentUiConfig>()
                     .map(|c| c.notify_awaiting)
                     .unwrap_or(true);
                 if notify_on {
-                    if let Some(p) = cx.try_global::<crate::PendingAgentNotifs>() {
+                    if let Some(p) = cx.try_global::<smelt_ui::daemon_states_global::PendingAgentNotifs>() {
                         p.0.lock().unwrap().push(("等你选择".to_string(), message, false));
                     }
                 }
@@ -879,7 +879,7 @@ impl AcpView {
     /// 把当前相位写进 DaemonStates 全局（key = `acp-` 前缀 sid）——Session::status、
     /// Dock 角标、菜单栏、总览全部经既有链路自动点亮。
     fn sync_daemon_state(&self, cx: &mut App) {
-        let Some(states) = cx.try_global::<crate::DaemonStates>() else { return };
+        let Some(states) = cx.try_global::<smelt_ui::daemon_states_global::DaemonStates>() else { return };
         let phase = match &self.phase {
             AcpPhase::Starting | AcpPhase::Idle => DaemonPhase::Idle,
             AcpPhase::Running => {
@@ -999,7 +999,7 @@ impl AcpView {
     }
 
     /// 当前模型的人类可读名（舞台头显示用）；None = agent 没上报过。
-    pub(crate) fn model_name(&self) -> Option<String> {
+    pub fn model_name(&self) -> Option<String> {
         self.model.as_ref().map(|m| m.current_name.clone())
     }
 
@@ -1386,7 +1386,7 @@ impl Render for AcpView {
                             .rounded_lg()
                             .bg(t.muted)
                             .text_sm()
-                            .child(crate::markdown_mermaid::markdown_view(
+                            .child(smelt_ui::markdown_mermaid::markdown_view(
                                 ("acp-user-md", i),
                                 text.clone(),
                             )),
@@ -1403,7 +1403,7 @@ impl Render for AcpView {
                             .pt(px(2.)) // 跟头像文字视觉基线对齐
                             .text_sm()
                             .when(*thought, |d| d.text_color(muted).italic())
-                            .child(crate::markdown_mermaid::markdown_view(("acp-md", i), text.clone())),
+                            .child(smelt_ui::markdown_mermaid::markdown_view(("acp-md", i), text.clone())),
                     )
                     .into_any_element(),
                 AcpEntry::ToolCall { id, title, kind, status, output } => {
@@ -2269,14 +2269,14 @@ fn render_diff_lines(
     for line in diff_lines(old, new) {
         let (bg, prefix, fg): (Option<gpui::Hsla>, &str, gpui::Hsla) = match line.tag {
             DiffLineTag::Removed => (
-                Some(crate::ui_theme::tint(crate::ui_theme::red(), 0x22).into()),
+                Some(smelt_ui::ui_theme::tint(smelt_ui::ui_theme::red(), 0x22).into()),
                 "-",
-                gpui::rgb(crate::ui_theme::red()).into(),
+                gpui::rgb(smelt_ui::ui_theme::red()).into(),
             ),
             DiffLineTag::Added => (
-                Some(crate::ui_theme::tint(crate::ui_theme::green(), 0x22).into()),
+                Some(smelt_ui::ui_theme::tint(smelt_ui::ui_theme::green(), 0x22).into()),
                 "+",
-                gpui::rgb(crate::ui_theme::diff_add_text()).into(),
+                gpui::rgb(smelt_ui::ui_theme::diff_add_text()).into(),
             ),
             DiffLineTag::Context => (None, " ", muted_color),
         };

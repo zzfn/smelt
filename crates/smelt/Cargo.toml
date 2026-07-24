@@ -11,6 +11,10 @@ workspace = true
 [dependencies]
 # GUI/守护共用的无 UI 逻辑（终端文本、OSC 扫描、权限菜单解析、远程网关）。
 smelt-core = { path = "../smelt-core" }
+# 共享 GPUI UI 基建（色板/markdown+mermaid/@补全/ACP agent UI 偏好数据模型）与
+# ACP 会话消息流渲染层，均已独立成 crate（见各自 Cargo.toml 文件头注释）。
+smelt-ui = { path = "../smelt-ui" }
+smelt-acp-view = { path = "../smelt-acp-view" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

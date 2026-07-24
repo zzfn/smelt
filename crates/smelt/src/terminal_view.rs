@@ -27,29 +27,9 @@ fn link_fg() -> u32 {
     if terminal::is_dark() { 0x007d_cfff } else { 0x0009_69da }
 }
 
-/// 出厂默认终端字体：Nerd Font 的严格等宽变体（含图标/powerline 字形，且单格宽对齐）。
-pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
-
-/// 用户配置的终端字体族（设置页可改，持久化在 Appearance；跟 FONT_PX_ATOM 同一路数：
-/// 单进程一套配置，全局量足够）。None/空 = 用出厂默认。
-static FONT_FAMILY_CONF: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
-
-/// 设置终端字体族（空白等同恢复默认）。
-pub fn set_font_family(name: &str) {
-    let name = name.trim();
-    if let Ok(mut g) = FONT_FAMILY_CONF.write() {
-        *g = if name.is_empty() { None } else { Some(name.to_string()) };
-    }
-}
-
-/// 当前终端字体族。
-pub fn font_family() -> String {
-    FONT_FAMILY_CONF
-        .read()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_else(|| DEFAULT_FONT_FAMILY.to_string())
-}
+// 终端字体族配置：搬进 smelt-core（跟 markdown_mermaid 的代码块渲染共用同一份，
+// 见 font_config.rs），这里重导出成原来的裸名字。
+pub(crate) use smelt_core::font_config::{font_family, set_font_family, DEFAULT_FONT_FAMILY};
 
 /// 兜底等宽字体：macOS 系统自带，必定存在。放在 fallback 链末尾做最后防线，
 /// 保证 cell_w 与实际字形宽度同源——否则测量和渲染各自 fallback 到不同字体，

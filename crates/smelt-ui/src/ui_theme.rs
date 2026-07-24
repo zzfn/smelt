@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{rgb, rgba, Rgba};
 
-use crate::AgentStatus;
+use smelt_core::agent_status::AgentStatus;
 
 /// 一套完整语义色板。字段即语义位，深浅两套必须一一对应填满。
 pub struct Palette {
