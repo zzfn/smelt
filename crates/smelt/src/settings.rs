@@ -10,21 +10,21 @@
 
 use std::time::{Duration, Instant};
 
-use gpui::*;
-use gpui::prelude::FluentBuilder;
 use gpui::InteractiveElement;
+use gpui::prelude::FluentBuilder;
+use gpui::*;
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::Input;
 use gpui_component::notification::Notification;
 use gpui_component::progress::Progress;
 use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::setting::{
-    SelectIndex, Settings, SettingField, SettingGroup, SettingItem, SettingPage,
+    SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
 use gpui_component::slider::{Slider, SliderEvent, SliderState, SliderValue};
 use gpui_component::*;
 
-use crate::{agent, pet, terminal, terminal_view, updater, Workspace};
+use crate::{Workspace, agent, pet, terminal, terminal_view, updater};
 
 // ===================== 外观 / 启动 配置类型 =====================
 
@@ -606,8 +606,7 @@ pub fn uninstall_claude_hooks() -> Result<(), String> {
         return Ok(());
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut root: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut root: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return Ok(());
     };
@@ -1027,11 +1026,8 @@ fn qr_png_for_url(url: &str) -> Option<Vec<u8>> {
         .build();
     let rgb = image::DynamicImage::ImageLuma8(luma).into_rgb8();
     let mut buf = Vec::new();
-    rgb.write_to(
-        &mut std::io::Cursor::new(&mut buf),
-        image::ImageFormat::Png,
-    )
-    .ok()?;
+    rgb.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .ok()?;
     Some(buf)
 }
 
@@ -1166,9 +1162,7 @@ fn spawn_webrtc_start(cx: &mut App) {
         let next_gen = next_webrtc_generation(cx);
         cx.set_global(WebrtcRuntimeState {
             connecting: false,
-            error: Some(
-                "未配置信令服务地址。请在设置 → 远程 填写你的 smelt-signal URL。".into(),
-            ),
+            error: Some("未配置信令服务地址。请在设置 → 远程 填写你的 smelt-signal URL。".into()),
             generation: next_gen,
             ..Default::default()
         });
@@ -1287,8 +1281,7 @@ fn webrtc_start_blocking(
             }
         }
     } else {
-        terminal::remote_start("127.0.0.1", write)
-            .map_err(|e| format!("开启本机远程失败：{e}"))?
+        terminal::remote_start("127.0.0.1", write).map_err(|e| format!("开启本机远程失败：{e}"))?
     };
     let token = status
         .token
@@ -1308,8 +1301,7 @@ fn webrtc_start_blocking(
 
     let Some(bridge) = bridge_bin else {
         return Err(
-            "找不到 smelt-bridge。请 make dist-build 安装，或 cargo build -p smelt-bridge。"
-                .into(),
+            "找不到 smelt-bridge。请 make dist-build 安装，或 cargo build -p smelt-bridge。".into(),
         );
     };
 
@@ -1385,7 +1377,8 @@ fn webrtc_start_blocking(
             cmd.stdout(log).stderr(err_log);
         }
         None => {
-            cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
         }
     }
     let child = cmd
@@ -1596,7 +1589,9 @@ fn read_copilot_beep() -> bool {
 
 /// 写 Copilot 的 `beep` 开关：只改这一个键，其余键（比如已有的 footer 配置）原样保留。
 fn set_copilot_beep(enabled: bool) {
-    let Some(path) = copilot_settings_path() else { return };
+    let Some(path) = copilot_settings_path() else {
+        return;
+    };
     let mut value: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -1662,7 +1657,10 @@ pub struct LlmInputs {
 
 /// 启动项列表编辑器：每项一对 label/command 输入框。
 pub struct LaunchInputs {
-    rows: Vec<(Entity<gpui_component::input::InputState>, Entity<gpui_component::input::InputState>)>,
+    rows: Vec<(
+        Entity<gpui_component::input::InputState>,
+        Entity<gpui_component::input::InputState>,
+    )>,
     _subs: Vec<Subscription>,
 }
 
@@ -1765,7 +1763,9 @@ impl Workspace {
                 .default_value(lc.api_key.clone())
         });
         let model = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("deepseek-chat").default_value(lc.model.clone())
+            InputState::new(window, cx)
+                .placeholder("deepseek-chat")
+                .default_value(lc.model.clone())
         });
         let persona = cx.new(|cx| {
             InputState::new(window, cx)
@@ -1778,38 +1778,52 @@ impl Workspace {
         // 变更即写回对应字段（Change 覆盖键入，Blur 兜底）。
         let save_on = |ev: &InputEvent| matches!(ev, InputEvent::Change | InputEvent::Blur);
         self.llm_subs.clear();
-        self.llm_subs.push(cx.subscribe(&base_url, move |this, s, ev: &InputEvent, cx| {
-            if save_on(ev) {
-                let v = s.read(cx).value().to_string();
-                this.update_llm_config(|c| c.base_url = v, cx);
-            }
-        }));
-        self.llm_subs.push(cx.subscribe(&api_key, move |this, s, ev: &InputEvent, cx| {
-            if save_on(ev) {
-                let v = s.read(cx).value().to_string();
-                this.update_llm_config(|c| c.api_key = v, cx);
-            }
-        }));
-        self.llm_subs.push(cx.subscribe(&model, move |this, s, ev: &InputEvent, cx| {
-            if save_on(ev) {
-                let v = s.read(cx).value().to_string();
-                this.update_llm_config(|c| c.model = v, cx);
-            }
-        }));
-        self.llm_subs.push(cx.subscribe(&persona, move |this, s, ev: &InputEvent, cx| {
-            if save_on(ev) {
-                let v = s.read(cx).value().to_string();
-                this.update_llm_config(|c| c.persona = v, cx);
-            }
-        }));
+        self.llm_subs.push(
+            cx.subscribe(&base_url, move |this, s, ev: &InputEvent, cx| {
+                if save_on(ev) {
+                    let v = s.read(cx).value().to_string();
+                    this.update_llm_config(|c| c.base_url = v, cx);
+                }
+            }),
+        );
+        self.llm_subs
+            .push(cx.subscribe(&api_key, move |this, s, ev: &InputEvent, cx| {
+                if save_on(ev) {
+                    let v = s.read(cx).value().to_string();
+                    this.update_llm_config(|c| c.api_key = v, cx);
+                }
+            }));
+        self.llm_subs
+            .push(cx.subscribe(&model, move |this, s, ev: &InputEvent, cx| {
+                if save_on(ev) {
+                    let v = s.read(cx).value().to_string();
+                    this.update_llm_config(|c| c.model = v, cx);
+                }
+            }));
+        self.llm_subs
+            .push(cx.subscribe(&persona, move |this, s, ev: &InputEvent, cx| {
+                if save_on(ev) {
+                    let v = s.read(cx).value().to_string();
+                    this.update_llm_config(|c| c.persona = v, cx);
+                }
+            }));
 
-        self.llm_inputs = Some(LlmInputs { base_url, api_key, model, persona });
+        self.llm_inputs = Some(LlmInputs {
+            base_url,
+            api_key,
+            model,
+            persona,
+        });
 
         // —— 有状态组件：不透明度滑块 + 字体大小滑块 + 背景色 / 宠物色取色器 ——
         let ap = cx.global::<Appearance>().clone();
         let pc = cx.global::<pet::PetConfig>().clone();
         let opacity_slider = cx.new(|_| {
-            SliderState::new().min(60.0).max(100.0).step(5.0).default_value(ap.opacity * 100.0)
+            SliderState::new()
+                .min(60.0)
+                .max(100.0)
+                .step(5.0)
+                .default_value(ap.opacity * 100.0)
         });
         let font_size_slider = cx.new(|_| {
             SliderState::new()
@@ -1837,16 +1851,15 @@ impl Workspace {
         });
         self.signal_http_input = Some(signal_http_input);
 
-        self.settings_subs.push(cx.subscribe(
-            &opacity_slider,
-            |this, _s, ev: &SliderEvent, cx| {
+        self.settings_subs.push(
+            cx.subscribe(&opacity_slider, |this, _s, ev: &SliderEvent, cx| {
                 let (SliderEvent::Change(v) | SliderEvent::Release(v)) = ev;
                 if let SliderValue::Single(x) = v {
                     let op = (*x / 100.0).clamp(0.3, 1.0);
                     this.set_appearance(move |a| a.opacity = op, cx);
                 }
-            },
-        ));
+            }),
+        );
         self.settings_subs.push(cx.subscribe(
             &font_size_slider,
             |this, _s, ev: &SliderEvent, cx| {
@@ -1895,13 +1908,21 @@ impl Workspace {
     }
 
     /// 修改桌面宠物配置：改全局 + 存盘 + 触发重绘。宠物窗口每帧读该全局，改动 ≤50ms 生效。
-    pub fn update_pet_config(&mut self, f: impl FnOnce(&mut pet::PetConfig), cx: &mut Context<Self>) {
+    pub fn update_pet_config(
+        &mut self,
+        f: impl FnOnce(&mut pet::PetConfig),
+        cx: &mut Context<Self>,
+    ) {
         apply_pet_config(f, cx);
         cx.notify();
     }
 
     /// 修改宠物大脑（LLM）配置：改全局 + 存盘 + 重绘。
-    pub fn update_llm_config(&mut self, f: impl FnOnce(&mut agent::LlmConfig), cx: &mut Context<Self>) {
+    pub fn update_llm_config(
+        &mut self,
+        f: impl FnOnce(&mut agent::LlmConfig),
+        cx: &mut Context<Self>,
+    ) {
         apply_llm_config(f, cx);
         cx.notify();
     }
@@ -1914,7 +1935,10 @@ impl Workspace {
     /// 懒创建启动项列表编辑器（需要 window）。
     pub fn ensure_launch_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let count = cx.global::<LaunchConfig>().entries.len();
-        let stale = self.launch_inputs.as_ref().is_none_or(|i| i.rows.len() != count);
+        let stale = self
+            .launch_inputs
+            .as_ref()
+            .is_none_or(|i| i.rows.len() != count);
         if stale {
             self.init_launch_inputs(window, cx);
         }
@@ -1938,48 +1962,64 @@ impl Workspace {
                     .placeholder("启动命令，如 claude")
                     .default_value(entry.command.clone())
             });
-            subs.push(cx.subscribe(&label_input, move |_, s, ev: &InputEvent, cx| {
-                if save_on(ev) {
-                    let v = s.read(cx).value().to_string();
-                    apply_launch_config(|c| {
-                        if let Some(e) = c.entries.get_mut(i) {
-                            e.label = v;
-                        }
-                    }, cx);
-                }
-            }));
-            subs.push(cx.subscribe(&command_input, move |_, s, ev: &InputEvent, cx| {
-                if save_on(ev) {
-                    let v = s.read(cx).value().to_string();
-                    apply_launch_config(|c| {
-                        if let Some(e) = c.entries.get_mut(i) {
-                            e.command = v;
-                        }
-                    }, cx);
-                }
-            }));
+            subs.push(
+                cx.subscribe(&label_input, move |_, s, ev: &InputEvent, cx| {
+                    if save_on(ev) {
+                        let v = s.read(cx).value().to_string();
+                        apply_launch_config(
+                            |c| {
+                                if let Some(e) = c.entries.get_mut(i) {
+                                    e.label = v;
+                                }
+                            },
+                            cx,
+                        );
+                    }
+                }),
+            );
+            subs.push(
+                cx.subscribe(&command_input, move |_, s, ev: &InputEvent, cx| {
+                    if save_on(ev) {
+                        let v = s.read(cx).value().to_string();
+                        apply_launch_config(
+                            |c| {
+                                if let Some(e) = c.entries.get_mut(i) {
+                                    e.command = v;
+                                }
+                            },
+                            cx,
+                        );
+                    }
+                }),
+            );
             rows.push((label_input, command_input));
         }
         self.launch_inputs = Some(LaunchInputs { rows, _subs: subs });
     }
 
     pub fn add_launch_entry(&mut self, cx: &mut Context<Self>) {
-        apply_launch_config(|c| {
-            c.entries.push(LaunchEntry {
-                label: "新启动项".into(),
-                command: String::new(),
-            });
-        }, cx);
+        apply_launch_config(
+            |c| {
+                c.entries.push(LaunchEntry {
+                    label: "新启动项".into(),
+                    command: String::new(),
+                });
+            },
+            cx,
+        );
         self.reset_launch_inputs();
         cx.notify();
     }
 
     pub fn remove_launch_entry(&mut self, index: usize, cx: &mut Context<Self>) {
-        apply_launch_config(|c| {
-            if index < c.entries.len() {
-                c.entries.remove(index);
-            }
-        }, cx);
+        apply_launch_config(
+            |c| {
+                if index < c.entries.len() {
+                    c.entries.remove(index);
+                }
+            },
+            cx,
+        );
         self.reset_launch_inputs();
         cx.notify();
     }
@@ -2000,10 +2040,13 @@ impl Workspace {
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
-                if let Some(p) =
-                    paths.into_iter().next().and_then(|p| p.to_str().map(String::from))
+                if let Some(p) = paths
+                    .into_iter()
+                    .next()
+                    .and_then(|p| p.to_str().map(String::from))
                 {
-                    this.update(cx, |this, cx| this.set_bg_image(Some(p), cx)).ok();
+                    this.update(cx, |this, cx| this.set_bg_image(Some(p), cx))
+                        .ok();
                 }
             }
         })
@@ -2043,9 +2086,8 @@ impl Workspace {
                 .border_color(border)
                 .child(label)
         };
-        let btn = move |id: &'static str, label: String| {
-            btn_base(id, label).hover(|s| s.bg(border))
-        };
+        let btn =
+            move |id: &'static str, label: String| btn_base(id, label).hover(|s| s.bg(border));
         let btn_hover = move |id: &'static str, label: String, hover_bg: Hsla| {
             btn_base(id, label).hover(move |s| s.bg(hover_bg))
         };
@@ -2081,13 +2123,17 @@ impl Workspace {
                     SharedString::from(format!("默认（{short}）")),
                 ))
                 .chain(
-                    names.into_iter().map(|n| (SharedString::from(n.clone()), SharedString::from(n))),
+                    names
+                        .into_iter()
+                        .map(|n| (SharedString::from(n.clone()), SharedString::from(n))),
                 )
                 .collect()
             })
             .clone();
-        let appearance_page = SettingPage::new("外观").default_open(true).group(
-            SettingGroup::new().items(vec![
+        let appearance_page =
+            SettingPage::new("外观")
+                .default_open(true)
+                .group(SettingGroup::new().items(vec![
                 SettingItem::new(
                     "主题模式",
                     SettingField::switch(
@@ -2147,7 +2193,11 @@ impl Workspace {
                 SettingItem::new(
                     "背景色",
                     SettingField::render(move |_, _, _| {
-                        div().children(bg_color_picker.as_ref().map(|p| ColorPicker::new(p).small()))
+                        div().children(
+                            bg_color_picker
+                                .as_ref()
+                                .map(|p| ColorPicker::new(p).small()),
+                        )
                     }),
                 ),
                 SettingItem::new(
@@ -2179,29 +2229,37 @@ impl Workspace {
                                     .text_color(muted)
                                     .child(img_name),
                             )
-                            .child(btn("pick-img", "选择图片…".into()).flex_shrink_0().on_mouse_down(
-                                MouseButton::Left,
-                                move |_, _window, cx: &mut App| {
-                                    pick_entity.update(cx, |this, cx| this.pick_bg_image(cx));
-                                },
-                            ))
+                            .child(
+                                btn("pick-img", "选择图片…".into())
+                                    .flex_shrink_0()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_, _window, cx: &mut App| {
+                                            pick_entity
+                                                .update(cx, |this, cx| this.pick_bg_image(cx));
+                                        },
+                                    ),
+                            )
                             .child(
                                 btn("clear-img", "清除".into())
                                     .flex_shrink_0()
                                     .text_color(muted)
                                     .on_mouse_down(
-                                    MouseButton::Left,
-                                    move |_, _window, cx: &mut App| {
-                                        clear_entity.update(cx, |this, cx| this.set_bg_image(None, cx));
-                                    },
-                                ),
+                                        MouseButton::Left,
+                                        move |_, _window, cx: &mut App| {
+                                            clear_entity
+                                                .update(cx, |this, cx| this.set_bg_image(None, cx));
+                                        },
+                                    ),
                             )
                     }),
                 ),
                 SettingItem::new(
                     "不透明度",
                     SettingField::render(move |_, _, _| {
-                        div().w(px(200.)).children(opacity_slider.as_ref().map(Slider::new))
+                        div()
+                            .w(px(200.))
+                            .children(opacity_slider.as_ref().map(Slider::new))
                     }),
                 ),
                 SettingItem::new(
@@ -2215,14 +2273,12 @@ impl Workspace {
                     )
                     .default_value(false),
                 ),
-            ]),
-        );
+            ]));
 
         // —— 桌面宠物 ——
         let pet_color_picker = self.pet_color_picker.clone();
         let llm_inputs = self.llm_inputs.clone();
-        let pet_page = SettingPage::new("桌面宠物").group(
-            SettingGroup::new().items(vec![
+        let pet_page = SettingPage::new("桌面宠物").group(SettingGroup::new().items(vec![
                 SettingItem::new(
                     "显示宠物",
                     SettingField::switch(
@@ -2273,7 +2329,11 @@ impl Workspace {
                 SettingItem::new(
                     "颜色",
                     SettingField::render(move |_, _, _| {
-                        div().children(pet_color_picker.as_ref().map(|p| ColorPicker::new(p).small()))
+                        div().children(
+                            pet_color_picker
+                                .as_ref()
+                                .map(|p| ColorPicker::new(p).small()),
+                        )
                     }),
                 ),
                 SettingItem::new(
@@ -2294,8 +2354,7 @@ impl Workspace {
                             ])
                     }),
                 ),
-            ]),
-        );
+            ]));
 
         // —— 启动：项目「+」下拉菜单的可配置启动项 ——
         // Settings 的 list 测量项高度时，百分比宽度（w_full）经常解析不到确定父宽，
@@ -3478,7 +3537,10 @@ impl Workspace {
         let workspace = cx.entity();
         cx.defer(move |cx| {
             if let Some(handle) = cx.try_global::<SettingsWindowHandle>().and_then(|h| h.0) {
-                if handle.update(cx, |_, window, _| window.activate_window()).is_ok() {
+                if handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+                {
                     return;
                 }
             }
@@ -3540,7 +3602,10 @@ mod daemon_info_tests {
             session_count: Some(5),
         };
         let line = daemon_info_line(&info);
-        assert!(line.starts_with("v0.5.4 · PID 64954 · 启动于 "), "got {line}");
+        assert!(
+            line.starts_with("v0.5.4 · PID 64954 · 启动于 "),
+            "got {line}"
+        );
         assert!(line.contains("已运行 "), "got {line}");
         assert!(line.ends_with("· 5 个会话"), "got {line}");
     }

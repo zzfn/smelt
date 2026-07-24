@@ -34,8 +34,8 @@ fn macos_rss() -> Option<u64> {
     use std::mem::MaybeUninit;
 
     use libc::{
-        mach_task_basic_info, mach_task_self, task_info, task_info_t, KERN_SUCCESS,
-        MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT,
+        KERN_SUCCESS, MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_task_basic_info,
+        mach_task_self, task_info, task_info_t,
     };
 
     let mut info = MaybeUninit::<mach_task_basic_info>::uninit();

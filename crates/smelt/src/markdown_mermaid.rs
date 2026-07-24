@@ -30,12 +30,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    div, img, px, relative, AnyElement, App, ElementId, InteractiveElement, IntoElement,
-    ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage,
-    Window,
+    AnyElement, App, ElementId, InteractiveElement, IntoElement, ObjectFit, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px, relative,
 };
-use gpui_component::text::{markdown_ast, MarkdownNode, MarkdownParseContext, TextView};
 use gpui_component::ActiveTheme;
+use gpui_component::text::{MarkdownNode, MarkdownParseContext, TextView, markdown_ast};
 use sha2::{Digest, Sha256};
 
 use crate::terminal_view;
@@ -103,9 +102,14 @@ fn parse_mermaid_block(
 ) -> Option<MarkdownNode> {
     let source = mermaid_source(node)?;
     Some(
-        MarkdownNode::new("mermaid", MermaidBlockData { source: source.clone() })
-            .text(source.clone())
-            .markdown(format!("```mermaid\n{source}\n```")),
+        MarkdownNode::new(
+            "mermaid",
+            MermaidBlockData {
+                source: source.clone(),
+            },
+        )
+        .text(source.clone())
+        .markdown(format!("```mermaid\n{source}\n```")),
     )
 }
 
@@ -135,7 +139,11 @@ fn source_digest(source: &str, is_dark: bool) -> String {
     let mut hasher = Sha256::new();
     hasher.update(CACHE_FORMAT_VERSION.as_bytes());
     hasher.update(source.as_bytes());
-    hasher.update(if is_dark { "\0dark".as_bytes() } else { "\0light".as_bytes() });
+    hasher.update(if is_dark {
+        "\0dark".as_bytes()
+    } else {
+        "\0light".as_bytes()
+    });
     format!("{:x}", hasher.finalize())
 }
 
@@ -188,7 +196,11 @@ fn render_or_load(source: &str, is_dark: bool, cache_dir: &Path) -> Result<Merma
 
     let (width, height) = parse_viewbox_size(&svg).unwrap_or((400.0, 300.0));
     let image = gpui::Image::from_bytes(gpui::ImageFormat::Svg, svg.into_bytes());
-    Ok(MermaidImage { image: Arc::new(image), width, height })
+    Ok(MermaidImage {
+        image: Arc::new(image),
+        width,
+        height,
+    })
 }
 
 /// renderer 阶段：查内存缓存 → 未命中调 `render_or_load` 并写回 → 渲成 `img()`；

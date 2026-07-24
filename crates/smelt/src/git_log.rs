@@ -82,7 +82,15 @@ pub fn parse_log(text: &str) -> Vec<CommitNode> {
                 .map(|s| s.rsplit(" -> ").next().unwrap_or(s))
                 .map(|s| s.strip_prefix("tag: ").unwrap_or(s).to_string())
                 .collect();
-            Some(CommitNode { hash, short, author, time, subject, parents, refs })
+            Some(CommitNode {
+                hash,
+                short,
+                author,
+                time,
+                subject,
+                parents,
+                refs,
+            })
         })
         .collect()
 }
@@ -116,7 +124,10 @@ pub fn layout_graph(commits: &[CommitNode]) -> Vec<GraphRow> {
             Some(&i) => i,
             // 没人等它：是某条线的头（HEAD、或时间序里刚冒出来的分支）。
             None => {
-                let i = lanes.iter().position(Option::is_none).unwrap_or(lanes.len());
+                let i = lanes
+                    .iter()
+                    .position(Option::is_none)
+                    .unwrap_or(lanes.len());
                 if i == lanes.len() {
                     lanes.push(None);
                 }
@@ -142,7 +153,10 @@ pub fn layout_graph(commits: &[CommitNode]) -> Vec<GraphRow> {
                 out_lanes.push(i);
                 continue;
             } else {
-                let i = lanes.iter().position(Option::is_none).unwrap_or(lanes.len());
+                let i = lanes
+                    .iter()
+                    .position(Option::is_none)
+                    .unwrap_or(lanes.len());
                 if i == lanes.len() {
                     lanes.push(None);
                 }
@@ -172,12 +186,19 @@ pub fn layout_graph(commits: &[CommitNode]) -> Vec<GraphRow> {
             if claimed.contains(&i) {
                 continue;
             }
-            if let Some(j) = lanes.iter().position(|l| l.as_deref() == Some(sha.as_str())) {
+            if let Some(j) = lanes
+                .iter()
+                .position(|l| l.as_deref() == Some(sha.as_str()))
+            {
                 edges.push(Edge::Through { from: i, to: j });
             }
         }
         let width = lanes.len().max(before.len()).max(node + 1);
-        rows.push(GraphRow { node, edges, lanes: width });
+        rows.push(GraphRow {
+            node,
+            edges,
+            lanes: width,
+        });
     }
     rows
 }
@@ -236,7 +257,11 @@ pub const LOG_LIMIT: usize = 500;
 
 /// 拼 `git log` 的参数。
 pub fn log_args(scope: &LogScope, limit: usize) -> Vec<String> {
-    let mut a = vec!["log".to_string(), LOG_FORMAT.to_string(), format!("--max-count={limit}")];
+    let mut a = vec![
+        "log".to_string(),
+        LOG_FORMAT.to_string(),
+        format!("--max-count={limit}"),
+    ];
     match scope {
         // 不带 ref = HEAD，也就是当前分支。
         LogScope::Head => {}
@@ -269,8 +294,8 @@ pub fn parse_name_status(text: &str) -> Vec<(String, String)> {
 
 // ===================== Workspace 方法 =====================
 
-use crate::git_panel::run_git;
 use crate::Workspace;
+use crate::git_panel::run_git;
 use gpui::Context;
 
 impl Workspace {
@@ -343,7 +368,13 @@ impl Workspace {
                     // 一个大提交的完整 diff 可能上万行，全量拉会卡住这一屏。
                     let out = run_git(
                         &r,
-                        &["show", "--name-status", "--pretty=format:", "--no-color", &h],
+                        &[
+                            "show",
+                            "--name-status",
+                            "--pretty=format:",
+                            "--no-color",
+                            &h,
+                        ],
                     )
                     .ok()?;
                     Some(parse_name_status(&String::from_utf8_lossy(&out.stdout)))
@@ -364,7 +395,9 @@ impl Workspace {
 
     /// 点提交详情里的某个文件：拉它在这次提交里的 diff。
     pub fn select_commit_file(&mut self, root: String, path: String, cx: &mut Context<Self>) {
-        let Some(hash) = self.git_log.selected.clone() else { return };
+        let Some(hash) = self.git_log.selected.clone() else {
+            return;
+        };
         self.git_log.detail_selected_file = Some(path.clone());
         self.git_log.detail_diff.clear();
         cx.notify();
@@ -374,11 +407,8 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     // 单个文件在这次提交里的改动。--format= 去掉提交头，只留 diff 本体。
-                    let out = run_git(
-                        &r,
-                        &["show", "--format=", "--no-color", &h, "--", &p],
-                    )
-                    .ok()?;
+                    let out =
+                        run_git(&r, &["show", "--format=", "--no-color", &h, "--", &p]).ok()?;
                     Some(crate::git_panel::parse_diff(&String::from_utf8_lossy(&out.stdout)).lines)
                 })
                 .await
@@ -399,7 +429,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{layout_graph, parse_log, CommitNode, Edge};
+    use super::{CommitNode, Edge, layout_graph, parse_log};
 
     fn c(hash: &str, parents: &[&str]) -> CommitNode {
         CommitNode {
@@ -436,8 +466,14 @@ mod tests {
     fn linear_history_stays_in_one_lane() {
         let commits = vec![c("a", &["b"]), c("b", &["c"]), c("c", &[])];
         let rows = layout_graph(&commits);
-        assert!(rows.iter().all(|r| r.node == 0), "直线历史不该分列：{rows:?}");
-        assert!(rows.iter().all(|r| r.lanes <= 1), "不该有多余的列：{rows:?}");
+        assert!(
+            rows.iter().all(|r| r.node == 0),
+            "直线历史不该分列：{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r.lanes <= 1),
+            "不该有多余的列：{rows:?}"
+        );
         // 中间那行：上面接 a、下面接 c
         assert!(rows[1].edges.contains(&Edge::In { from: 0 }));
         assert!(rows[1].edges.contains(&Edge::Out { to: 0 }));
@@ -449,8 +485,12 @@ mod tests {
     #[test]
     fn merge_commit_forks_a_second_lane() {
         // m 合并了 a（主线）和 b（分支），两者最后都汇到 base
-        let commits =
-            vec![c("m", &["a", "b"]), c("a", &["base"]), c("b", &["base"]), c("base", &[])];
+        let commits = vec![
+            c("m", &["a", "b"]),
+            c("a", &["base"]),
+            c("b", &["base"]),
+            c("base", &[]),
+        ];
         let rows = layout_graph(&commits);
 
         assert_eq!(rows[0].node, 0, "merge 提交自己在第 0 列");
@@ -469,7 +509,11 @@ mod tests {
         // a 和 b 分别落在两列上
         assert_ne!(rows[1].node, rows[2].node, "两个分支不该挤在同一列");
         // base 是汇合点：两条线都汇进来
-        let ins = rows[3].edges.iter().filter(|e| matches!(e, Edge::In { .. })).count();
+        let ins = rows[3]
+            .edges
+            .iter()
+            .filter(|e| matches!(e, Edge::In { .. }))
+            .count();
         assert_eq!(ins, 2, "base 应收到两条汇入线：{:?}", rows[3].edges);
     }
 
@@ -528,7 +572,11 @@ mod tests {
         assert_eq!(merge.parents.len(), 2, "第一条应是 merge 提交");
         let rows = layout_graph(&commits);
         assert_eq!(rows.len(), 4);
-        let outs = rows[0].edges.iter().filter(|e| matches!(e, Edge::Out { .. })).count();
+        let outs = rows[0]
+            .edges
+            .iter()
+            .filter(|e| matches!(e, Edge::Out { .. }))
+            .count();
         assert_eq!(outs, 2, "merge 行应向下发两条线：{:?}", rows[0].edges);
         assert!(rows.iter().any(|r| r.lanes >= 2), "分叉期间应该出现第二列");
         // 最后一个（根）提交回到第 0 列
@@ -547,7 +595,14 @@ mod tests {
             c("old", &[]),
         ];
         let rows = layout_graph(&commits);
-        assert_eq!(rows[4].node, 0, "合并完之后应回到第 0 列，实际 {}", rows[4].node);
-        assert!(rows.iter().all(|r| r.lanes <= 2), "两条分支不该撑出第三列：{rows:?}");
+        assert_eq!(
+            rows[4].node, 0,
+            "合并完之后应回到第 0 列，实际 {}",
+            rows[4].node
+        );
+        assert!(
+            rows.iter().all(|r| r.lanes <= 2),
+            "两条分支不该撑出第三列：{rows:?}"
+        );
     }
 }

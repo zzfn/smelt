@@ -12,19 +12,27 @@ use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use smol::Timer;
 
-use crate::terminal::{self, Terminal};
-use crate::tasks::NewTaskPrefill;
 use crate::NewTask;
+use crate::tasks::NewTaskPrefill;
+use crate::terminal::{self, Terminal};
 
 /// 选区高亮背景色：跟终端主题一起切换（深色用暗蓝，浅色换成不刺眼的浅蓝，
 /// 否则深色定死的暗蓝铺在浅底上，选中文字会糊在一起看不清）。
 fn sel_bg() -> u32 {
-    if terminal::is_dark() { 0x0033_4a6a } else { 0x00ad_d6ff }
+    if terminal::is_dark() {
+        0x0033_4a6a
+    } else {
+        0x00ad_d6ff
+    }
 }
 
 /// 悬停链接的高亮前景色：同上，浅色主题换成对比度够的蓝。
 fn link_fg() -> u32 {
-    if terminal::is_dark() { 0x007d_cfff } else { 0x0009_69da }
+    if terminal::is_dark() {
+        0x007d_cfff
+    } else {
+        0x0009_69da
+    }
 }
 
 /// 出厂默认终端字体：Nerd Font 的严格等宽变体（含图标/powerline 字形，且单格宽对齐）。
@@ -38,7 +46,11 @@ static FONT_FAMILY_CONF: std::sync::RwLock<Option<String>> = std::sync::RwLock::
 pub fn set_font_family(name: &str) {
     let name = name.trim();
     if let Ok(mut g) = FONT_FAMILY_CONF.write() {
-        *g = if name.is_empty() { None } else { Some(name.to_string()) };
+        *g = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        };
     }
 }
 
@@ -82,7 +94,17 @@ const REFRESH: Duration = Duration::from_millis(30);
 // 导致 Tab 补全在终端里形同虚设。这里在 "Terminal" 这个更贴近焦点的 context 上
 // 重新绑一份，深度更深的 context 按 GPUI 的 keymap 优先级规则会盖过 Root 那份，
 // 从而把 Tab/Shift-Tab 交还给终端本身（见下方 render 里的 `.on_action`）。
-gpui::actions!(smelt_terminal, [TerminalTab, TerminalBackTab, TerminalFind, TerminalFindNext, TerminalFindPrev, TerminalFindClose]);
+gpui::actions!(
+    smelt_terminal,
+    [
+        TerminalTab,
+        TerminalBackTab,
+        TerminalFind,
+        TerminalFindNext,
+        TerminalFindPrev,
+        TerminalFindClose
+    ]
+);
 
 /// 终端字号（px）：跟随设置页「字体大小」全局切换，见 `set_font_px`。单进程只有
 /// 一套终端字号，用全局原子量足够，不必给每处渲染/量measure 调用各传一份——
@@ -94,7 +116,10 @@ pub const MAX_FONT_PX: u32 = 22;
 
 /// 切换终端字号（px，自动夹到 [MIN_FONT_PX, MAX_FONT_PX]）。
 pub fn set_font_px(px: u32) {
-    FONT_PX_ATOM.store(px.clamp(MIN_FONT_PX, MAX_FONT_PX), std::sync::atomic::Ordering::Relaxed);
+    FONT_PX_ATOM.store(
+        px.clamp(MIN_FONT_PX, MAX_FONT_PX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// 当前终端字号（px）。
@@ -219,7 +244,10 @@ pub struct TerminalView {
 /// 外观设置里跟终端渲染相关的字段是否发生变化（bg_color/bg_image/opacity/blur）。
 /// Appearance 未 derive PartialEq，故手动比较这几个字段。
 fn appearance_changed(a: &crate::Appearance, b: &crate::Appearance) -> bool {
-    a.bg_color != b.bg_color || a.bg_image != b.bg_image || a.opacity != b.opacity || a.blur != b.blur
+    a.bg_color != b.bg_color
+        || a.bg_image != b.bg_image
+        || a.opacity != b.opacity
+        || a.blur != b.blur
 }
 
 /// 「需要注意」的细分：等审批（红，最高优先）> 其他需要处理（等输入 / 响铃等，橙）。
@@ -246,7 +274,7 @@ fn classify_attention(msg: &str) -> AttentionKind {
 // 权限菜单解析已抽到 smelt_core::permission_menu（唯一真源，GUI 与 smeltd 共用）。
 // 这里只 use 自己要用的；消费者（main.rs 等）直接从 permission_menu 取类型，不经这里
 // 转发——转发一层就等于多一个「看起来像定义处」的地方。
-use crate::permission_menu::{parse_permission_prompt, PermissionPrompt};
+use crate::permission_menu::{PermissionPrompt, parse_permission_prompt};
 
 /// 同一终端同文本的系统通知最小间隔。
 const NOTIFY_DEDUP: Duration = Duration::from_secs(60);
@@ -309,96 +337,100 @@ impl TerminalView {
 
         // 定时重绘：后台读线程更新 Term 网格，这里每 30ms 通知 UI 刷新。
         // 顺便检查响铃：非活动会话也在跑此循环，故能在后台标记「需要注意」。
-        cx.spawn(async move |this, cx| loop {
-            Timer::after(REFRESH).await;
-            let r = this.update(cx, |this, cx| {
-                if let Some(msg) = this.terminal.take_notification() {
-                    let task = this.terminal.current_title();
-                    // 焦点感知（借鉴 codex）：app 在前台时不弹系统通知——你自己看得见
-                    // 蓝点/徽章，弹了是打扰；切走了才提醒。cx.active_window() 在 app
-                    // 失活时为 None（宠物窗是 NonactivatingPanel，不参与）。
-                    // 同文本 60s 去重：Claude Code 会反复上报同一条 waiting。
-                    let now = Instant::now();
-                    let dup = this
-                        .last_notified
-                        .as_ref()
-                        .is_some_and(|(m, t)| *m == msg && now.duration_since(*t) < NOTIFY_DEDUP);
-                    if !dup {
-                        if cx.active_window().is_none() {
-                            system_notify(&this.title, task.as_deref(), &msg);
-                        } else {
-                            // app 在前台：系统通知不弹，改交给 Workspace::render 判断——
-                            // 只有「没在看这个 pane」才真弹 toast，正在看的直接吃掉。
-                            this.pending_toast = Some(msg.clone());
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(REFRESH).await;
+                let r = this.update(cx, |this, cx| {
+                    if let Some(msg) = this.terminal.take_notification() {
+                        let task = this.terminal.current_title();
+                        // 焦点感知（借鉴 codex）：app 在前台时不弹系统通知——你自己看得见
+                        // 蓝点/徽章，弹了是打扰；切走了才提醒。cx.active_window() 在 app
+                        // 失活时为 None（宠物窗是 NonactivatingPanel，不参与）。
+                        // 同文本 60s 去重：Claude Code 会反复上报同一条 waiting。
+                        let now = Instant::now();
+                        let dup = this.last_notified.as_ref().is_some_and(|(m, t)| {
+                            *m == msg && now.duration_since(*t) < NOTIFY_DEDUP
+                        });
+                        if !dup {
+                            if cx.active_window().is_none() {
+                                system_notify(&this.title, task.as_deref(), &msg);
+                            } else {
+                                // app 在前台：系统通知不弹，改交给 Workspace::render 判断——
+                                // 只有「没在看这个 pane」才真弹 toast，正在看的直接吃掉。
+                                this.pending_toast = Some(msg.clone());
+                            }
+                            this.last_notified = Some((msg.clone(), now));
                         }
-                        this.last_notified = Some((msg.clone(), now));
+                        // 宠物播报照常（应用内的轻提示，不算系统级打扰；宠物自己有气泡节流）。
+                        let line = match task.as_deref() {
+                            Some(t) if !t.is_empty() => format!("「{t}」{msg}"),
+                            _ => msg.clone(),
+                        };
+                        crate::pet::push_pet_message(cx, line);
+                        this.notification = Some(msg);
+                        this.notified_at = Some(Instant::now());
                     }
-                    // 宠物播报照常（应用内的轻提示，不算系统级打扰；宠物自己有气泡节流）。
-                    let line = match task.as_deref() {
-                        Some(t) if !t.is_empty() => format!("「{t}」{msg}"),
-                        _ => msg.clone(),
-                    };
-                    crate::pet::push_pet_message(cx, line);
-                    this.notification = Some(msg);
-                    this.notified_at = Some(Instant::now());
-                }
 
-                // 运行状态边沿检测（标题 spinner）：完成提醒 + 卡住提醒。
-                let running = title_is_running(this.terminal.current_title());
-                let name = this.title.clone();
-                if this.was_running && !running {
-                    // Running → Idle：该会话的 agent 干完了 → 标「完成未读」（总览绿标）。
-                    this.completed_unread = true;
-                    // 绑了本 session 的任务 → Done；若确实收尾了任务，挂旗让 Workspace
-                    // 同项目自动 claim 下一条待办（见 `on_session_task_idle`）。
-                    let sid = this.session_id.clone();
-                    if let Some(cwd) = crate::tasks::TaskStore::mark_session_done(&sid) {
-                        this.pending_task_continue_cwd = Some(cwd);
-                    }
-                    crate::pet::push_pet_message(cx, format!("「{name}」任务完成啦，来看看结果吧"));
-                }
-                if running {
-                    this.running_frames += 1;
-                    if this.running_frames == STUCK_FRAMES && !this.stuck_notified {
-                        this.stuck_notified = true;
+                    // 运行状态边沿检测（标题 spinner）：完成提醒 + 卡住提醒。
+                    let running = title_is_running(this.terminal.current_title());
+                    let name = this.title.clone();
+                    if this.was_running && !running {
+                        // Running → Idle：该会话的 agent 干完了 → 标「完成未读」（总览绿标）。
+                        this.completed_unread = true;
+                        // 绑了本 session 的任务 → Done；若确实收尾了任务，挂旗让 Workspace
+                        // 同项目自动 claim 下一条待办（见 `on_session_task_idle`）。
+                        let sid = this.session_id.clone();
+                        if let Some(cwd) = crate::tasks::TaskStore::mark_session_done(&sid) {
+                            this.pending_task_continue_cwd = Some(cwd);
+                        }
                         crate::pet::push_pet_message(
                             cx,
-                            format!("「{name}」已经跑了好久，要不去瞅一眼？"),
+                            format!("「{name}」任务完成啦，来看看结果吧"),
                         );
                     }
-                } else {
-                    this.running_frames = 0;
-                    this.stuck_notified = false;
-                }
-                this.was_running = running;
+                    if running {
+                        this.running_frames += 1;
+                        if this.running_frames == STUCK_FRAMES && !this.stuck_notified {
+                            this.stuck_notified = true;
+                            crate::pet::push_pet_message(
+                                cx,
+                                format!("「{name}」已经跑了好久，要不去瞅一眼？"),
+                            );
+                        }
+                    } else {
+                        this.running_frames = 0;
+                        this.stuck_notified = false;
+                    }
+                    this.was_running = running;
 
-                // P0 性能修复：这句 notify() 以前无条件调用，导致哪怕 shell 完全空闲
-                // 也在以 33 次/秒的频率触发 render() 里"整个网格快照 + 每行重新整形
-                // 文字"的重活。现在先问 alacritty 自带的 damage tracking——终端内容
-                // （字符/颜色/光标/翻滚/进出备用屏幕/resize）没有真的变化，就跳过。
-                // 外观设置（背景色/图/透明度/模糊）单独比较，因为这些跟 PTY 内容无关、
-                // damage tracking 感知不到。拖选高亮 / Cmd 悬停链接不受影响：它们各自
-                // 的鼠标事件处理里已经各自调用过 cx.notify()，跟这里无关。
-                // 注：内容变化的重绘现在主要由事件驱动任务（drive_redraws）负责——读线程
-                // 一有输出就唤醒；这里的 content_changed 仍保留，一是驱动外观变化的重绘，
-                // 二是作内容重绘的兜底（万一 channel 那条漏了，轮询还能兜住）。
-                let content_changed = this.terminal.take_damage();
-                let ap_now = cx.global::<crate::Appearance>().clone();
-                let ap_changed = match &this.last_appearance {
-                    Some(prev) => appearance_changed(prev, &ap_now),
-                    None => true,
-                };
-                if ap_changed {
-                    this.last_appearance = Some(ap_now);
+                    // P0 性能修复：这句 notify() 以前无条件调用，导致哪怕 shell 完全空闲
+                    // 也在以 33 次/秒的频率触发 render() 里"整个网格快照 + 每行重新整形
+                    // 文字"的重活。现在先问 alacritty 自带的 damage tracking——终端内容
+                    // （字符/颜色/光标/翻滚/进出备用屏幕/resize）没有真的变化，就跳过。
+                    // 外观设置（背景色/图/透明度/模糊）单独比较，因为这些跟 PTY 内容无关、
+                    // damage tracking 感知不到。拖选高亮 / Cmd 悬停链接不受影响：它们各自
+                    // 的鼠标事件处理里已经各自调用过 cx.notify()，跟这里无关。
+                    // 注：内容变化的重绘现在主要由事件驱动任务（drive_redraws）负责——读线程
+                    // 一有输出就唤醒；这里的 content_changed 仍保留，一是驱动外观变化的重绘，
+                    // 二是作内容重绘的兜底（万一 channel 那条漏了，轮询还能兜住）。
+                    let content_changed = this.terminal.take_damage();
+                    let ap_now = cx.global::<crate::Appearance>().clone();
+                    let ap_changed = match &this.last_appearance {
+                        Some(prev) => appearance_changed(prev, &ap_now),
+                        None => true,
+                    };
+                    if ap_changed {
+                        this.last_appearance = Some(ap_now);
+                    }
+                    if content_changed || ap_changed {
+                        // 滚动/输出变了：搜索高亮要按新的 display_offset 重算可视区命中。
+                        this.refresh_search_highlights();
+                        cx.notify();
+                    }
+                });
+                if r.is_err() {
+                    break; // 视图已销毁
                 }
-                if content_changed || ap_changed {
-                    // 滚动/输出变了：搜索高亮要按新的 display_offset 重算可视区命中。
-                    this.refresh_search_highlights();
-                    cx.notify();
-                }
-            });
-            if r.is_err() {
-                break; // 视图已销毁
             }
         })
         .detach();
@@ -561,7 +593,6 @@ impl TerminalView {
         self.notified_at
     }
 
-
     /// 终端末尾最多 n 行非空文本（总览页迷你预览用）。走 [`Terminal::text_lines`] 的纯文本
     /// 路径，不为了几行字把整个网格连同颜色/属性 clone 一遍。
     pub fn last_lines(&self, n: usize) -> Vec<String> {
@@ -587,7 +618,6 @@ impl TerminalView {
     pub fn agent_title(&self) -> Option<String> {
         self.terminal.current_title()
     }
-
 
     pub fn title(&self) -> &str {
         &self.title
@@ -743,24 +773,27 @@ impl TerminalView {
             return;
         }
         self.drag_scroll_running = true;
-        cx.spawn(async move |this, cx| loop {
-            Timer::after(Duration::from_millis(60)).await;
-            let go = this.update(cx, |this, cx| {
-                if !this.selecting || this.drag_scroll == 0 {
-                    this.drag_scroll_running = false;
-                    return false;
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(60)).await;
+                let go = this.update(cx, |this, cx| {
+                    if !this.selecting || this.drag_scroll == 0 {
+                        this.drag_scroll_running = false;
+                        return false;
+                    }
+                    let dir = this.drag_scroll;
+                    this.terminal.scroll(dir);
+                    // 向上滚活动端钉在首行（扩向更早内容），向下钉在末行；Side 取
+                    // 扩选方向的外侧，保证边缘行的端点格被选进来。
+                    let row = if dir > 0 { 0 } else { usize::MAX };
+                    this.terminal
+                        .selection_update(row, this.drag_scroll_col, dir > 0);
+                    cx.notify();
+                    true
+                });
+                if !matches!(go, Ok(true)) {
+                    break;
                 }
-                let dir = this.drag_scroll;
-                this.terminal.scroll(dir);
-                // 向上滚活动端钉在首行（扩向更早内容），向下钉在末行；Side 取
-                // 扩选方向的外侧，保证边缘行的端点格被选进来。
-                let row = if dir > 0 { 0 } else { usize::MAX };
-                this.terminal.selection_update(row, this.drag_scroll_col, dir > 0);
-                cx.notify();
-                true
-            });
-            if !matches!(go, Ok(true)) {
-                break;
             }
         })
         .detach();
@@ -776,7 +809,10 @@ impl TerminalView {
         let Some(cells) = self.last_frame.as_ref().and_then(|f| f.rows.get(row)) else {
             return hi - lo;
         };
-        cells[lo..hi.min(cells.len())].iter().filter(|c| c.ch != '\0').count()
+        cells[lo..hi.min(cells.len())]
+            .iter()
+            .filter(|c| c.ch != '\0')
+            .count()
     }
 
     /// 点击单元处若落在某个链接上，返回该目标（未做 file:// 转换，打开前还要经
@@ -812,7 +848,9 @@ fn link_at(row: &[terminal::Cell], c: usize) -> Option<(usize, usize, String)> {
         }
         return Some((a, b, uri.to_string()));
     }
-    find_links(row).into_iter().find(|&(a, b, _)| c >= a && c <= b)
+    find_links(row)
+        .into_iter()
+        .find(|&(a, b, _)| c >= a && c <= b)
 }
 
 /// 输入法（IME）支持：中文等需要合成的输入走这里，最终提交的文字通过
@@ -850,8 +888,15 @@ impl EntityInputHandler for TerminalView {
         // 焦点是否有效文字输入位置，一直是 NSNotFound 会导致它不出现（IME 候选窗本身
         // 走 hasMarkedText/setMarkedText，不受这个影响，所以合成打字不受影响）。这里
         // 汇报一个折叠的光标位置：合成中就在 marked_text 末尾，否则在 0。
-        let len = self.marked_text.as_ref().map(|s| s.encode_utf16().count()).unwrap_or(0);
-        Some(UTF16Selection { range: len..len, reversed: false })
+        let len = self
+            .marked_text
+            .as_ref()
+            .map(|s| s.encode_utf16().count())
+            .unwrap_or(0);
+        Some(UTF16Selection {
+            range: len..len,
+            reversed: false,
+        })
     }
 
     fn marked_text_range(
@@ -910,7 +955,10 @@ impl EntityInputHandler for TerminalView {
         // 候选窗要摆在光标格子上：从网格原点按 列×字宽 / 行×行高 偏移。
         let (row, col) = self.cursor.unwrap_or((0, 0));
         let origin = element_bounds.origin
-            + point(px(PAD_X + col as f32 * self.cell_w), px(PAD_Y + row as f32 * line_px()));
+            + point(
+                px(PAD_X + col as f32 * self.cell_w),
+                px(PAD_Y + row as f32 * line_px()),
+            );
         Some(Bounds {
             origin,
             size: size(px(2.0), px(line_px())),
@@ -949,8 +997,12 @@ impl Render for TerminalView {
                 underline: None,
                 strikethrough: None,
             };
-            let measured =
-                f32::from(window.text_system().layout_line("M", px(font_px()), &[run], None).width);
+            let measured = f32::from(
+                window
+                    .text_system()
+                    .layout_line("M", px(font_px()), &[run], None)
+                    .width,
+            );
             let cell_w = if measured > 1.0 {
                 measured
             } else {
@@ -986,7 +1038,11 @@ impl Render for TerminalView {
         // 输入法照样要知道往哪落。
         //
         // IME 合成中不画网格里的光标：预编辑串自带光标（画在拼音末尾，跟 iTerm2 一致）。
-        let cursor = if self.marked_text.is_some() { None } else { frame.cursor };
+        let cursor = if self.marked_text.is_some() {
+            None
+        } else {
+            frame.cursor
+        };
         self.cursor = frame.cursor_pos;
         // 失焦的终端把光标画成空心框（见 paint_row）——多个终端并排时才看得出焦点在谁身上。
         let focused = self.focus_handle.is_focused(window);
@@ -1026,7 +1082,11 @@ impl Render for TerminalView {
         // 的颜色必须跟 terminal::default_bg() 是同一套逻辑：用户没手动选过背景色时
         // 跟主题模式走，选过了就保留用户的选择（不因为切深浅色模式而被顶掉）。
         let ap = cx.global::<crate::Appearance>().clone();
-        let bg_color = if ap.bg_color_is_default() { terminal::default_bg() } else { ap.bg_color };
+        let bg_color = if ap.bg_color_is_default() {
+            terminal::default_bg()
+        } else {
+            ap.bg_color
+        };
         let mut bg_layer = div().absolute().inset_0().bg(rgb(bg_color));
         if let Some(path) = &ap.bg_image {
             bg_layer = bg_layer.child(
@@ -1209,9 +1269,8 @@ impl Render for TerminalView {
                     // 应用开了鼠标上报且没按 Shift → 把 press 转发给 TUI（vim/less/
                     // Claude 等靠这个点选）。Shift 旁路 = 强制本地框选（xterm 约定）。
                     // 双击/三击永远走本地选词/选行（应用鼠标协议没有语义选区）。
-                    let app_wants_mouse = this.terminal.mouse_mode()
-                        && !ev.modifiers.shift
-                        && ev.click_count <= 1;
+                    let app_wants_mouse =
+                        this.terminal.mouse_mode() && !ev.modifiers.shift && ev.click_count <= 1;
                     if app_wants_mouse && this.terminal.mouse_button(0, true, cell.0, cell.1) {
                         this.app_mouse = true;
                         this.selecting = false;
@@ -1221,7 +1280,7 @@ impl Render for TerminalView {
                     }
                     this.app_mouse = false;
                     let kind = match ev.click_count {
-                        2 => terminal::SelectionKind::Word,          // 双击选词（语义边界）
+                        2 => terminal::SelectionKind::Word, // 双击选词（语义边界）
                         n if n >= 3 => terminal::SelectionKind::Line, // 三击选整行
                         _ => terminal::SelectionKind::Simple,
                     };
@@ -1417,17 +1476,8 @@ impl Render for TerminalView {
                             };
                             let origin = point(ox, oy + px(r as f32 * line_px()));
                             paint_row(
-                                row,
-                                origin,
-                                cur,
-                                focused,
-                                &base_font,
-                                hl,
-                                &row_hits,
-                                cell_w,
-                                ime_here,
-                                window,
-                                cx,
+                                row, origin, cur, focused, &base_font, hl, &row_hits, cell_w,
+                                ime_here, window, cx,
                             );
                         }
                     },
@@ -1456,7 +1506,8 @@ impl Render for TerminalView {
                             f32::from(bounds.origin.y) + PAD_Y,
                         ));
                         // 记录自身尺寸，供按卡片大小算行列
-                        size_cell.set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
+                        size_cell
+                            .set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
                         window.handle_input(&fh, ElementInputHandler::new(bounds, entity), cx);
                     },
                 )
@@ -1517,13 +1568,15 @@ impl Render for TerminalView {
             .context_menu(move |menu, _window, _cx| {
                 let sid = menu_sid.clone();
                 let cwd = menu_cwd.clone();
-                menu.item(PopupMenuItem::new("新建任务").on_click(move |_ev, window, cx| {
-                    *cx.default_global::<NewTaskPrefill>() = NewTaskPrefill {
-                        session_id: Some(sid.clone()),
-                        cwd: cwd.clone(),
-                    };
-                    window.dispatch_action(Box::new(NewTask), cx);
-                }))
+                menu.item(
+                    PopupMenuItem::new("新建任务").on_click(move |_ev, window, cx| {
+                        *cx.default_global::<NewTaskPrefill>() = NewTaskPrefill {
+                            session_id: Some(sid.clone()),
+                            cwd: cwd.clone(),
+                        };
+                        window.dispatch_action(Box::new(NewTask), cx);
+                    }),
+                )
             })
     }
 }
@@ -1535,7 +1588,12 @@ const SCROLLBAR_THUMB_MIN: f32 = 28.0;
 
 /// 滚动条 thumb 几何：返回 (thumb 高度, thumb 顶部 y)。
 /// offset=0 → thumb 在底部；offset=max → 顶部（跟 alacritty display_offset 一致）。
-fn scrollbar_thumb(track_h: f32, viewport_rows: usize, max_offset: usize, offset: usize) -> (f32, f32) {
+fn scrollbar_thumb(
+    track_h: f32,
+    viewport_rows: usize,
+    max_offset: usize,
+    offset: usize,
+) -> (f32, f32) {
     let total = viewport_rows.saturating_add(max_offset).max(1);
     // 首帧 grid_size 未量出来时轨道可能比 THUMB_MIN 还矮，min 必须让位，
     // 否则 clamp 遇到 min > max 直接 panic。
@@ -1598,7 +1656,8 @@ impl TerminalView {
                 if let Some(grab) = this.scrollbar_drag {
                     if ev.pressed_button == Some(MouseButton::Left) {
                         let (_, oy) = this.grid_origin.get();
-                        let y = (f32::from(ev.position.y) - oy - grab).clamp(0.0, track_h - thumb_h);
+                        let y =
+                            (f32::from(ev.position.y) - oy - grab).clamp(0.0, track_h - thumb_h);
                         this.jump_scrollbar_to(y + thumb_h * 0.5, track_h, thumb_h, max_off, cx);
                     }
                 }
@@ -1684,7 +1743,11 @@ fn paint_row(
     // 失焦时一律画成空心框（跟 iTerm2 / Zed 一致，terminal_element.rs:1250）——驾驶舱里
     // 多个终端并排，每个都亮着一模一样的实心块的话，根本看不出焦点在谁身上。
     let cursor = cursor.map(|(col, kind)| {
-        let kind = if focused { kind } else { terminal::CursorKind::Hollow };
+        let kind = if focused {
+            kind
+        } else {
+            terminal::CursorKind::Hollow
+        };
         (col, kind)
     });
     // 只有实心块要把底下的字反色（底色由 bg_spans 画、字色由 style_of 换）。竖线 / 下划线 /
@@ -1801,7 +1864,10 @@ fn paint_row(
     for (col, span, bg) in bg_spans(row, &style_of) {
         let x0 = at(col).x.floor();
         let x1 = (at(col).x + px(span as f32 * cell_w)).ceil();
-        window.paint_quad(fill(Bounds::new(point(x0, origin.y), size(x1 - x0, h)), rgb(bg)));
+        window.paint_quad(fill(
+            Bounds::new(point(x0, origin.y), size(x1 - x0, h)),
+            rgb(bg),
+        ));
     }
 
     // 字形只画到最后一个「非 blank」，尾部那些什么都不画的空格不必进批次。
@@ -1837,7 +1903,11 @@ fn paint_row(
     // 非实心块的光标形状：画在文字之上。宽度按宽字符占几格算。
     if let Some((col, kind)) = cursor {
         let fg = rgb(terminal::default_fg());
-        let w = px(if is_wide_at(col) { 2.0 * cell_w } else { cell_w });
+        let w = px(if is_wide_at(col) {
+            2.0 * cell_w
+        } else {
+            cell_w
+        });
         let bounds = Bounds::new(at(col), size(w, h));
         match kind {
             // 实心块已经靠 bg_spans + 反色字画好了
@@ -1850,10 +1920,7 @@ fn paint_row(
             }
             terminal::CursorKind::Underline => {
                 let y = origin.y + h - px(2.0);
-                window.paint_quad(fill(
-                    Bounds::new(point(at(col).x, y), size(w, px(2.0))),
-                    fg,
-                ));
+                window.paint_quad(fill(Bounds::new(point(at(col).x, y), size(w, px(2.0))), fg));
             }
         }
     }
@@ -1861,7 +1928,14 @@ fn paint_row(
     if let Some((text, col)) = ime {
         let fg = terminal::default_fg();
         // 预编辑串：终端默认前景 + 下划线标示「合成中」。
-        let run = run_of(text, CellStyle { fg, underline: true, ..CellStyle::default() });
+        let run = run_of(
+            text,
+            CellStyle {
+                fg,
+                underline: true,
+                ..CellStyle::default()
+            },
+        );
         let shaped = shape(text.to_string(), run, window);
         let w = shaped.width;
         // 先垫底色盖住底下的终端内容，再画拼音，最后把光标接在末尾。
@@ -1988,7 +2062,12 @@ fn text_batches(
     let mut cur: Option<(usize, usize, String, CellStyle)> = None;
     let flush = |cur: &mut Option<(usize, usize, String, CellStyle)>, out: &mut Vec<Batch>| {
         if let Some((col, _, text, style)) = cur.take() {
-            out.push(Batch { col, text, style, wide: false });
+            out.push(Batch {
+                col,
+                text,
+                style,
+                wide: false,
+            });
         }
     };
     for i in 0..end.min(row.len()) {
@@ -2005,7 +2084,12 @@ fn text_batches(
         // 宽字符（后面跟着 '\0' 占位格）：独占一批，绘制时按真实字形宽度居中到两格里。
         if row.get(i + 1).is_some_and(|c| c.ch == '\0') {
             flush(&mut cur, &mut out);
-            out.push(Batch { col: i, text, style, wide: true });
+            out.push(Batch {
+                col: i,
+                text,
+                style,
+                wide: true,
+            });
             continue;
         }
 
@@ -2057,8 +2141,10 @@ fn deliver_native_notification(title: &str, subtitle: &str, body: &str) {
         if ident.is_null() {
             return;
         }
-        let center: *mut Object =
-            msg_send![class!(NSUserNotificationCenter), defaultUserNotificationCenter];
+        let center: *mut Object = msg_send![
+            class!(NSUserNotificationCenter),
+            defaultUserNotificationCenter
+        ];
         if center.is_null() {
             return;
         }
@@ -2096,7 +2182,10 @@ fn find_urls(row: &[terminal::Cell]) -> Vec<(usize, usize, String)> {
                     end -= 1;
                     continue;
                 }
-                if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'') {
+                if matches!(
+                    ch,
+                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+                ) {
                     end -= 1;
                     continue;
                 }
@@ -2145,7 +2234,10 @@ fn find_paths(row: &[terminal::Cell]) -> Vec<(usize, usize, String)> {
                     end -= 1;
                     continue;
                 }
-                if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'') {
+                if matches!(
+                    ch,
+                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+                ) {
                     end -= 1;
                     continue;
                 }
@@ -2189,7 +2281,10 @@ fn cells_to_token(row: &[terminal::Cell], start: usize, end: usize) -> String {
 /// 是可点路径，避免误判。
 fn expand_existing_path(token: &str) -> Option<String> {
     let expanded = match token.strip_prefix('~') {
-        Some(rest) => dirs::home_dir()?.join(rest.trim_start_matches('/')).to_string_lossy().into_owned(),
+        Some(rest) => dirs::home_dir()?
+            .join(rest.trim_start_matches('/'))
+            .to_string_lossy()
+            .into_owned(),
         None => token.to_string(),
     };
     std::path::Path::new(&expanded).exists().then_some(expanded)
@@ -2386,8 +2481,8 @@ fn csi_u_modifiers(m: &Modifiers) -> u8 {
 mod tests {
     // 不能 `use super::*`：那会把 gpui 的 `test` 属性宏一起带进来，盖掉标准 #[test]。
     use super::{
-        bg_spans, cells_to_token, keystroke_to_bytes, link_at, scrollbar_thumb, text_batches,
-        visible_end, CellStyle, SCROLLBAR_THUMB_MIN,
+        CellStyle, SCROLLBAR_THUMB_MIN, bg_spans, cells_to_token, keystroke_to_bytes, link_at,
+        scrollbar_thumb, text_batches, visible_end,
     };
     use crate::terminal::Cell;
     use gpui::{Keystroke, Modifiers};
@@ -2446,7 +2541,10 @@ mod tests {
 
     /// 造一个只改了底色的样式（给 bg_spans 的测试用）。
     fn with_bg(bg: u32) -> CellStyle {
-        CellStyle { bg: Some(bg), ..PLAIN }
+        CellStyle {
+            bg: Some(bg),
+            ..PLAIN
+        }
     }
 
     /// 「拿空格承载底色」是终端里的常规操作：fzf 的选中行、tmux/vim 的状态栏、TUI 菜单的
@@ -2516,10 +2614,18 @@ mod tests {
         // 第 5 格是带下划线的空格（比如 OSC 8 链接铺在空格上）：要画线，不能截在它前面。
         let mut underlined = row("ab      ");
         underlined[5].underline = true;
-        assert_eq!(visible_end(&underlined, &|_| false), 6, "带下划线的空格不算 blank");
+        assert_eq!(
+            visible_end(&underlined, &|_| false),
+            6,
+            "带下划线的空格不算 blank"
+        );
 
         // 悬停链接高亮压在尾部空格上时同理。
-        assert_eq!(visible_end(&cells, &|i| i == 4), 5, "链接高亮的空格不算 blank");
+        assert_eq!(
+            visible_end(&cells, &|i| i == 4),
+            5,
+            "链接高亮的空格不算 blank"
+        );
     }
 
     /// OSC 8 超链接：可见文本只是标题（`Release notes`），真正的 URL 藏在协议里。正则扫
@@ -2538,8 +2644,16 @@ mod tests {
             Some((3, 4, "https://example.com/notes".to_string())),
             "命中 OSC 8：范围覆盖挂着同一 URI 的连续格子"
         );
-        assert_eq!(link_at(&cells, 4), link_at(&cells, 3), "同一链接内任意一格结果相同");
-        assert_eq!(link_at(&cells, 0), None, "没挂链接、可见文本也不是 URL 的格子：没有链接");
+        assert_eq!(
+            link_at(&cells, 4),
+            link_at(&cells, 3),
+            "同一链接内任意一格结果相同"
+        );
+        assert_eq!(
+            link_at(&cells, 0),
+            None,
+            "没挂链接、可见文本也不是 URL 的格子：没有链接"
+        );
     }
 
     /// 零宽字符（变体选择器 U+FE0F、组合变音符等）挂在基字符那一格上（alacritty 的
@@ -2570,7 +2684,10 @@ mod tests {
     fn ambiguous_width_chars_batch_normally() {
         // 网格：—(0) —(1) 正(2,3) —— 破折号只占一格、不带 '\0' 占位，所以它俩连成一批；
         // 「正」是宽字符，按规矩独占一批（见 wide_chars_never_share_a_batch）。
-        assert_eq!(batches(&row("——正")), vec![(0, "——".into()), (2, "正".into())]);
+        assert_eq!(
+            batches(&row("——正")),
+            vec![(0, "——".into()), (2, "正".into())]
+        );
     }
 
     /// 核心不变量：每个全角字各自成批，且起始列 = 它在网格里的真实列号。
@@ -2623,7 +2740,14 @@ mod tests {
         let cells = row("abcd");
         // 前两格一种颜色，后两格另一种。
         let got: Vec<(usize, String)> = text_batches(&cells, cells.len(), &|i| {
-            if i < 2 { PLAIN } else { CellStyle { fg: 0xff0000, ..PLAIN } }
+            if i < 2 {
+                PLAIN
+            } else {
+                CellStyle {
+                    fg: 0xff0000,
+                    ..PLAIN
+                }
+            }
         })
         .into_iter()
         .map(|b| (b.col, b.text))
@@ -2774,4 +2898,3 @@ mod tests {
         assert_eq!(thumb_y, 0.0);
     }
 }
-

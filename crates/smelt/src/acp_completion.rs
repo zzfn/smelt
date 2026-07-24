@@ -62,7 +62,11 @@ pub fn detect_trigger(before_cursor: &str) -> Option<Trigger> {
             continue;
         }
         // 触发符前面必须是行首或空白，否则是词中间的符号（邮箱 / 路径）。
-        if before_cursor[..ix].chars().next_back().is_none_or(|c| c.is_whitespace()) {
+        if before_cursor[..ix]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace())
+        {
             return Some(Trigger {
                 kind: if ch == '@' { Kind::At } else { Kind::Slash },
                 start: ix,
@@ -112,14 +116,26 @@ pub fn list_files(cwd: &str) -> Rc<Vec<String>> {
         return Rc::new(files);
     }
     let mut out = Vec::new();
-    walk(std::path::Path::new(cwd), std::path::Path::new(cwd), 0, &mut out);
+    walk(
+        std::path::Path::new(cwd),
+        std::path::Path::new(cwd),
+        0,
+        &mut out,
+    );
     out.sort();
     Rc::new(out)
 }
 
 fn git_ls_files(cwd: &str) -> Option<Vec<String>> {
     let out = std::process::Command::new("git")
-        .args(["-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard"])
+        .args([
+            "-C",
+            cwd,
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -137,7 +153,9 @@ fn walk(root: &std::path::Path, dir: &std::path::Path, depth: usize, out: &mut V
     if depth > 2 || out.len() > 2000 {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let path = e.path();
         let name = e.file_name();
@@ -169,7 +187,10 @@ mod tests {
             &files[..files.len().min(5)]
         );
         // git ls-files 尊重 .gitignore：构建产物不该混进补全菜单。
-        assert!(!files.iter().any(|f| f.starts_with("target/")), "target/ 不该出现");
+        assert!(
+            !files.iter().any(|f| f.starts_with("target/")),
+            "target/ 不该出现"
+        );
     }
 
     #[test]
@@ -187,9 +208,18 @@ mod tests {
     /// 正常打字不该乱弹菜单：词中间的符号不算触发。
     #[test]
     fn ignores_symbols_inside_words() {
-        assert!(detect_trigger("mail a@b.com").is_none(), "邮箱里的 @ 不该触发");
-        assert!(detect_trigger("path src/main").is_none(), "路径里的 / 不该触发");
-        assert!(detect_trigger("@src/main.rs 然后").is_none(), "打了空格就该收");
+        assert!(
+            detect_trigger("mail a@b.com").is_none(),
+            "邮箱里的 @ 不该触发"
+        );
+        assert!(
+            detect_trigger("path src/main").is_none(),
+            "路径里的 / 不该触发"
+        );
+        assert!(
+            detect_trigger("@src/main.rs 然后").is_none(),
+            "打了空格就该收"
+        );
         assert!(detect_trigger("").is_none());
     }
 

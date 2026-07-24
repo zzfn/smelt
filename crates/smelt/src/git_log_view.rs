@@ -15,11 +15,11 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{h_flex, v_flex, ActiveTheme};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::git_log::{Edge, GitLogState, GraphRow, LogScope};
 use crate::ui_theme;
-use crate::{placeholder_view, Workspace};
+use crate::{Workspace, placeholder_view};
 
 /// 每行高度。与提交列表逐行对齐，图和文字必须共用同一个值。
 pub const ROW_H: f32 = 24.0;
@@ -37,8 +37,11 @@ const LANE_COLORS_DARK: [u32; 6] = [0x7dcfff, 0xbb9af7, 0xe0af68, 0x2ac3de, 0xff
 const LANE_COLORS_LIGHT: [u32; 6] = [0x1f7aa8, 0x7a4aa8, 0x9a6b0a, 0x117a8a, 0xb85c1f, 0x4a7a1f];
 
 fn lane_color(i: usize) -> Hsla {
-    let ring =
-        if ui_theme::is_light() { &LANE_COLORS_LIGHT } else { &LANE_COLORS_DARK };
+    let ring = if ui_theme::is_light() {
+        &LANE_COLORS_LIGHT
+    } else {
+        &LANE_COLORS_DARK
+    };
     rgb(ring[i % ring.len()]).into()
 }
 
@@ -140,7 +143,11 @@ pub fn git_log_view(
     };
 
     if state.commits.is_empty() {
-        let hint = if state.loading { "正在读取提交历史…" } else { "没有提交记录" };
+        let hint = if state.loading {
+            "正在读取提交历史…"
+        } else {
+            "没有提交记录"
+        };
         return placeholder_view(hint, muted);
     }
 
@@ -185,69 +192,80 @@ pub fn git_log_view(
                         .h(px(commits.len() as f32 * ROW_H))
                         .child(graph_canvas(rows, gw)),
                 )
-                .child(v_flex().w_full().children(commits.iter().enumerate().map(|(i, c)| {
-                    let is_sel = selected.as_deref() == Some(c.hash.as_str());
-                    let hash = c.hash.clone();
-                    let ws_click = ws.clone();
-                    let root_click = root.clone();
-                    h_flex()
-                        .id(("log-row", i))
-                        .h(px(ROW_H))
+                .child(
+                    v_flex()
                         .w_full()
-                        .min_w_0()
-                        // 兜底：窄到连固定列都塞不下时，多出来的部分裁掉而不是
-                        // 画到隔壁面板上。
-                        .overflow_hidden()
-                        .items_center()
-                        .gap_2()
-                        .pr_3()
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(accent))
-                        .when(is_sel, |d| d.bg(accent))
-                        .on_click(move |_ev, _w, cx| {
-                            let (h, r) = (hash.clone(), root_click.clone());
-                            ws_click.update(cx, |this, cx| this.select_commit(r, h, cx));
-                        })
-                        // 给分支图让出位置。
-                        .child(div().w(px(gw)).flex_none())
-                        // 引用标签（分支 / tag）。最多两个、每个限宽——CI 生成的
-                        // tag 名能长到 `3242.67318.0.f5206a4c`，不限宽会把标题挤没。
-                        .children(c.refs.iter().take(2).map(|r| {
-                            div()
-                                .flex_none()
-                                .max_w(px(120.))
-                                .truncate()
-                                .px_1()
-                                .rounded_sm()
-                                .text_xs()
-                                .bg(ui_theme::tint(ui_theme::blue(), 0x33))
-                                .text_color(rgb(ui_theme::text_mid()))
-                                .child(r.clone())
-                        }))
-                        .child(div().flex_1().min_w_0().truncate().text_color(fg).child(c.subject.clone()))
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(110.))
-                                .truncate()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(c.author.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(110.))
-                                // 右对齐：今年的是 `07-16 17:53`、往年的是
-                                // `2025-04-22`，宽度不一样，左对齐会参差不齐。
-                                .flex()
-                                .justify_end()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(fmt_time(c.time)),
-                        )
-                }))),
+                        .children(commits.iter().enumerate().map(|(i, c)| {
+                            let is_sel = selected.as_deref() == Some(c.hash.as_str());
+                            let hash = c.hash.clone();
+                            let ws_click = ws.clone();
+                            let root_click = root.clone();
+                            h_flex()
+                                .id(("log-row", i))
+                                .h(px(ROW_H))
+                                .w_full()
+                                .min_w_0()
+                                // 兜底：窄到连固定列都塞不下时，多出来的部分裁掉而不是
+                                // 画到隔壁面板上。
+                                .overflow_hidden()
+                                .items_center()
+                                .gap_2()
+                                .pr_3()
+                                .text_sm()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(accent))
+                                .when(is_sel, |d| d.bg(accent))
+                                .on_click(move |_ev, _w, cx| {
+                                    let (h, r) = (hash.clone(), root_click.clone());
+                                    ws_click.update(cx, |this, cx| this.select_commit(r, h, cx));
+                                })
+                                // 给分支图让出位置。
+                                .child(div().w(px(gw)).flex_none())
+                                // 引用标签（分支 / tag）。最多两个、每个限宽——CI 生成的
+                                // tag 名能长到 `3242.67318.0.f5206a4c`，不限宽会把标题挤没。
+                                .children(c.refs.iter().take(2).map(|r| {
+                                    div()
+                                        .flex_none()
+                                        .max_w(px(120.))
+                                        .truncate()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(ui_theme::tint(ui_theme::blue(), 0x33))
+                                        .text_color(rgb(ui_theme::text_mid()))
+                                        .child(r.clone())
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(fg)
+                                        .child(c.subject.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(110.))
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(c.author.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(110.))
+                                        // 右对齐：今年的是 `07-16 17:53`、往年的是
+                                        // `2025-04-22`，宽度不一样，左对齐会参差不齐。
+                                        .flex()
+                                        .justify_end()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(fmt_time(c.time)),
+                                )
+                        })),
+                ),
         );
 
     v_flex()
@@ -268,7 +286,12 @@ pub fn git_log_view(
                 .border_color(border)
                 .text_sm()
                 .text_color(muted)
-                .child(div().flex_1().min_w_0().child(filter_summary(state, head_branch.as_deref())))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(filter_summary(state, head_branch.as_deref())),
+                )
                 .child(
                     div()
                         .id("git-log-reload")
@@ -309,7 +332,9 @@ fn filter_summary(state: &GitLogState, head: Option<&str>) -> String {
 /// Unix 秒 → `MM-DD HH:MM`。跨年时补上年份，免得把去年的提交看成今天的。
 fn fmt_time(ts: i64) -> String {
     use chrono::{Datelike, Local, TimeZone};
-    let Some(dt) = Local.timestamp_opt(ts, 0).single() else { return String::new() };
+    let Some(dt) = Local.timestamp_opt(ts, 0).single() else {
+        return String::new();
+    };
     let now = Local::now();
     if dt.year() == now.year() {
         dt.format("%m-%d %H:%M").to_string()
@@ -351,7 +376,15 @@ pub fn commit_detail_pane(
                 .border_b_1()
                 .border_color(border)
                 // 提交标题常常很长，这一栏只有 380px，必须截断。
-                .child(div().w_full().min_w_0().truncate().text_sm().text_color(fg).child(c.subject.clone()))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(fg)
+                        .child(c.subject.clone()),
+                )
                 .child(
                     h_flex()
                         .w_full()
@@ -384,11 +417,7 @@ pub fn commit_detail_pane(
 }
 
 /// 提交详情里的文件列表：点一个文件在下方看它的 diff。
-fn commit_diff_list(
-    root: Option<String>,
-    state: &GitLogState,
-    cx: &mut Context<Workspace>,
-) -> Div {
+fn commit_diff_list(root: Option<String>, state: &GitLogState, cx: &mut Context<Workspace>) -> Div {
     let (muted, fg, accent) = {
         let t = cx.theme();
         (t.muted_foreground, t.foreground, t.accent)
@@ -402,33 +431,50 @@ fn commit_diff_list(
     let diff_lines = state.detail_diff.clone();
     let diff_scroll = state.detail_scroll.clone();
 
-    let file_list = v_flex().flex_none().max_h(px(160.)).p_1().children(
-        files.into_iter().enumerate().map(|(i, (st, path))| {
-            let is_sel = sel_file.as_deref() == Some(path.as_str());
-            let ws_click = ws.clone();
-            let (p, r) = (path.clone(), root.clone());
-            h_flex()
-                .id(("commit-file", i))
-                .gap_2()
-                .px_2()
-                .py(px(1.0))
-                .text_sm()
-                .rounded_sm()
-                .cursor_pointer()
-                .hover(|d| d.bg(accent))
-                .when(is_sel, |d| d.bg(accent))
-                .on_click(move |_ev, _w, cx| {
-                    let (p, r) = (p.clone(), r.clone());
-                    ws_click.update(cx, |this, cx| {
-                        if let Some(r) = r {
-                            this.select_commit_file(r, p, cx);
-                        }
-                    });
-                })
-                .child(div().flex_none().w(px(14.)).text_xs().text_color(muted).child(st))
-                .child(div().flex_1().min_w_0().truncate().text_color(fg).child(path))
-        }),
-    );
+    let file_list =
+        v_flex()
+            .flex_none()
+            .max_h(px(160.))
+            .p_1()
+            .children(files.into_iter().enumerate().map(|(i, (st, path))| {
+                let is_sel = sel_file.as_deref() == Some(path.as_str());
+                let ws_click = ws.clone();
+                let (p, r) = (path.clone(), root.clone());
+                h_flex()
+                    .id(("commit-file", i))
+                    .gap_2()
+                    .px_2()
+                    .py(px(1.0))
+                    .text_sm()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(accent))
+                    .when(is_sel, |d| d.bg(accent))
+                    .on_click(move |_ev, _w, cx| {
+                        let (p, r) = (p.clone(), r.clone());
+                        ws_click.update(cx, |this, cx| {
+                            if let Some(r) = r {
+                                this.select_commit_file(r, p, cx);
+                            }
+                        });
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(14.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(st),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(fg)
+                            .child(path),
+                    )
+            }));
 
     // 选中文件的 diff：复用 Git 页的行渲染，配色与行内高亮保持一致。
     let diff = if sel_file.is_none() {
@@ -517,7 +563,14 @@ pub fn branch_tree(
                  root: Option<String>,
                  is_remote: bool| {
         v_flex()
-            .child(div().px_2().py(px(1.0)).text_xs().text_color(muted).child(title))
+            .child(
+                div()
+                    .px_2()
+                    .py(px(1.0))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(title),
+            )
             .children(names.into_iter().enumerate().map(move |(i, name)| {
                 let on = scope == LogScope::Branch(name.clone());
                 let is_head = head.as_deref() == Some(name.as_str());
@@ -572,7 +625,8 @@ pub fn branch_tree(
                     // 右键：签出 / 合并到当前 / 删除。远端分支签出时 git 的 DWIM
                     // 会自动建同名本地跟踪分支，所以两边用同一条命令。
                     .context_menu({
-                        let (ws3, r3, n3, head3) = (ws2b.clone(), r2b.clone(), name.clone(), head2.clone());
+                        let (ws3, r3, n3, head3) =
+                            (ws2b.clone(), r2b.clone(), name.clone(), head2.clone());
                         move |menu, _window, _cx| {
                             let is_head = head3.as_deref() == Some(n3.as_str());
                             let (ws_co, r_co, n_co) = (ws3.clone(), r3.clone(), n3.clone());
@@ -624,14 +678,16 @@ pub fn branch_tree(
                                     } else {
                                         "删除分支…"
                                     })
-                                    .on_click(move |_ev, _window, cx| {
-                                        let (r, n) = (r_del.clone(), n_del.clone());
-                                        ws_del.update(cx, |this, cx| {
-                                            if let Some(r) = r {
-                                                this.start_delete_branch(r, n, remote, cx);
-                                            }
-                                        });
-                                    }),
+                                    .on_click(
+                                        move |_ev, _window, cx| {
+                                            let (r, n) = (r_del.clone(), n_del.clone());
+                                            ws_del.update(cx, |this, cx| {
+                                                if let Some(r) = r {
+                                                    this.start_delete_branch(r, n, remote, cx);
+                                                }
+                                            });
+                                        },
+                                    ),
                                 );
                             menu
                         }
@@ -673,5 +729,13 @@ pub fn branch_tree(
             root.clone(),
             false,
         ))
-        .child(group("远程", remote, scope.clone(), head_branch, ws, root, true))
+        .child(group(
+            "远程",
+            remote,
+            scope.clone(),
+            head_branch,
+            ws,
+            root,
+            true,
+        ))
 }

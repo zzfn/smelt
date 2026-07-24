@@ -35,9 +35,9 @@ mod stage;
 mod status_bar;
 mod status_item;
 mod tasks;
-mod toast;
 mod terminal;
 mod terminal_view;
+mod toast;
 mod ui_theme;
 mod updater;
 mod usage_stats;
@@ -50,38 +50,46 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gpui::*;
-use gpui::prelude::FluentBuilder;
 use gpui::InteractiveElement;
+use gpui::prelude::FluentBuilder;
+use gpui::*;
 use gpui_component::badge::Badge;
 use gpui_component::color_picker::ColorPickerState;
 use gpui_component::input::Input;
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_component::notification::Notification;
-use gpui_component::slider::SliderState;
 use gpui_component::resizable::{
-    h_resizable, resizable_panel, v_resizable, ResizablePanelEvent, ResizableState,
+    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, v_resizable,
 };
+use gpui_component::slider::SliderState;
 use gpui_component::*;
 use notify::RecommendedWatcher;
 use terminal_view::TerminalView;
 
 use file_tree::{
-    file_content_pane, file_tree, search_results_view, DeleteFileTarget, OpenFile, SearchState,
+    DeleteFileTarget, OpenFile, SearchState, file_content_pane, file_tree, search_results_view,
 };
 use git_panel::{
-    git_view, run_git, BranchList, DeleteWorktreeTarget, GitDiff, GitStatusData, RepoInfo,
+    BranchList, DeleteWorktreeTarget, GitDiff, GitStatusData, RepoInfo, git_view, run_git,
 };
 use hotspot::hotspot_view;
-use session_history::{history_view, HistoryListState, HistoryPane};
-use settings::{load_appearance, load_launch_config, Appearance, LlmInputs};
+use session_history::{HistoryListState, HistoryPane, history_view};
+use settings::{Appearance, LlmInputs, load_appearance, load_launch_config};
 use usage_stats::format_count;
-
 
 // Cmd+Q 退出的应用级 action（gpui 无默认菜单栏，需自建菜单栏 + 键位绑定）。
 gpui::actions!(
     smelt,
-    [Quit, OpenSettings, CheckForUpdate, ReportIssue, SendSelectionToTerminal, NewTask]
+    [
+        Quit,
+        OpenSettings,
+        CheckForUpdate,
+        ReportIssue,
+        SendSelectionToTerminal,
+        NewTask,
+        PrevSession,
+        NextSession
+    ]
 );
 
 /// 命令面板里的一个可执行动作。
@@ -131,7 +139,10 @@ impl RenderOnce for CmdItem {
         } else {
             cx.theme().foreground
         };
-        self.base.px_3().py_1().child(div().text_color(fg).child(self.label))
+        self.base
+            .px_3()
+            .py_1()
+            .child(div().text_color(fg).child(self.label))
     }
 }
 
@@ -291,7 +302,12 @@ impl Global for PendingAgentNotifs {}
 /// 那个 session id 还没有数据都返回 None。
 fn daemon_state_for(view: &Entity<TerminalView>, cx: &App) -> Option<terminal::DaemonSessionState> {
     let id = view.read(cx).session_id().to_string();
-    cx.try_global::<DaemonStates>()?.0.lock().unwrap().get(&id).cloned()
+    cx.try_global::<DaemonStates>()?
+        .0
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
 }
 
 /// 主区终端分屏布局树：叶子是一个终端，内部 Split 把区域按某轴切成多块。
@@ -302,6 +318,12 @@ enum Pane {
         axis: Axis,
         state: Entity<ResizableState>,
         children: Vec<Pane>,
+        /// 从存档恢复的各子块像素尺寸；新建分屏是空的（均分）。
+        ///
+        /// 渲染时当 `resizable_panel().size()` 的**初始值**传下去。每帧原样传也不会
+        /// 冲掉用户拖出来的比例——gpui-component 里 initial_size 只在 panel 自己还
+        /// 没有 size 时生效，一旦拖过就走 `panel_state.size` 那条分支（panel.rs）。
+        init_sizes: Vec<f32>,
     },
 }
 
@@ -394,7 +416,10 @@ impl Session {
     /// 单终端会话。
     fn single(view: Entity<TerminalView>) -> Self {
         Self {
-            kind: SessionKind::Term { layout: Pane::Leaf(view.clone()), active: view },
+            kind: SessionKind::Term {
+                layout: Pane::Leaf(view.clone()),
+                active: view,
+            },
             custom_title: None,
             _acp_persist_sub: None,
         }
@@ -469,20 +494,22 @@ impl Session {
     /// Braille spinner 开头）时取它的任务名，再否则回退 cwd 末段——避免把普通 shell 的
     /// user@host:path 标题当任务名。
     fn title(&self, cx: &App) -> String {
-        self.custom_title.clone().unwrap_or_else(|| match &self.kind {
-            SessionKind::Term { active, .. } => pane_auto_title(active, cx),
-            SessionKind::Acp(view) => {
-                let dir = view
-                    .read(cx)
-                    .cwd()
-                    .map(|c| c.rsplit('/').next().unwrap_or(&c).to_string());
-                let agent = view.read(cx).agent_kind().short_label();
-                match dir {
-                    Some(d) if !d.is_empty() => format!("{agent} 对话 · {d}"),
-                    _ => format!("{agent} 对话"),
+        self.custom_title
+            .clone()
+            .unwrap_or_else(|| match &self.kind {
+                SessionKind::Term { active, .. } => pane_auto_title(active, cx),
+                SessionKind::Acp(view) => {
+                    let dir = view
+                        .read(cx)
+                        .cwd()
+                        .map(|c| c.rsplit('/').next().unwrap_or(&c).to_string());
+                    let agent = view.read(cx).agent_kind().short_label();
+                    match dir {
+                        Some(d) if !d.is_empty() => format!("{agent} 对话 · {d}"),
+                        _ => format!("{agent} 对话"),
+                    }
                 }
-            }
-        })
+            })
     }
 
     /// 会话工作目录：活动终端的 cwd（侧栏分组用）。
@@ -515,7 +542,8 @@ impl Session {
                 return Some(s.to_string());
             }
         }
-        v.iter().find_map(|t| t.read(cx).notification().map(|s| s.to_string()))
+        v.iter()
+            .find_map(|t| t.read(cx).notification().map(|s| s.to_string()))
     }
 
     /// 会话内扫到的权限菜单（优先含审批/菜单的 pane）。
@@ -795,6 +823,8 @@ fn split_leaf(
                 axis,
                 state,
                 children: vec![old, Pane::Leaf(new_leaf)],
+                // 新拆出来的分屏没有历史尺寸，均分。
+                init_sizes: Vec::new(),
             };
             true
         }
@@ -831,6 +861,10 @@ struct WsState {
     /// 所有会话（每个 = 一棵分屏树 + 会话内活动叶子遍历序）。
     #[serde(default)]
     sessions: Vec<SessionState>,
+    /// 已打开的项目根目录（有序）。独立于会话存在，见 Workspace::projects。
+    /// 旧存档没有这个字段 → 启动时从各会话 cwd 反推一份（见 Workspace::new）。
+    #[serde(default)]
+    projects: Vec<String>,
     /// 当前活动会话索引。
     #[serde(default)]
     active_session: usize,
@@ -892,8 +926,8 @@ struct AcpSaved {
     resume_session_id: Option<agent_client_protocol::schema::v1::SessionId>,
 }
 
-/// 可序列化的分屏布局镜像：叶子存该终端 cwd + 守护会话 id，Split 存方向 + 子节点。
-/// 拖动比例暂不持久化，重开按均分；结构 / 嵌套 / 方向完整恢复。
+/// 可序列化的分屏布局镜像：叶子存该终端 cwd + 守护会话 id，Split 存方向 + 子节点 +
+/// 各子块尺寸。结构 / 嵌套 / 方向 / 拖出来的比例都完整恢复。
 /// id 用于重开 GUI 时 reattach smeltd 里还活着的会话（旧存档无 id → 开新会话）。
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum PaneState {
@@ -912,7 +946,111 @@ enum PaneState {
         #[serde(default)]
         launch_cmd: Option<String>,
     },
-    Split { axis: SplitAxis, children: Vec<PaneState> },
+    Split {
+        axis: SplitAxis,
+        children: Vec<PaneState>,
+        /// 各子块的像素尺寸 —— 存盘那一刻 ResizableState 里的真实值（含用户拖拽结果）。
+        /// 旧存档没有这个字段 → 空 vec → 按均分，跟以前行为一致。
+        #[serde(default)]
+        sizes: Vec<f32>,
+    },
+}
+
+/// 侧栏的一个项目分组。**身份是 root（路径），不是 label**——两个不同目录的末段名
+/// 可能一模一样（`~/a/smelt` 和 `~/b/smelt`），拿显示名当 key 会把它们认成同一个项目：
+/// 第二个连行都不显示、会话挂错组、关一个连带关掉另一个的会话。
+pub(crate) struct ProjectGroup {
+    /// 项目根目录：唯一标识。active_project / collapsed_projects / close_project 全用它。
+    pub root: String,
+    /// 侧栏显示名。末段重名时往前补父目录段区分（`a · smelt` / `b · smelt`）。
+    pub label: String,
+    /// 组内会话在 `sessions` 里的下标（顺序 = 侧栏显示顺序）。
+    pub sessions: Vec<usize>,
+}
+
+/// 显示名撞车时往前补 `extra` 段父目录：`/a/b/smelt` + 1 → `b · smelt`。
+/// base 是这一组本来的显示名（worktree 是「仓库 · 分支」，普通项目是目录末段）。
+fn label_with_parents(root: &str, base: &str, extra: usize) -> String {
+    if extra == 0 {
+        return base.to_string();
+    }
+    let segs: Vec<&str> = root
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let end = segs.len().saturating_sub(1); // base 已经代表末段
+    let start = end.saturating_sub(extra);
+    if start >= end {
+        return base.to_string();
+    }
+    format!("{} · {}", segs[start..end].join("/"), base)
+}
+
+/// 给重名的分组逐步补父目录段，直到互不相同（或路径已经补到顶）。
+fn disambiguate_labels(groups: &mut [ProjectGroup], bases: &[String]) {
+    let mut extra = vec![0usize; groups.len()];
+    // 每轮给所有重名组多补一段；路径最深也就那么几段，8 轮足够收敛。
+    for _ in 0..8 {
+        let mut dup: Vec<usize> = Vec::new();
+        for i in 0..groups.len() {
+            if groups
+                .iter()
+                .enumerate()
+                .any(|(j, g)| j != i && g.label == groups[i].label)
+            {
+                dup.push(i);
+            }
+        }
+        if dup.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for i in dup {
+            let next = extra[i] + 1;
+            let candidate = label_with_parents(&groups[i].root, &bases[i], next);
+            if candidate != groups[i].label {
+                extra[i] = next;
+                groups[i].label = candidate;
+                changed = true;
+            }
+        }
+        // 全都补到路径顶了还重名（真同路径 / 只剩根）→ 认命，别空转。
+        if !changed {
+            return;
+        }
+    }
+}
+
+/// cwd 归属哪个项目根：cwd 就是根、或落在根之下（必须是完整路径段，`/a/bc` 不算
+/// 落在 `/a/b` 下）。多个根都匹配时取最深的那个——`~/dev/a` 和 `~/dev/a/sub` 都打开
+/// 过时，子目录的会话归后者。空 cwd 或谁都不沾 → None（调用方按 cwd 自建隐式组）。
+fn project_root_of(projects: &[String], cwd: &str) -> Option<String> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let cwd = cwd.trim_end_matches('/');
+    projects
+        .iter()
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|root| !root.is_empty() && (cwd == *root || cwd.starts_with(&format!("{root}/"))))
+        .max_by_key(|root| root.len())
+        .map(str::to_string)
+}
+
+/// 存档里一个会话的代表 cwd：ACP 取自身 cwd，终端取分屏树里第一个有 cwd 的叶子。
+/// 旧存档迁移（反推项目列表）用。
+fn session_state_cwd(s: &SessionState) -> Option<String> {
+    if let Some(acp) = &s.acp {
+        return acp.cwd.clone();
+    }
+    fn first_cwd(p: &PaneState) -> Option<String> {
+        match p {
+            PaneState::Leaf { cwd, .. } => cwd.clone(),
+            PaneState::Split { children, .. } => children.iter().find_map(first_cwd),
+        }
+    }
+    first_cwd(&s.layout)
 }
 
 /// 新会话 id（uuid v4）：GUI 与 smeltd 之间的持久身份。
@@ -959,9 +1097,21 @@ fn pane_to_state(pane: &Pane, cx: &App) -> PaneState {
                 launch_cmd: t.launch_cmd().map(str::to_string),
             }
         }
-        Pane::Split { axis, children, .. } => PaneState::Split {
+        Pane::Split {
+            axis,
+            state,
+            children,
+            ..
+        } => PaneState::Split {
             axis: (*axis).into(),
             children: children.iter().map(|c| pane_to_state(c, cx)).collect(),
+            // 直接读 ResizableState：用户拖出来的当前尺寸就在里面，不用自己跟着同步一份。
+            sizes: state
+                .read(cx)
+                .sizes()
+                .iter()
+                .map(|p| f32::from(*p))
+                .collect(),
         },
     }
 }
@@ -993,17 +1143,12 @@ fn spawn_layout_leaves_rec(ps: &PaneState, out: &mut Vec<SpawnedLeaf>) -> Result
             launch_cmd,
         } => {
             let sid = id.clone().unwrap_or_else(new_sid);
-            let terminal = terminal::Terminal::spawn(
-                24,
-                80,
-                cwd.as_deref(),
-                &sid,
-                launch_cmd.as_deref(),
-            )
-            .map_err(|e| {
-                eprintln!("[workspace] 恢复会话 {sid}（{cwd:?}）失败：{e:#}");
-                e.to_string()
-            })?;
+            let terminal =
+                terminal::Terminal::spawn(24, 80, cwd.as_deref(), &sid, launch_cmd.as_deref())
+                    .map_err(|e| {
+                        eprintln!("[workspace] 恢复会话 {sid}（{cwd:?}）失败：{e:#}");
+                        e.to_string()
+                    })?;
             out.push(SpawnedLeaf {
                 terminal,
                 sid,
@@ -1048,7 +1193,11 @@ fn rebuild_pane_ready(
             tabs.push(v.clone());
             Some(Pane::Leaf(v))
         }
-        PaneState::Split { axis, children } => {
+        PaneState::Split {
+            axis,
+            children,
+            sizes,
+        } => {
             let mut kept: Vec<Pane> = children
                 .iter()
                 .filter_map(|c| rebuild_pane_ready(c, leaves, tabs, cx))
@@ -1059,6 +1208,13 @@ fn rebuild_pane_ready(
                 _ => Some(Pane::Split {
                     axis: (*axis).into(),
                     state: cx.new(|_| ResizableState::default()),
+                    // 有子块没起来被丢掉时尺寸就对不上号了，宁可整组均分也不能错位——
+                    // 错位会把 A 的宽度套到 B 头上，比均分更糟。
+                    init_sizes: if kept.len() == children.len() && sizes.len() == kept.len() {
+                        sizes.clone()
+                    } else {
+                        Vec::new()
+                    },
                     children: kept,
                 }),
             }
@@ -1197,11 +1353,20 @@ struct Workspace {
     commit_msg_input: Option<Entity<gpui_component::input::InputState>>,
     /// 「生成」按钮请求 LLM 生成 commit message 进行中（防连点、按钮显示"生成中…"）。
     commit_msg_generating: bool,
-    /// 活动项目（project_groups 的分组名）：会话列表里高亮哪一组、顶栏显示谁、
-    /// 「+Agent/+Term」新建到哪个 cwd。None 或该组已消失时回退到活动会话所在组
-    /// （见 active_project_name）。
+    /// 「关闭项目」二次确认弹窗：(显示名, root 路径, 会连带关掉的会话数)。Some = 弹窗开着。
+    /// 显示名只用来写文案，真正关哪个项目认 root。空项目不走确认（无损），会话数恒 > 0。
+    close_project_target: Option<(String, String, usize)>,
+    /// 已打开的项目根目录（有序，就是侧栏分组的骨架）。项目是**独立于会话**的实体：
+    /// 「打开项目」只往这里加一条、不建会话；项目下最后一个会话关掉了，这一条也还在
+    /// （侧栏显示 0 个会话的空项目）。要它消失只能显式「关闭项目」。
+    /// 会话按 cwd 挂到项目下（见 project_root_for_cwd）；挂不上的（比如 Finder 拖进来
+    /// 之前的旧会话）仍按自己的 cwd 自建隐式分组，不污染这份列表。
+    projects: Vec<String>,
+    /// 活动项目的 **root 路径**（不是显示名——同名目录是两个项目，见 ProjectGroup）：
+    /// 会话列表里高亮哪一组、顶栏显示谁、「+对话/+终端」新建到哪个 cwd。None 或该组
+    /// 已消失时回退到活动会话所在组（见 active_project_root）。
     active_project: Option<String>,
-    /// 会话列表里被折叠起来的项目分组名。
+    /// 会话列表里被折叠起来的项目（存 root 路径，同上）。
     collapsed_projects: HashSet<String>,
     /// 文件树里被用户折叠起来的项目根目录（多根工作区才有；默认全展开，只有在这个
     /// 集合里的才收起，见 file_tree / toggle_root_collapsed）。持久化。
@@ -1456,6 +1621,9 @@ struct Workspace {
     /// 全部失灵"。切到非终端页面时把 focus 显式认领到这个句柄上，保证 Workspace 的
     /// on_key_down 始终在 dispatch 路径上。
     focus_handle: FocusHandle,
+    /// 冷启动的会话恢复流程是否已经跑完（没有待恢复会话时启动即为 true）。
+    /// save_state 的抹盘安全阀靠它区分「还没恢复上来的空」和「用户真把会话全关了」。
+    sessions_restored: bool,
 }
 
 /// 历史会话页「继续」把已读出的 `Turn` 列表转成 `AcpEntry`，好塞进新建的占位
@@ -1476,7 +1644,10 @@ fn turns_to_acp_entries(turns: &[session_history::Turn]) -> Vec<acp_view::AcpEnt
             continue;
         }
         if !t.text.trim().is_empty() {
-            out.push(acp_view::AcpEntry::Assistant { text: t.text.clone(), thought: false });
+            out.push(acp_view::AcpEntry::Assistant {
+                text: t.text.clone(),
+                thought: false,
+            });
         }
         for (j, tool) in t.tools.iter().enumerate() {
             out.push(acp_view::AcpEntry::ToolCall {
@@ -1507,20 +1678,39 @@ impl Workspace {
         let restore_orphans = pending_sessions.clone();
         let sessions: Vec<Session> = Vec::new();
 
+        // 项目列表：新存档直接读；旧存档（没有 projects 字段）从各会话 cwd 反推一份，
+        // 保证升级后侧栏分组跟升级前长得一样，之后这些项目就独立于会话活着了。
+        let projects: Vec<String> = match saved.as_ref() {
+            Some(s) if !s.projects.is_empty() => s.projects.clone(),
+            _ => {
+                let mut seen: Vec<String> = Vec::new();
+                for cwd in pending_sessions.iter().filter_map(session_state_cwd) {
+                    if !cwd.is_empty() && !seen.contains(&cwd) {
+                        seen.push(cwd);
+                    }
+                }
+                seen
+            }
+        };
+
         // 文件树列 resize：拖动完 emit Resized，写回存档持久化宽度。
         let file_tree_resize = cx.new(|_| ResizableState::default());
-        let _file_tree_resize_sub =
-            cx.subscribe(&file_tree_resize, |this, _state, _e: &ResizablePanelEvent, cx| {
+        let _file_tree_resize_sub = cx.subscribe(
+            &file_tree_resize,
+            |this, _state, _e: &ResizablePanelEvent, cx| {
                 this.save_state(cx);
-            });
+            },
+        );
         // 日志页三栏 resize（不落盘：日志是临时查看，没必要持久化）。
         let git_log_resize = cx.new(|_| ResizableState::default());
         // Git 页左栏 resize：同上一套，拖完落盘。
         let git_left_resize = cx.new(|_| ResizableState::default());
-        let _git_left_resize_sub =
-            cx.subscribe(&git_left_resize, |this, _state, _e: &ResizablePanelEvent, cx| {
+        let _git_left_resize_sub = cx.subscribe(
+            &git_left_resize,
+            |this, _state, _e: &ResizablePanelEvent, cx| {
                 this.save_state(cx);
-            });
+            },
+        );
 
         let mut ws = Self {
             sessions,
@@ -1556,6 +1746,10 @@ impl Workspace {
             diff_comment_input: None,
             commit_msg_input: None,
             commit_msg_generating: false,
+            // 没有待恢复会话 → 一开始就算「恢复完毕」，否则等 schedule_session_restore 置位。
+            sessions_restored: pending_sessions.is_empty(),
+            close_project_target: None,
+            projects,
             active_project: None,
             collapsed_projects: HashSet::new(),
             collapsed_roots: saved
@@ -1730,6 +1924,8 @@ impl Workspace {
             });
         }
         if pending.is_empty() {
+            // 只有 ACP 会话（已在上面同步建好占位）→ 恢复到此为止。
+            self.sessions_restored = true;
             self.check_daemon_outdated(cx);
             cx.notify();
             return;
@@ -1784,7 +1980,8 @@ impl Workspace {
                     };
                     let mut leaf_iter = leaves.into_iter();
                     let mut tabs = Vec::new();
-                    let Some(layout) = rebuild_pane_ready(&ss.layout, &mut leaf_iter, &mut tabs, cx)
+                    let Some(layout) =
+                        rebuild_pane_ready(&ss.layout, &mut leaf_iter, &mut tabs, cx)
                     else {
                         return Some(ss);
                     };
@@ -1809,6 +2006,7 @@ impl Workspace {
 
             let _ = this.update(cx, |this, cx| {
                 this.restore_orphans = failed;
+                this.sessions_restored = true;
                 this.active_session = active_session.min(this.sessions.len().saturating_sub(1));
                 this.save_state(cx);
                 if !this.restore_orphans.is_empty() {
@@ -1868,37 +2066,87 @@ impl Workspace {
         self.sessions.get(self.active_session)
     }
 
-    /// 按会话的 cwd 分组成「项目」：(项目名, cwd, 该项目下的会话下标列表)。
-    /// 侧栏渲染和拖拽排序共用同一份算法，避免两处各算一遍、行为跑偏。临时终端
-    /// （cwd 落在 scratch_dir）单独归一组「临时终端」；worktree 检出显示「仓库名 ·
-    /// 分支名」（见 group_info_for_cwd），且跟主仓库、其余 worktree 聚在一起排序，
-    /// 不会因为创建时间跟别的项目穿插而散落在列表各处——组内、组间相对顺序仍按
-    /// 「同一簇里最早出现的组」的先后来（stable_sort，不会无意义打乱手动拖拽过的
-    /// 顺序）。
-    fn project_groups(&self, cx: &App) -> Vec<(String, String, Vec<usize>)> {
-        let mut projects: Vec<(String, String, Vec<usize>)> = Vec::new();
-        let mut cluster_of: HashMap<String, Option<String>> = HashMap::new();
+    /// 某个 cwd 归属哪个已打开项目（见 project_root_of）。
+    fn project_root_for_cwd(&self, cwd: &str) -> Option<String> {
+        project_root_of(&self.projects, cwd)
+    }
+
+    /// 侧栏分组（见 ProjectGroup）。骨架是 `self.projects`——项目独立于会话存在，所以
+    /// 一个会话都没有的项目照样出现（sessions 为空）。会话按 cwd 挂到所属项目下；挂不上
+    /// 的（旧会话、临时目录）仍按自己的 cwd 自建隐式组接在后面。
+    ///
+    /// 分组身份一律用 **root 路径**：末段同名的两个目录是两个项目，各占一行、会话不混。
+    /// 显示名重复时由 disambiguate_labels 补父目录段区分。
+    ///
+    /// 侧栏渲染和拖拽排序共用同一份算法，避免两处各算一遍、行为跑偏。worktree 检出
+    /// 显示「仓库名 · 分支名」（见 group_info_for_cwd），且跟主仓库、其余 worktree 聚在
+    /// 一起排序，不会散落在列表各处——组间相对顺序按「同一簇里最早出现的组」的先后来
+    /// （stable_sort，不会无意义打乱手动拖拽过的顺序）。
+    pub(crate) fn project_groups(&self, cx: &App) -> Vec<ProjectGroup> {
+        let mut groups: Vec<ProjectGroup> = Vec::new();
+        // 聚簇 key（worktree 与主仓库共享 common-dir）与消歧用的原始显示名，按组下标存。
+        let mut clusters: Vec<Option<String>> = Vec::new();
+        let mut bases: Vec<String> = Vec::new();
+        let same_root = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+
+        // 骨架：已打开的项目按列表顺序占位，先不管有没有会话。
+        for root in &self.projects {
+            if groups.iter().any(|g| same_root(&g.root, root)) {
+                continue;
+            }
+            let (label, cluster) = self.group_info_for_cwd(root);
+            bases.push(label.clone());
+            clusters.push(cluster);
+            groups.push(ProjectGroup {
+                root: root.clone(),
+                label,
+                sessions: Vec::new(),
+            });
+        }
+        // 会话挂到所属项目下；无主的按自己的 cwd 自建一组。
         for (ix, s) in self.sessions.iter().enumerate() {
             let cwd = s.cwd(cx).unwrap_or_default();
-            let (name, cluster) = self.group_info_for_cwd(&cwd);
-            match projects.iter_mut().find(|(n, _, _)| *n == name) {
-                Some(p) => p.2.push(ix),
+            let owner = self.project_root_for_cwd(&cwd);
+            let root = owner.unwrap_or(cwd);
+            match groups.iter_mut().find(|g| same_root(&g.root, &root)) {
+                Some(g) => g.sessions.push(ix),
                 None => {
-                    cluster_of.insert(name.clone(), cluster);
-                    projects.push((name, cwd, vec![ix]));
+                    let (label, cluster) = self.group_info_for_cwd(&root);
+                    bases.push(label.clone());
+                    clusters.push(cluster);
+                    groups.push(ProjectGroup {
+                        root,
+                        label,
+                        sessions: vec![ix],
+                    });
                 }
             }
         }
+
+        // 同仓库（主仓库 + 各 worktree）聚到一起：按「这一簇里最早出现的组」排。
+        let key_of = |i: usize| {
+            clusters[i]
+                .clone()
+                .unwrap_or_else(|| groups[i].root.clone())
+        };
         let mut first_seen: HashMap<String, usize> = HashMap::new();
-        for (i, (name, _, _)) in projects.iter().enumerate() {
-            let key = cluster_of.get(name).cloned().flatten().unwrap_or_else(|| name.clone());
-            first_seen.entry(key).or_insert(i);
+        for i in 0..groups.len() {
+            first_seen.entry(key_of(i)).or_insert(i);
         }
-        projects.sort_by_key(|(name, _, _)| {
-            let key = cluster_of.get(name).cloned().flatten().unwrap_or_else(|| name.clone());
-            first_seen[&key]
-        });
-        projects
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by_key(|&i| first_seen[&key_of(i)]);
+        let mut sorted: Vec<ProjectGroup> = Vec::with_capacity(groups.len());
+        let mut sorted_bases: Vec<String> = Vec::with_capacity(groups.len());
+        for i in order {
+            sorted.push(ProjectGroup {
+                root: groups[i].root.clone(),
+                label: groups[i].label.clone(),
+                sessions: groups[i].sessions.clone(),
+            });
+            sorted_bases.push(bases[i].clone());
+        }
+        disambiguate_labels(&mut sorted, &sorted_bases);
+        sorted
     }
 
     /// 拖拽排序：把 dragged 会话挪到 target 会话旁边（before=true 插到它前面，否则插到
@@ -1917,11 +2165,14 @@ impl Workspace {
         }
         let groups = self.project_groups(cx);
         let group_of = |id: EntityId| {
-            groups
-                .iter()
-                .position(|(_, _, ixs)| ixs.iter().any(|&ix| self.sessions[ix].anchor_id() == id))
+            groups.iter().position(|g| {
+                g.sessions
+                    .iter()
+                    .any(|&ix| self.sessions[ix].anchor_id() == id)
+            })
         };
-        let (Some(dragged_group), Some(target_group)) = (group_of(dragged), group_of(target)) else {
+        let (Some(dragged_group), Some(target_group)) = (group_of(dragged), group_of(target))
+        else {
             return;
         };
         if dragged_group != target_group {
@@ -1936,7 +2187,11 @@ impl Workspace {
 
         let active_id = self.cur().map(|s| s.anchor_id());
         let session = self.sessions.remove(from_ix);
-        let adjusted_target_ix = if from_ix < target_ix { target_ix - 1 } else { target_ix };
+        let adjusted_target_ix = if from_ix < target_ix {
+            target_ix - 1
+        } else {
+            target_ix
+        };
         let insert_at = adjusted_target_ix + if before { 0 } else { 1 };
         self.sessions.insert(insert_at, session);
 
@@ -1950,37 +2205,42 @@ impl Workspace {
     }
 
     /// 拖拽排序：把 from 项目的所有会话（保持相对顺序）整体挪到 to 项目最前面。
-    /// （项目拖拽待接到 rail，暂时闲置；见 ProjectDrag 注释。）
+    /// 认 **root 路径**不认显示名（同名目录是两个项目，见 ProjectGroup）。
+    /// （项目拖拽待接到 UI，暂时闲置；见 ProjectDrag 注释。）
     #[allow(dead_code)]
-    fn move_project_near(&mut self, from_name: SharedString, to_name: SharedString, cx: &mut Context<Self>) {
-        if from_name == to_name {
+    fn move_project_near(&mut self, from_root: &str, to_root: &str, cx: &mut Context<Self>) {
+        let same_root = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+        if same_root(from_root, to_root) {
             return;
         }
         let groups = self.project_groups(cx);
-        let Some((_, _, from_ixs)) = groups.iter().find(|(n, _, _)| n.as_str() == from_name.as_ref())
-        else {
+        let Some(from) = groups.iter().find(|g| same_root(&g.root, from_root)) else {
             return;
         };
-        if !groups.iter().any(|(n, _, _)| n.as_str() == to_name.as_ref()) {
+        if !groups.iter().any(|g| same_root(&g.root, to_root)) {
             return;
         }
-        let mut from_ixs = from_ixs.clone();
+        let mut from_ixs = from.sessions.clone();
         from_ixs.sort_unstable();
 
         let active_id = self.cur().map(|s| s.anchor_id());
         // 降序 remove 保证前面下标不受后面删除影响；收集完再倒回原相对顺序。
-        let mut moved: Vec<Session> = from_ixs.iter().rev().map(|&ix| self.sessions.remove(ix)).collect();
+        let mut moved: Vec<Session> = from_ixs
+            .iter()
+            .rev()
+            .map(|&ix| self.sessions.remove(ix))
+            .collect();
         moved.reverse();
 
         let insert_at = self
             .sessions
             .iter()
             .position(|s| {
+                // 归属判定必须跟 project_groups 用同一套（project_root_for_cwd），
+                // 否则这里永远找不到目标组、挪动直接失效。
                 let cwd = s.cwd(cx).unwrap_or_default();
-                // 必须用跟 project_groups 同一套名字推导（group_info_for_cwd），
-                // 不能退回纯目录名——worktree 分组显示名带了分支后缀，两边不一致
-                // 会导致这里永远找不到目标组、挪动直接失效。
-                self.group_info_for_cwd(&cwd).0 == to_name.as_ref()
+                self.project_root_for_cwd(&cwd)
+                    .is_some_and(|r| same_root(&r, to_root))
             })
             .unwrap_or(self.sessions.len());
         for (i, s) in moved.into_iter().enumerate() {
@@ -2008,9 +2268,12 @@ impl Workspace {
         view: &Entity<acp_view::AcpView>,
         cx: &mut Context<Self>,
     ) -> gpui::Subscription {
-        cx.subscribe(view, |this: &mut Self, _view, _ev: &acp_view::AcpViewEvent, cx| {
-            this.save_state(cx);
-        })
+        cx.subscribe(
+            view,
+            |this: &mut Self, _view, _ev: &acp_view::AcpViewEvent, cx| {
+                this.save_state(cx);
+            },
+        )
     }
 
     /// 「+」菜单「对话 · smelt 原生界面」下那几项：新建 ACP 会话（第二种会话类型，
@@ -2172,9 +2435,7 @@ impl Workspace {
         let launch_bg = launch_owned.clone();
         // 立刻给反馈，避免「点了像没点」。
         self.stage_override = None;
-        eprintln!(
-            "[workspace] 新建会话 cwd={cwd:?} launch={launch:?} sid={sid}"
-        );
+        eprintln!("[workspace] 新建会话 cwd={cwd:?} launch={launch:?} sid={sid}");
         cx.notify();
 
         let (tx, rx) = smol::channel::bounded(1);
@@ -2197,8 +2458,7 @@ impl Workspace {
                 Ok(r) => r,
                 Err(_) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.background_error =
-                            Some("新建会话内部通道断开，请重试".into());
+                        this.background_error = Some("新建会话内部通道断开，请重试".into());
                         cx.notify();
                     });
                     return;
@@ -2245,7 +2505,9 @@ impl Workspace {
     /// ACP 会话没有分屏树，直接忽略。
     fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
         let Some(sess) = self.cur() else { return };
-        let Some(active) = sess.active_term() else { return };
+        let Some(active) = sess.active_term() else {
+            return;
+        };
         let cwd = active.read(cx).cwd().or_else(current_dir);
         let old = sess.anchor_id();
         let session_ix = self.active_session;
@@ -2305,11 +2567,13 @@ impl Workspace {
                     let layout = pane_to_state(l, cx);
                     let mut ids = Vec::new();
                     collect_leaf_ids(l, &mut ids);
-                    let active = ids
-                        .iter()
-                        .position(|x| *x == s.anchor_id())
-                        .unwrap_or(0);
-                    SessionState { layout, active, custom_title: s.custom_title.clone(), acp: None }
+                    let active = ids.iter().position(|x| *x == s.anchor_id()).unwrap_or(0);
+                    SessionState {
+                        layout,
+                        active,
+                        custom_title: s.custom_title.clone(),
+                        acp: None,
+                    }
                 }
                 SessionKind::Acp(view) => {
                     let v = view.read(cx);
@@ -2341,7 +2605,12 @@ impl Workspace {
         // 安全阀：内存里一个会话都没有、也没有 orphan，但磁盘上还有旧存档 → 绝不
         // 用空列表覆盖（历史上「守护未就绪 → 恢复全失败 → save_state 抹盘」会把
         // 用户所有侧栏会话永久清掉）。
-        if sessions.is_empty() {
+        //
+        // 但「用户自己把会话全关了」是合法状态（项目实体化后侧栏还有项目撑着），
+        // 那种情况必须允许写空，否则重启又全恢复回来。靠 sessions_restored 区分：
+        // 恢复流程跑完之前为 false，此时的空 = 还没恢复上来，护住；跑完之后为 true，
+        // 空就是用户真的关光了。
+        if sessions.is_empty() && !self.sessions_restored {
             if let Some(existing) = load_ws_state() {
                 let had = !existing.sessions.is_empty()
                     || existing.layout.is_some()
@@ -2355,14 +2624,27 @@ impl Workspace {
             }
         }
 
-        let file_tree_w = self.file_tree_resize.read(cx).sizes().first().copied().map(f32::from);
+        let file_tree_w = self
+            .file_tree_resize
+            .read(cx)
+            .sizes()
+            .first()
+            .copied()
+            .map(f32::from);
         let state = WsState {
             sessions,
+            projects: self.projects.clone(),
             active_session: self.active_session,
             // 旧档的 sidebar_w 字段保留声明只为 serde 兼容；新布局固定宽，不再写。
             sidebar_w: None,
             file_tree_w,
-            git_left_w: self.git_left_resize.read(cx).sizes().first().copied().map(f32::from),
+            git_left_w: self
+                .git_left_resize
+                .read(cx)
+                .sizes()
+                .first()
+                .copied()
+                .map(f32::from),
             pinned_file_tree_roots: self.pinned_roots.clone(),
             collapsed_file_tree_roots: self.collapsed_roots.iter().cloned().collect(),
             ..Default::default()
@@ -2381,15 +2663,145 @@ impl Workspace {
         self.add_session(cwd, cx);
     }
 
-    /// 临时终端：不挂在任何项目下，固定落在 $HOME，侧栏单独分组「临时终端」。
-    /// 点一下就在 $HOME 新建一个终端——就这么简单，不做「已有就复用」那套
-    /// （复用反而制造困惑：分不清是新建还是切旧的）。异步 spawn，完成后
-    /// add_session_with_launch 会把舞台切到这个新终端。
+    /// 临时终端：固定落在 $HOME。$HOME 也按项目对待（进 projects 列表），所以把里面的
+    /// 会话关光之后这一组还在，不会整组消失。异步 spawn，完成后 add_session_with_launch
+    /// 会把舞台切到这个新终端。
     fn new_scratch_session(&mut self, cx: &mut Context<Self>) {
-        self.add_session(scratch_dir(), cx);
+        let dir = scratch_dir();
+        if let Some(d) = dir.clone() {
+            self.add_project(d, cx);
+        }
+        self.add_session(dir, cx);
     }
 
-    /// 「打开项目」：弹原生选择框选一个目录，在其中开新会话。
+    /// 把一个目录加进项目列表并设为活动项目。已经在列表里就只切活动，不重复加。
+    /// **不建会话**——项目和会话是两回事，建会话是调用方另外的事。
+    fn add_project(&mut self, root: String, cx: &mut Context<Self>) {
+        if root.is_empty() {
+            return;
+        }
+        let root = root.trim_end_matches('/').to_string();
+        if !self
+            .projects
+            .iter()
+            .any(|p| p.trim_end_matches('/') == root)
+        {
+            self.projects.push(root.clone());
+        }
+        self.active_project = Some(root);
+        // 打开项目 = 想看这个项目，收掉盖在舞台上的覆盖页。
+        self.stage_override = None;
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// 侧栏右键「关闭项目」：底下还有会话就先弹确认——关项目会连带 kill 掉那些 shell，
+    /// 正在跑的活儿就没了，且找不回来。空项目无损，直接关。
+    /// `root` 是项目根路径（分组身份，见 ProjectGroup）。
+    fn start_close_project(&mut self, root: String, cx: &mut Context<Self>) {
+        let Some(g) = self
+            .project_groups(cx)
+            .into_iter()
+            .find(|g| g.root.trim_end_matches('/') == root.trim_end_matches('/'))
+        else {
+            return;
+        };
+        if g.sessions.is_empty() {
+            self.close_project(&root, cx);
+        } else {
+            self.close_project_target = Some((g.label, root, g.sessions.len()));
+            cx.notify();
+        }
+    }
+
+    fn cancel_close_project(&mut self, cx: &mut Context<Self>) {
+        self.close_project_target = None;
+        cx.notify();
+    }
+
+    fn confirm_close_project(&mut self, cx: &mut Context<Self>) {
+        let Some((_, root, _)) = self.close_project_target.take() else {
+            return;
+        };
+        self.close_project(&root, cx);
+    }
+
+    /// 「关闭项目」确认弹窗：说清会连带关掉几个会话（视觉同删 Worktree 那套危险配色）。
+    fn render_close_project_confirm(&self, cx: &mut Context<Self>) -> Div {
+        let Some((label, _, n)) = self.close_project_target.clone() else {
+            return div();
+        };
+        let (fg, muted) = {
+            let t = cx.theme();
+            (t.foreground, t.muted_foreground)
+        };
+        let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(true);
+
+        let content = v_flex()
+            .child(div().font_bold().text_color(fg).text_lg().child("确定关闭这个项目吗？"))
+            .child(div().text_sm().text_color(muted).child(format!(
+                "「{label}」下的 {n} 个会话会被一起关掉，终端里正在跑的东西会被终止。项目本身只是从工作台移走，磁盘上的目录不动。"
+            )))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(Self::modal_button(
+                        "cancel-close-project",
+                        "取消",
+                        neutral_bg,
+                        neutral_hover,
+                        fg,
+                        |this, _, _, cx| this.cancel_close_project(cx),
+                        cx,
+                    ))
+                    .child(Self::modal_button(
+                        "confirm-close-project",
+                        "关闭项目",
+                        tint,
+                        hover,
+                        accent_text,
+                        |this, _, _, cx| this.confirm_close_project(cx),
+                        cx,
+                    )),
+            );
+        Self::modal_shell(380., true, content, cx)
+    }
+
+    /// 关闭项目：从列表移除，并连带关掉挂在它下面的所有会话。
+    /// 认 **root 路径**（分组身份，见 ProjectGroup）——用显示名的话，末段同名的另一个
+    /// 项目会被一起误伤。
+    fn close_project(&mut self, root: &str, cx: &mut Context<Self>) {
+        let root = root.trim_end_matches('/').to_string();
+        let Some(g) = self
+            .project_groups(cx)
+            .into_iter()
+            .find(|g| g.root.trim_end_matches('/') == root)
+        else {
+            return;
+        };
+        // 降序关闭：前面的下标不受后面 remove 影响。
+        let mut ixs = g.sessions;
+        ixs.sort_unstable_by(|a, b| b.cmp(a));
+        for ix in ixs {
+            self.close_session(ix, cx);
+        }
+        self.projects.retain(|p| p.trim_end_matches('/') != root);
+        if self
+            .active_project
+            .as_deref()
+            .map(|p| p.trim_end_matches('/'))
+            == Some(root.as_str())
+        {
+            self.active_project = None;
+        }
+        self.collapsed_projects.remove(&root);
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// 「打开项目」：弹原生选择框选一个目录，加进项目列表。**不自动建会话**——
+    /// 打开项目只是把它放上工作台，要开终端还是开对话由分组行的「+」决定。
     fn open_project(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -2400,18 +2812,21 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(dir) = paths.into_iter().next() {
-                    let dir = dir.to_str().map(String::from);
-                    this.update(cx, |this, cx| this.add_session(dir, cx)).ok();
+                    if let Some(dir) = dir.to_str().map(String::from) {
+                        this.update(cx, |this, cx| this.add_project(dir, cx)).ok();
+                    }
                 }
             }
         })
         .detach();
     }
 
-    /// 从 Finder 拖入的路径各开一个会话：文件夹直接用，文件取其父目录。
+    /// 从 Finder 拖入的路径 = 打开项目：文件夹直接用，文件取其父目录，各加一条项目。
+    /// **不自动建会话**——跟「+ 打开项目」同一套语义，开终端还是开对话由项目行的
+    /// 「+」决定（两条路结果不一致的话，"打开项目"到底会发生什么就说不清了）。
     ///
-    /// 整段路径判定 + `Terminal::spawn` 都在后台跑——`on_drop` / `on_open_urls` 在
-    /// ObjC FFI 栈上，同步 spawn 会把整个窗口卡成 beachball（拖多文件更甚）。
+    /// 路径判定（is_dir 要 stat）仍丢后台：`on_drop` / `on_open_urls` 在 ObjC FFI 栈
+    /// 上，拖一大把文件时同步 stat 会把窗口卡成 beachball。
     fn open_paths(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
         if paths.is_empty() {
             eprintln!("[workspace] open_paths: 空路径列表，忽略");
@@ -2422,7 +2837,6 @@ impl Workspace {
             paths.len(),
             paths
         );
-        // 立刻切到终端页并提示，避免用户以为拖了没反应（spawn 在后台要几百毫秒～数秒）。
         self.stage_override = None;
         cx.notify();
 
@@ -2431,7 +2845,7 @@ impl Workspace {
         std::thread::Builder::new()
             .name("smelt-open-paths".into())
             .spawn(move || {
-                let mut out = Vec::with_capacity(paths.len());
+                let mut out: Vec<String> = Vec::with_capacity(paths.len());
                 for p in paths {
                     let dir = if p.is_dir() {
                         p
@@ -2444,16 +2858,17 @@ impl Workspace {
                     let Some(cwd) = dir.to_str().map(str::to_string) else {
                         continue;
                     };
-                    let sid = new_sid();
-                    let result = terminal::Terminal::spawn(24, 80, Some(&cwd), &sid, None);
-                    out.push((cwd, sid, result));
+                    // 一次拖进同目录的一堆文件 → 只加一条项目。
+                    if !out.contains(&cwd) {
+                        out.push(cwd);
+                    }
                 }
                 let _ = tx.send_blocking(out);
             })
             .expect("spawn smelt-open-paths 线程");
 
         cx.spawn(async move |this, cx| {
-            let built = match rx.recv().await {
+            let dirs = match rx.recv().await {
                 Ok(v) => v,
                 Err(_) => {
                     let _ = this.update(cx, |this, cx| {
@@ -2465,45 +2880,12 @@ impl Workspace {
             };
 
             let _ = this.update(cx, |this, cx| {
-                let mut ok_n = 0usize;
-                let mut err_msgs: Vec<String> = Vec::new();
-                for (cwd, sid, result) in built {
-                    match result {
-                        Ok(terminal) => {
-                            let view = cx.new(|cx| {
-                                TerminalView::from_terminal(
-                                    cx,
-                                    terminal,
-                                    Some(cwd),
-                                    sid,
-                                    None,
-                                    None,
-                                )
-                            });
-                            this.sessions.push(Session::single(view));
-                            this.active_session = this.sessions.len() - 1;
-                            ok_n += 1;
-                        }
-                        Err(e) => {
-                            eprintln!("[workspace] 拖入打开失败（{cwd}）：{e:#}");
-                            err_msgs.push(format!("{cwd}: {e:#}"));
-                        }
+                if dirs.is_empty() {
+                    this.background_error = Some("拖入的路径无法作为项目目录打开".into());
+                } else {
+                    for dir in dirs {
+                        this.add_project(dir, cx);
                     }
-                }
-                if ok_n > 0 {
-                    this.stage_override = None;
-                    this.save_state(cx);
-                }
-                if !err_msgs.is_empty() {
-                    let head = err_msgs.into_iter().take(2).collect::<Vec<_>>().join("；");
-                    this.background_error = Some(if ok_n > 0 {
-                        format!("已打开 {ok_n} 个，另有失败：{head}")
-                    } else {
-                        format!("拖入打开失败：{head}")
-                    });
-                } else if ok_n == 0 {
-                    this.background_error =
-                        Some("拖入的路径无法作为项目目录打开".into());
                 }
                 cx.notify();
             });
@@ -2511,10 +2893,14 @@ impl Workspace {
         .detach();
     }
 
-    /// 关闭第 ix 个会话（至少保留一个）。用户主动关 → 让守护杀掉这些 shell
-    /// （区别于退出 GUI：那时不杀，会话在 smeltd 里持久活着）。
+    /// 关闭第 ix 个会话。用户主动关 → 让守护杀掉这些 shell（区别于退出 GUI：
+    /// 那时不杀，会话在 smeltd 里持久活着）。
+    ///
+    /// 允许关到一个会话都不剩：项目独立于会话存在，侧栏还有项目行撑着不会空白，
+    /// 舞台落到「还没有会话」引导页。（以前硬性拒绝关最后一个，那是项目还没实体化、
+    /// 关光就整个侧栏空掉的年代留下的保护。）
     fn close_session(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if self.sessions.len() <= 1 || ix >= self.sessions.len() {
+        if ix >= self.sessions.len() {
             return;
         }
         for t in &self.sessions[ix].term_leaves() {
@@ -2524,7 +2910,10 @@ impl Workspace {
             view.update(cx, |v, cx| v.shutdown(cx));
         }
         self.sessions.remove(ix);
-        if self.active_session >= self.sessions.len() {
+        // 空列表时 active_session 归 0（各处都是 sessions.get(ix) 取，取不到就是无会话态）。
+        if self.sessions.is_empty() {
+            self.active_session = 0;
+        } else if self.active_session >= self.sessions.len() {
             self.active_session = self.sessions.len() - 1;
         } else if self.active_session > ix {
             self.active_session -= 1;
@@ -2534,8 +2923,8 @@ impl Workspace {
     }
 
     /// 删 worktree 前先清掉 cwd 落在 `path`（或它子目录）下的所有会话，不然会留下
-    /// 指向即将被删除目录的死会话。close_session 拒绝关到全局只剩 0 个会话，所以
-    /// 如果这些要关的会话恰好是当前仅有的会话，先开一个安全的临时终端垫底。
+    /// 指向即将被删除目录的死会话。顺带把这个目录从项目列表里摘掉——目录都要没了，
+    /// 留一条指向不存在路径的项目没有意义。
     fn close_sessions_under(&mut self, path: &str, cx: &mut Context<Self>) {
         let prefix = format!("{}/", path.trim_end_matches('/'));
         let mut ixs: Vec<usize> = self
@@ -2548,9 +2937,10 @@ impl Workspace {
             })
             .map(|(ix, _)| ix)
             .collect();
-        if ixs.len() == self.sessions.len() {
-            self.new_scratch_session(cx);
-        }
+        self.projects.retain(|p| {
+            let p = p.trim_end_matches('/');
+            p != path.trim_end_matches('/') && !p.starts_with(&prefix)
+        });
         // 降序关闭：前面的下标不受后面 remove 影响（同 move_project_near 的做法）。
         ixs.sort_unstable_by(|a, b| b.cmp(a));
         for ix in ixs {
@@ -2558,28 +2948,55 @@ impl Workspace {
         }
     }
 
-    /// Cmd+W：会话内多 pane 时关掉活动 pane（切到相邻），否则关整个会话。
-    fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(sess) = self.cur() else { return };
-        if sess.pane_count() > 1 {
-            let target = sess.anchor_id();
-            // 用户主动关 pane → 守护真正杀掉该 shell。多 pane 必是终端会话。
-            if let Some(active) = sess.active_term() {
-                terminal::kill_remote(&active.read(cx).session_id().to_string());
-            }
-            let sess = &mut self.sessions[self.active_session];
-            if let Some(layout) = sess.term_layout_mut() {
-                remove_leaf(layout, target);
-            }
+    /// 关掉第 ix 个会话里的指定 pane：会话内还有别的 pane 就只拆这一个（守护真正杀掉
+    /// 这个 shell，剩下的 pane 不受影响），只剩它一个时才退化成关整个会话。
+    /// 侧栏 pane 行的 × 和 Cmd+W 都走这里。
+    fn close_session_pane(
+        &mut self,
+        ix: usize,
+        view: Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = view.entity_id();
+        let Some((count, was_active)) = self
+            .sessions
+            .get(ix)
+            .map(|s| (s.pane_count(), s.anchor_id() == target))
+        else {
+            return;
+        };
+        if count <= 1 {
+            self.close_session(ix, cx);
+            self.focus_active(window, cx);
+            return;
+        }
+        // 用户主动关 pane → 守护真正杀掉该 shell（区别于退出 GUI：那时保活）。
+        terminal::kill_remote(view.read(cx).session_id());
+        let sess = &mut self.sessions[ix];
+        if let Some(layout) = sess.term_layout_mut() {
+            remove_leaf(layout, target);
+        }
+        // 关掉的正是活动 pane 才需要改指向，关别的 pane 时当前视图不该跳走。
+        if was_active {
             if let Some(first) = sess.term_leaves().first().cloned() {
                 sess.set_active_term(first);
             }
-            self.focus_active(window, cx);
-            self.save_state(cx);
-            cx.notify();
-        } else {
-            self.close_session(self.active_session, cx);
-            self.focus_active(window, cx);
+        }
+        self.focus_active(window, cx);
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Cmd+W：会话内多 pane 时关掉活动 pane（切到相邻），否则关整个会话。
+    fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.cur().and_then(|s| s.active_term().cloned()) {
+            Some(view) => self.close_session_pane(self.active_session, view, window, cx),
+            // ACP 会话没有分屏树，只能整个关。
+            None => {
+                self.close_session(self.active_session, cx);
+                self.focus_active(window, cx);
+            }
         }
     }
 
@@ -2619,8 +3036,10 @@ impl Workspace {
 
     /// 焦点还给活动会话：Term → 活动 pane；ACP → 消息流输入框。
     fn focus_active_stage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(Session { kind: SessionKind::Acp(view), .. }) =
-            self.sessions.get(self.active_session)
+        if let Some(Session {
+            kind: SessionKind::Acp(view),
+            ..
+        }) = self.sessions.get(self.active_session)
         {
             let view = view.clone();
             view.update(cx, |v, cx| v.focus_input(window, cx));
@@ -2650,12 +3069,7 @@ impl Workspace {
     }
 
     /// 总览：打开会话，并尽量聚焦到「需要处理」的那个 pane。
-    fn overview_open_session(
-        &mut self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn overview_open_session(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.sessions.len() {
             return;
         }
@@ -2697,17 +3111,37 @@ impl Workspace {
     }
 
     /// 切换到第 ix 个会话并聚焦。
+    /// 按侧栏「分组展平后的视觉顺序」切上/下一个会话（delta=-1/1），到头循环。
+    /// 快捷键 cmd-up / cmd-down；顺序跟眼睛看到的一致（跨项目一路顺下去），
+    /// 不是 self.sessions 的数组序——那个跟侧栏显示序未必一致，切起来会乱跳。
+    fn cycle_session(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let order: Vec<usize> = self
+            .project_groups(cx)
+            .iter()
+            .flat_map(|g| g.sessions.iter().copied())
+            .collect();
+        if order.is_empty() {
+            return;
+        }
+        let cur = order
+            .iter()
+            .position(|&ix| ix == self.active_session)
+            .unwrap_or(0);
+        let n = order.len() as isize;
+        let next = (cur as isize + delta).rem_euclid(n) as usize;
+        self.activate(order[next], window, cx);
+    }
+
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.sessions.len() {
             self.active_session = ix;
-            // 项目 rail 的选中态跟着活动会话走：切到别的项目的会话时 rail 与
-            // 会话列表同步换过去。
-            if let Some((name, _, _)) = self
+            // 活动项目跟着活动会话走：切到别的项目的会话时侧栏高亮同步换过去。
+            if let Some(g) = self
                 .project_groups(cx)
                 .into_iter()
-                .find(|(_, _, ixs)| ixs.contains(&ix))
+                .find(|g| g.sessions.contains(&ix))
             {
-                self.active_project = Some(name);
+                self.active_project = Some(g.root);
             }
             // 点会话 = 回到会话舞台：收掉任何全屏覆盖页（总览/Git/文件树/…）。
             // 新布局没有常驻 TabBar，这里不收的话覆盖页会一直盖着舞台，
@@ -2774,18 +3208,24 @@ impl Workspace {
         use gpui_component::input::{InputEvent, InputState};
         let current = match &target {
             RenameTarget::Session(ix) => {
-                let Some(s) = self.sessions.get(*ix) else { return };
+                let Some(s) = self.sessions.get(*ix) else {
+                    return;
+                };
                 s.title(cx)
             }
             RenameTarget::Pane(view) => pane_title(view, cx),
         };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
         input.update(cx, |s, cx| s.focus(window, cx));
-        self._rename_sub = Some(cx.subscribe_in(&input, window, |this, _input, ev: &InputEvent, window, cx| {
-            if matches!(ev, InputEvent::PressEnter { .. }) {
-                this.confirm_rename(window, cx);
-            }
-        }));
+        self._rename_sub = Some(cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    this.confirm_rename(window, cx);
+                }
+            },
+        ));
         self.rename_target = Some(target);
         self.rename_input = Some(input);
         cx.notify();
@@ -2793,8 +3233,12 @@ impl Workspace {
 
     /// 提交重命名：空输入等于清掉自定义名，回退到自动推导的标题。
     fn confirm_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.rename_target.take() else { return };
-        let Some(input) = self.rename_input.take() else { return };
+        let Some(target) = self.rename_target.take() else {
+            return;
+        };
+        let Some(input) = self.rename_input.take() else {
+            return;
+        };
         self._rename_sub = None;
         let text = input.read(cx).value().trim().to_string();
         match target {
@@ -2844,14 +3288,19 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok((version, url)) if updater::is_newer(&version, env!("CARGO_PKG_VERSION")) => {
+                    Ok((version, url))
+                        if updater::is_newer(&version, env!("CARGO_PKG_VERSION")) =>
+                    {
                         this.start_update_download(version, url, cx);
                         return; // start_update_download 里已经 notify 过
                     }
                     Ok(_) => this.update_status = updater::UpdateStatus::UpToDate,
                     Err(e) => {
-                        this.update_status =
-                            if silent { updater::UpdateStatus::Idle } else { updater::UpdateStatus::Failed(e.to_string()) };
+                        this.update_status = if silent {
+                            updater::UpdateStatus::Idle
+                        } else {
+                            updater::UpdateStatus::Failed(e.to_string())
+                        };
                     }
                 }
                 cx.notify();
@@ -2864,8 +3313,11 @@ impl Workspace {
     /// 下载线程通过 channel 往回推字节进度，UI 线程照单刷新状态；发送端随下载任务结束而
     /// drop，`recv` 收到 Err 即代表下载收尾，此时再 `await` 任务拿最终结果。
     fn start_update_download(&mut self, version: String, url: String, cx: &mut Context<Self>) {
-        self.update_status =
-            updater::UpdateStatus::Downloading { version: version.clone(), received: 0, total: None };
+        self.update_status = updater::UpdateStatus::Downloading {
+            version: version.clone(),
+            received: 0,
+            total: None,
+        };
         cx.notify();
         cx.spawn(async move |this, cx| {
             let (tx, rx) = smol::channel::unbounded::<updater::DownloadProgress>();
@@ -2882,7 +3334,11 @@ impl Workspace {
                 let _ = this.update(cx, |this, cx| {
                     this.update_status = match progress {
                         updater::DownloadProgress::Bytes { received, total } => {
-                            updater::UpdateStatus::Downloading { version, received, total }
+                            updater::UpdateStatus::Downloading {
+                                version,
+                                received,
+                                total,
+                            }
                         }
                         updater::DownloadProgress::Installing => {
                             updater::UpdateStatus::Installing { version }
@@ -2895,7 +3351,10 @@ impl Workspace {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.update_status = match result {
-                    Ok(staged_app) => updater::UpdateStatus::ReadyToInstall { version, staged_app },
+                    Ok(staged_app) => updater::UpdateStatus::ReadyToInstall {
+                        version,
+                        staged_app,
+                    },
                     Err(e) => updater::UpdateStatus::Failed(e.to_string()),
                 };
                 cx.notify();
@@ -3011,7 +3470,10 @@ impl Workspace {
 
     fn refresh_session_manager(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let list = cx.background_executor().spawn(async { terminal::list_daemon_sessions() }).await;
+            let list = cx
+                .background_executor()
+                .spawn(async { terminal::list_daemon_sessions() })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.session_manager_list = Some(list);
                 cx.notify();
@@ -3038,9 +3500,14 @@ impl Workspace {
     /// 不需要走「重启守护进程」那种连坐所有会话的核选项。
     fn kill_all_orphans_in_manager(&mut self, cx: &mut Context<Self>) {
         let tracked = self.tracked_session_ids(cx);
-        let Some(list) = self.session_manager_list.clone() else { return };
-        let orphan_ids: Vec<String> =
-            list.into_iter().map(|s| s.id).filter(|id| !tracked.contains(id)).collect();
+        let Some(list) = self.session_manager_list.clone() else {
+            return;
+        };
+        let orphan_ids: Vec<String> = list
+            .into_iter()
+            .map(|s| s.id)
+            .filter(|id| !tracked.contains(id))
+            .collect();
         if orphan_ids.is_empty() {
             return;
         }
@@ -3068,14 +3535,23 @@ impl Workspace {
         let tracked = self.tracked_session_ids(cx);
 
         let body: AnyElement = match &self.session_manager_list {
-            None => div().text_sm().text_color(muted).child("查询中…").into_any_element(),
-            Some(list) if list.is_empty() => {
-                div().text_sm().text_color(muted).child("守护进程当前没有任何会话。").into_any_element()
-            }
+            None => div()
+                .text_sm()
+                .text_color(muted)
+                .child("查询中…")
+                .into_any_element(),
+            Some(list) if list.is_empty() => div()
+                .text_sm()
+                .text_color(muted)
+                .child("守护进程当前没有任何会话。")
+                .into_any_element(),
             Some(list) => {
                 let orphan_count = list.iter().filter(|s| !tracked.contains(&s.id)).count();
-                let mut rows =
-                    v_flex().id("session-manager-list").gap_1().max_h(px(360.)).overflow_y_scroll();
+                let mut rows = v_flex()
+                    .id("session-manager-list")
+                    .gap_1()
+                    .max_h(px(360.))
+                    .overflow_y_scroll();
                 for s in list {
                     let is_orphan = !tracked.contains(&s.id);
                     let label = s
@@ -3100,13 +3576,7 @@ impl Workspace {
                                     } else {
                                         rgb(ui_theme::green())
                                     }))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(fg)
-                                            .truncate()
-                                            .child(label),
-                                    )
+                                    .child(div().text_sm().text_color(fg).truncate().child(label))
                                     .children(is_orphan.then(|| {
                                         div()
                                             .text_xs()
@@ -3331,7 +3801,11 @@ impl Workspace {
         let list: Vec<_> = items
             .into_iter()
             .map(|(si, pane, msg)| {
-                let name = self.sessions.get(si).map(|s| s.title(cx)).unwrap_or_default();
+                let name = self
+                    .sessions
+                    .get(si)
+                    .map(|s| s.title(cx))
+                    .unwrap_or_default();
                 div()
                     .id(("notif", pane.entity_id()))
                     .p_2()
@@ -3427,25 +3901,12 @@ impl Workspace {
             .flex()
             .items_center()
             .justify_between()
-            .child(
-                div()
-                    .text_xl()
-                    .font_bold()
-                    .text_color(fg)
-                    .child("总览"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(if need_attn > 0 {
-                        format!(
-                            "会话监控 · {need_attn} 需关注 · hook 事实 + 终端权限菜单"
-                        )
-                    } else {
-                        format!("会话监控 · {} · 点卡片进入终端", self.sessions.len())
-                    }),
-            );
+            .child(div().text_xl().font_bold().text_color(fg).child("总览"))
+            .child(div().text_xs().text_color(muted).child(if need_attn > 0 {
+                format!("会话监控 · {need_attn} 需关注 · hook 事实 + 终端权限菜单")
+            } else {
+                format!("会话监控 · {} · 点卡片进入终端", self.sessions.len())
+            }));
 
         let body = self.render_overview_sessions(cx);
 
@@ -3488,45 +3949,61 @@ impl Workspace {
         let statuses: Vec<AgentStatus> = self.sessions.iter().map(|s| s.status(cx)).collect();
         let need = statuses
             .iter()
-            .filter(|s| matches!(s, AgentStatus::WaitingApproval | AgentStatus::NeedsAttention))
+            .filter(|s| {
+                matches!(
+                    s,
+                    AgentStatus::WaitingApproval | AgentStatus::NeedsAttention
+                )
+            })
             .count();
-        let running = statuses.iter().filter(|s| matches!(s, AgentStatus::Running)).count();
-        let done = statuses.iter().filter(|s| matches!(s, AgentStatus::Done)).count();
+        let running = statuses
+            .iter()
+            .filter(|s| matches!(s, AgentStatus::Running))
+            .count();
+        let done = statuses
+            .iter()
+            .filter(|s| matches!(s, AgentStatus::Done))
+            .count();
         let filter = self.overview_filter;
         // 筛选：要一眼像「分段按钮」，未选中也有底/边/hover，别和装饰 pill 混。
-        let filter_chip = |id: &'static str, label: String, f: OverviewFilter, color: Hsla, tint: Hsla| {
-            let on = filter == f;
-            let idle_bg: Hsla = ui_theme::overlay(0x14).into();
-            let idle_border: Hsla = ui_theme::overlay(0x28).into();
-            div()
-                .id(id)
-                .px(px(12.))
-                .py(px(6.))
-                .rounded_md()
-                .cursor_pointer()
-                .bg(if on { tint } else { idle_bg })
-                .border_1()
-                .border_color(if on { color } else { idle_border })
-                .text_sm()
-                .font_weight(if on {
-                    gpui::FontWeight::SEMIBOLD
-                } else {
-                    gpui::FontWeight::NORMAL
-                })
-                .text_color(if on { color } else { fg })
-                .hover(|d| {
-                    d.bg(if on { tint } else { ui_theme::overlay(0x22).into() })
+        let filter_chip =
+            |id: &'static str, label: String, f: OverviewFilter, color: Hsla, tint: Hsla| {
+                let on = filter == f;
+                let idle_bg: Hsla = ui_theme::overlay(0x14).into();
+                let idle_border: Hsla = ui_theme::overlay(0x28).into();
+                div()
+                    .id(id)
+                    .px(px(12.))
+                    .py(px(6.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if on { tint } else { idle_bg })
+                    .border_1()
+                    .border_color(if on { color } else { idle_border })
+                    .text_sm()
+                    .font_weight(if on {
+                        gpui::FontWeight::SEMIBOLD
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
+                    .text_color(if on { color } else { fg })
+                    .hover(|d| {
+                        d.bg(if on {
+                            tint
+                        } else {
+                            ui_theme::overlay(0x22).into()
+                        })
                         .border_color(color)
-                })
-                .child(label)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.overview_filter = f;
-                        cx.notify();
-                    }),
-                )
-        };
+                    })
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.overview_filter = f;
+                            cx.notify();
+                        }),
+                    )
+            };
 
         let summary = div()
             .flex()
@@ -3608,17 +4085,15 @@ impl Workspace {
                 OverviewFilter::Running => "当前没有运行中的会话",
                 OverviewFilter::All => "没有会话",
             };
-            return div()
-                .child(summary)
-                .child(
-                    div()
-                        .py_12()
-                        .flex()
-                        .justify_center()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(empty_hint),
-                );
+            return div().child(summary).child(
+                div()
+                    .py_12()
+                    .flex()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(empty_hint),
+            );
         }
 
         let cards: Vec<_> = order
@@ -3631,8 +4106,10 @@ impl Workspace {
                 let live = cwd_opt
                     .as_deref()
                     .and_then(|c| {
-                        self.session_list
-                            .get(&session_history::session_list_key(settings::AcpAgentKind::Claude, c))
+                        self.session_list.get(&session_history::session_list_key(
+                            settings::AcpAgentKind::Claude,
+                            c,
+                        ))
                     })
                     .and_then(|(_, list)| list.first());
                 // 状态通道（hook 事实）优先；jsonl 作补充。
@@ -3640,9 +4117,7 @@ impl Workspace {
                     .term_leaves()
                     .iter()
                     .find_map(|t| daemon_state_for(t, cx));
-                let phase_label = daemon_detail
-                    .as_ref()
-                    .map(|d| d.phase_label().to_string());
+                let phase_label = daemon_detail.as_ref().map(|d| d.phase_label().to_string());
                 let phase_detail = daemon_detail.as_ref().and_then(|d| d.detail_line());
                 let phase_age = daemon_detail.as_ref().and_then(|d| d.phase_age_secs());
                 let mut meta_parts: Vec<String> = Vec::new();
@@ -3690,7 +4165,9 @@ impl Workspace {
                 let notif = s.notification_msg(cx);
                 let when = s.notified_at(cx).map(ago);
                 let preview = s.preview(cx, 3);
-                let git = cwd_opt.as_ref().and_then(|c| self.git_cache.get(c).cloned());
+                let git = cwd_opt
+                    .as_ref()
+                    .and_then(|c| self.git_cache.get(c).cloned());
                 // 等审批时描红边，方便在网格里扫到
                 let card_edge: Hsla = if is_approval {
                     c_red.into()
@@ -3738,7 +4215,11 @@ impl Workspace {
                     })
                     .shadow_sm()
                     .cursor_pointer()
-                    .hover(|d| d.border_color(dot).shadow_lg().bg(rgb(ui_theme::bg_hover())))
+                    .hover(|d| {
+                        d.border_color(dot)
+                            .shadow_lg()
+                            .bg(rgb(ui_theme::bg_hover()))
+                    })
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -3786,9 +4267,7 @@ impl Workspace {
                                     .bg(tint)
                                     .text_color(dot)
                                     .child(
-                                        phase_label
-                                            .clone()
-                                            .unwrap_or_else(|| label.to_string()),
+                                        phase_label.clone().unwrap_or_else(|| label.to_string()),
                                     ),
                             )
                             .child(div().text_color(muted).child(cwd))
@@ -3827,9 +4306,10 @@ impl Workspace {
                                 div().text_color(c_amber).child(format!("● {changed} 改动"))
                             }))
                     }))
-                    .children(meta_line.map(|line| {
-                        div().text_xs().text_color(muted).truncate().child(line)
-                    }))
+                    .children(
+                        meta_line
+                            .map(|line| div().text_xs().text_color(muted).truncate().child(line)),
+                    )
                     // OSC 通知且与 hook 问句不同时再显示
                     .children(
                         notif
@@ -3866,11 +4346,14 @@ impl Workspace {
                             .flex()
                             .flex_col()
                             .children(preview.into_iter().map(|line| {
-                                div().truncate().whitespace_nowrap().child(if line.is_empty() {
-                                    " ".to_string()
-                                } else {
-                                    line
-                                })
+                                div()
+                                    .truncate()
+                                    .whitespace_nowrap()
+                                    .child(if line.is_empty() {
+                                        " ".to_string()
+                                    } else {
+                                        line
+                                    })
                             }))
                     }))
                     // 需要用户时：实心/描边按钮，和侧栏「新建终端」一样有底有边
@@ -3887,9 +4370,7 @@ impl Workspace {
                                 .items_center()
                                 .gap_2()
                                 .pt_1()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .children(opts.into_iter().enumerate().map(|(oi, opt)| {
                                     let ix_sel = ix;
                                     let key = opt.key.clone();
@@ -3902,16 +4383,8 @@ impl Workspace {
                                         .rounded_md()
                                         .cursor_pointer()
                                         .border_1()
-                                        .border_color(if primary {
-                                            c_green
-                                        } else {
-                                            btn_border
-                                        })
-                                        .bg(if primary {
-                                            green_tint
-                                        } else {
-                                            btn_idle
-                                        })
+                                        .border_color(if primary { c_green } else { btn_border })
+                                        .bg(if primary { green_tint } else { btn_idle })
                                         .text_sm()
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(if primary { c_green } else { fg })
@@ -4042,7 +4515,11 @@ impl Workspace {
             let t = cx.theme();
             (t.border, t.popover)
         };
-        let backdrop = if heavy { rgba(0x000000aa) } else { rgba(0x00000026) };
+        let backdrop = if heavy {
+            rgba(0x000000aa)
+        } else {
+            rgba(0x00000026)
+        };
         div()
             .absolute()
             .inset_0()
@@ -4094,7 +4571,12 @@ impl Workspace {
     /// 弹窗按钮的基础样式（尺寸/圆角/字号/底色/文字色/label），不含点击行为——大部分
     /// 调用方直接用 [`Self::modal_button`]；`render_delete_worktree_confirm` 的
     /// 「检查中…」禁用态需要条件性挂 hover/on_click，才会单独调这个再自己 `.when(...)`。
-    fn modal_button_base(id: &'static str, label: &'static str, bg: Hsla, text_color: Hsla) -> Stateful<Div> {
+    fn modal_button_base(
+        id: &'static str,
+        label: &'static str,
+        bg: Hsla,
+        text_color: Hsla,
+    ) -> Stateful<Div> {
         div()
             .id(id)
             .px_3()
@@ -4130,10 +4612,17 @@ impl Workspace {
             let t = cx.theme();
             (t.foreground, t.muted_foreground)
         };
-        let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(false);
+        let (neutral_bg, neutral_hover, tint, hover, accent_text) =
+            Self::modal_accent_colors(false);
 
         let content = v_flex()
-            .child(div().font_bold().text_color(fg).text_lg().child("确定退出 Smelt 吗？"))
+            .child(
+                div()
+                    .font_bold()
+                    .text_color(fg)
+                    .text_lg()
+                    .child("确定退出 Smelt 吗？"),
+            )
             .child(
                 div()
                     .text_sm()
@@ -4188,8 +4677,11 @@ impl Workspace {
             let t = cx.theme();
             (t.foreground, t.muted_foreground)
         };
-        let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(false);
-        let Some(input) = self.rename_input.as_ref() else { return div() };
+        let (neutral_bg, neutral_hover, tint, hover, accent_text) =
+            Self::modal_accent_colors(false);
+        let Some(input) = self.rename_input.as_ref() else {
+            return div();
+        };
         // 会话行和分屏子行共用这个弹窗，标题得说清改的是哪个。
         let heading = match self.rename_target {
             Some(RenameTarget::Pane(_)) => "重命名终端",
@@ -4198,7 +4690,12 @@ impl Workspace {
 
         let content = v_flex()
             .child(div().font_bold().text_color(fg).text_lg().child(heading))
-            .child(div().text_sm().text_color(muted).child("留空则恢复自动识别的标题。"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("留空则恢复自动识别的标题。"),
+            )
             .child(Input::new(input))
             .child(
                 h_flex()
@@ -4282,13 +4779,24 @@ impl Workspace {
             let t = cx.theme();
             (t.foreground, t.muted_foreground)
         };
-        let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(false);
+        let (neutral_bg, neutral_hover, tint, hover, accent_text) =
+            Self::modal_accent_colors(false);
         let cur_name = self
             .open_file
             .as_ref()
-            .map(|of| of.path.rsplit('/').next().unwrap_or(of.path.as_str()).to_string())
+            .map(|of| {
+                of.path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(of.path.as_str())
+                    .to_string()
+            })
             .unwrap_or_default();
-        let target_name = target.rsplit('/').next().unwrap_or(target.as_str()).to_string();
+        let target_name = target
+            .rsplit('/')
+            .next()
+            .unwrap_or(target.as_str())
+            .to_string();
 
         let content = v_flex()
             .child(
@@ -4298,12 +4806,9 @@ impl Workspace {
                     .text_lg()
                     .child(format!("「{cur_name}」有未保存的改动")),
             )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child(format!("要切换到「{target_name}」了，这些改动还没保存，要怎么处理？")),
-            )
+            .child(div().text_sm().text_color(muted).child(format!(
+                "要切换到「{target_name}」了，这些改动还没保存，要怎么处理？"
+            )))
             .child(
                 h_flex()
                     .justify_end()
@@ -4364,7 +4869,12 @@ impl Workspace {
             window,
             |this, state, ev: &ListEvent, window, cx| match ev {
                 ListEvent::Confirm(ix) => {
-                    let cmd = state.read(cx).delegate().matched.get(ix.row).map(|(_, c)| c.clone());
+                    let cmd = state
+                        .read(cx)
+                        .delegate()
+                        .matched
+                        .get(ix.row)
+                        .map(|(_, c)| c.clone());
                     if let Some(cmd) = cmd {
                         this.exec_cmd(cmd, window, cx);
                     }
@@ -4417,9 +4927,7 @@ impl Workspace {
     fn render_pane(&self, pane: &Pane, path: &str, cx: &mut Context<Self>) -> AnyElement {
         match pane {
             Pane::Leaf(t) => {
-                let active = self
-                    .cur()
-                    .is_some_and(|s| s.anchor_id() == t.entity_id());
+                let active = self.cur().is_some_and(|s| s.anchor_id() == t.entity_id());
                 // 不给任何 pane 描边（iTerm2 也不描，之前的蓝框提醒也拿掉了）：分屏时靠
                 // 「压暗非活动 pane」区分谁是活动的就够了；单 pane 时压根没有别的 pane
                 // 可比，不需要任何叠加层。
@@ -4448,7 +4956,12 @@ impl Workspace {
                     .child(overlay)
                     .into_any_element()
             }
-            Pane::Split { axis, state, children } => {
+            Pane::Split {
+                axis,
+                state,
+                children,
+                init_sizes,
+            } => {
                 let id = SharedString::from(path.to_string());
                 let mut group = if matches!(axis, Axis::Horizontal) {
                     h_resizable(id)
@@ -4457,14 +4970,20 @@ impl Workspace {
                 }
                 .with_state(state);
                 for (i, c) in children.iter().enumerate() {
-                    group = group.child(self.render_pane(c, &format!("{path}-{i}"), cx));
+                    let el = self.render_pane(c, &format!("{path}-{i}"), cx);
+                    // 存档尺寸只作 initial_size：拖过之后 panel 自己的 size 会盖过它
+                    //（见 Pane::Split::init_sizes 注释），所以每帧原样传是安全的。
+                    let mut panel = resizable_panel().child(el);
+                    if let Some(s) = init_sizes.get(i).copied().filter(|s| *s > 0.) {
+                        panel = panel.size(px(s));
+                    }
+                    group = group.child(panel);
                 }
                 group.into_any_element()
             }
         }
     }
 }
-
 
 impl Workspace {
     /// 舞台覆盖页（旧全屏页）：总览 / 任务 / 文件树 / Git / 热力图 / 历史。
@@ -4492,322 +5011,320 @@ impl Workspace {
                 .into_any_element(),
             MainView::DiffDetail => self.git_diff_only_pane(window, cx),
             MainView::Tasks => self.render_tasks_page(window, cx).into_any_element(),
-                        MainView::Files => {
-                            // 有查询串 → 显示搜索结果；否则显示文件树。
-                            let has_query = self
-                                .file_filter
-                                .as_ref()
-                                .is_some_and(|s| !s.read(cx).value().trim().is_empty());
-                            // 打开文件后的 reveal：祖先目录缓存齐了就滚到树里对应行。
-                            if !has_query {
-                                self.try_flush_file_tree_reveal(cx);
-                            }
-                            let body = if has_query {
-                                match &self.search_results {
-                                    Some(state) => {
-                                        search_results_view(state, &self.file_tree_scroll, cx)
-                                    }
-                                    // ensure_search 已在 render 顶部同步置位，通常到不了这里。
-                                    None => div().flex_1().into_any_element(),
-                                }
-                            } else {
-                                let open_path = self.open_file.as_ref().map(|of| of.path.as_str());
-                                let selected = self.file_tree_selected.as_deref();
-                                // 多根工作区：把所有项目根一起铺开（顺序同侧栏项目列表）；
-                                // 每个根各查各自的 git status 标 M/A/D，归属由 file_tree 内部
-                                // 按行所属的根处理，不再是全局一份。
-                                let roots = self.workspace_roots(cx);
-                                file_tree(
-                                    &roots,
-                                    &self.expanded,
-                                    &self.collapsed_roots,
-                                    &self.dir_cache,
-                                    &self.file_tree_scroll,
-                                    open_path,
-                                    selected,
-                                    self.file_tree_w,
-                                    &self.git_status,
-                                    cx,
-                                )
-                            };
-                            // 顶部搜索框（file_filter 已在 render 顶部懒创建）。
-                            let search_box = self.file_filter.as_ref().map(|state| {
-                                div()
-                                    .px_2()
-                                    .py(px(6.))
-                                    .border_b_1()
-                                    .border_color(c_border)
-                                    .child(Input::new(state).small())
-                            });
-                            let content = file_content_pane(&self.open_file, cx);
-                            div()
-                                .flex_1()
-                                // min_h_0：否则这个 flex item 会被文件内容撑到整份文件那么高、
-                                // 溢出窗口，导致内部 uniform_list 拿不到有界高度而无法滚动。
-                                .min_h_0()
-                                .flex()
-                                .child(
-                                    // 文件树列宽可拖拽（拖右边框），不再写死 260px——文件名
-                                    // 超长时至少还能拖宽了看，配合行上的 tooltip 一起解决
-                                    // 「长文件名看不全」的问题。
-                                    h_resizable("file-tree-split")
-                                        .with_state(&self.file_tree_resize)
-                                        .child(
-                                            resizable_panel()
-                                                .size(px(self.file_tree_w))
-                                                .size_range(px(160.)..px(480.))
-                                                .child(
-                                                    div()
-                                                        .size_full()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .min_h_0()
-                                                        .border_r_1()
-                                                        .border_color(c_border)
-                                                        .children(search_box)
-                                                        .child(body),
-                                                ),
-                                        )
-                                        .child(resizable_panel().child(content)),
-                                )
-                                .into_any_element()
-                        }
-                        MainView::Git => {
-                            let cwd = self.cur().and_then(|s| s.cwd(cx));
-                            let c_border = cx.theme().border;
-                            // 「改动 / 日志」子标签。两者同属 Git 工具窗口，不占两个
-                            // 顶层标签（JetBrains 也是这个结构）。
-                            let sub_tabs = {
-                                let (fg, muted, accent) = {
-                                    let t = cx.theme();
-                                    (t.foreground, t.muted_foreground, t.accent)
-                                };
-                                h_flex()
-                                    .gap_1()
-                                    .px_3()
-                                    .py_1()
-                                    .border_b_1()
-                                    .border_color(c_border)
-                                    .children([(GitTab::Changes, "改动"), (GitTab::Log, "日志")].map(
-                                        |(tab, label)| {
-                                            let on = self.git_tab == tab;
-                                            div()
-                                                .id(label)
-                                                .px_2()
-                                                .py(px(1.0))
-                                                .text_sm()
-                                                .rounded_sm()
-                                                .cursor_pointer()
-                                                .text_color(if on { fg } else { muted })
-                                                .when(on, |d| d.bg(accent))
-                                                .hover(|d| d.opacity(0.8))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.git_tab = tab;
-                                                    cx.notify();
-                                                }))
-                                                .child(label)
-                                        },
-                                    ))
-                                    // 热力图入口：原顶部 TabBar 撤掉后挂靠在 Git 页
-                                    // （同为「看仓库」维度的全屏视图）。
+            MainView::Files => {
+                // 有查询串 → 显示搜索结果；否则显示文件树。
+                let has_query = self
+                    .file_filter
+                    .as_ref()
+                    .is_some_and(|s| !s.read(cx).value().trim().is_empty());
+                // 打开文件后的 reveal：祖先目录缓存齐了就滚到树里对应行。
+                if !has_query {
+                    self.try_flush_file_tree_reveal(cx);
+                }
+                let body = if has_query {
+                    match &self.search_results {
+                        Some(state) => search_results_view(state, &self.file_tree_scroll, cx),
+                        // ensure_search 已在 render 顶部同步置位，通常到不了这里。
+                        None => div().flex_1().into_any_element(),
+                    }
+                } else {
+                    let open_path = self.open_file.as_ref().map(|of| of.path.as_str());
+                    let selected = self.file_tree_selected.as_deref();
+                    // 多根工作区：把所有项目根一起铺开（顺序同侧栏项目列表）；
+                    // 每个根各查各自的 git status 标 M/A/D，归属由 file_tree 内部
+                    // 按行所属的根处理，不再是全局一份。
+                    let roots = self.workspace_roots(cx);
+                    file_tree(
+                        &roots,
+                        &self.expanded,
+                        &self.collapsed_roots,
+                        &self.dir_cache,
+                        &self.file_tree_scroll,
+                        open_path,
+                        selected,
+                        self.file_tree_w,
+                        &self.git_status,
+                        cx,
+                    )
+                };
+                // 顶部搜索框（file_filter 已在 render 顶部懒创建）。
+                let search_box = self.file_filter.as_ref().map(|state| {
+                    div()
+                        .px_2()
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(c_border)
+                        .child(Input::new(state).small())
+                });
+                let content = file_content_pane(&self.open_file, cx);
+                div()
+                    .flex_1()
+                    // min_h_0：否则这个 flex item 会被文件内容撑到整份文件那么高、
+                    // 溢出窗口，导致内部 uniform_list 拿不到有界高度而无法滚动。
+                    .min_h_0()
+                    .flex()
+                    .child(
+                        // 文件树列宽可拖拽（拖右边框），不再写死 260px——文件名
+                        // 超长时至少还能拖宽了看，配合行上的 tooltip 一起解决
+                        // 「长文件名看不全」的问题。
+                        h_resizable("file-tree-split")
+                            .with_state(&self.file_tree_resize)
+                            .child(
+                                resizable_panel()
+                                    .size(px(self.file_tree_w))
+                                    .size_range(px(160.)..px(480.))
                                     .child(
                                         div()
-                                            .id("git-tab-hotspot")
-                                            .px_2()
-                                            .py(px(1.0))
-                                            .text_sm()
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .text_color(muted)
-                                            .hover(|d| d.opacity(0.8))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.stage_override = Some(MainView::Hotspot);
-                                                cx.notify();
-                                            }))
-                                            .child("热力图"),
-                                    )
-                            };
-
-                            let body = match self.git_tab {
-                                GitTab::Changes => {
-                                    let status = cwd
-                                        .as_ref()
-                                        .and_then(|r| self.git_status.get(r).map(|(_, d)| d));
-                                    let branches = cwd
-                                        .as_ref()
-                                        .and_then(|r| self.branches.get(r).map(|(_, d)| d));
-                                    // 评论输入框懒创建（需要 window），跟文件树搜索框同一套模式。
-                                    if self.git_diff.is_some() && self.diff_comment_input.is_none() {
-                                        use gpui_component::input::InputState;
-                                        let state = cx.new(|cx| {
-                                            InputState::new(window, cx)
-                                                .placeholder("给选中的行写评论，发送前可以再改改…")
-                                        });
-                                        self.diff_comment_input = Some(state);
-                                    }
-                                    // commit message 输入框懒创建，跟上面评论框同一套模式；只要
-                                    // 进了 Git 页就常驻（不像评论框依赖已经打开某个 diff）。
-                                    if self.commit_msg_input.is_none() {
-                                        use gpui_component::input::InputState;
-                                        let state = cx.new(|cx| {
-                                            // 多行 + 自增高：commit message 的规范写法是
-                                            // 「标题空行正文」，单行框根本写不了 body，
-                                            // AI 生成的多段说明也会被挤成一行。
-                                            InputState::new(window, cx)
-                                                .multi_line(true)
-                                                .auto_grow(2, 8)
-                                                .placeholder("Commit message（可多行；点「AI 生成」起草）")
-                                        });
-                                        self.commit_msg_input = Some(state);
-                                    }
-                                    git_view(
-                                        cwd.clone(),
-                                        status,
-                                        branches,
-                                        &self.git_diff,
-                                        self.diff_split,
-                                        &self.diff_selected,
-                                        self.diff_comment_input.as_ref(),
-                                        self.commit_msg_input.as_ref(),
-                                        self.commit_msg_generating,
-                                        self.pushing,
-                                        &self.git_files_scroll,
-                                        &self.diff_scroll,
-                                        self.active_hunk,
-                                        &self.git_left_resize,
-                                        self.git_left_w,
-                                        &self.git_tree_collapsed,
-                                        self.diff_scope,
-                                        cx,
-                                    )
-                                }
-                                GitTab::Log => {
-                                    if let Some(root) = cwd.clone() {
-                                        // 进页面就保证数据在（内部按 root 去重，不会每帧拉）；
-                                        // 分支列表复用 Git 页那份缓存，左侧树才有内容。
-                                        self.ensure_git_log(root.clone(), cx);
-                                        self.ensure_branches(root, cx);
-                                    }
-                                    // 状态在这里取好再传下去：渲染函数内部绝不能 read 自己的
-                                    // entity（render 期间它正被可变借用，重入会直接 abort）。
-                                    let branches = cwd
-                                        .as_ref()
-                                        .and_then(|r| self.branches.get(r))
-                                        .map(|(_, b)| b);
-                                    // 当前检出的分支：日志默认看它，分支树里也要标出来。
-                                    // 复用 Git 页已有的 status 缓存，不另跑一次 git。
-                                    let head_branch = cwd
-                                        .as_ref()
-                                        .and_then(|r| self.git_status.get(r))
-                                        .map(|(_, d)| d.branch_name().to_string())
-                                        .filter(|b| !b.is_empty());
-                                    // 三栏都可拖拽：窗口窄的时候能自己腾地方，写死
-                                    // 宽度的话中间的提交列表会被挤得没法看。
-                                    div().flex_1().min_h_0().flex().child(
-                                        h_resizable("git-log-split")
-                                            .with_state(&self.git_log_resize)
-                                            // 左：分支树
-                                            .child(
-                                                resizable_panel()
-                                                    .size(px(200.))
-                                                    .size_range(px(140.)..px(360.))
-                                                    .child(
-                                                        div()
-                                                            .size_full()
-                                                            .min_h_0()
-                                                            .border_r_1()
-                                                            .border_color(c_border)
-                                                            .child(git_log_view::branch_tree(
-                                                                cwd.clone(),
-                                                                branches,
-                                                                &self.git_log.scope,
-                                                                head_branch.clone(),
-                                                                cx,
-                                                            )),
-                                                    ),
-                                            )
-                                            // 中：分支图 + 提交列表
-                                            // wrapper 必须 .flex()：div 默认 Block，
-                                            // 里面 flex_1 根节点会高度塌 0（同 Git
-                                            // 改动页 diff 面板的坑）。
-                                            .child(resizable_panel().child(
-                                                div()
-                                                    .size_full()
-                                                    .flex()
-                                                    .min_w_0()
-                                                    .min_h_0()
-                                                    .border_r_1()
-                                                    .border_color(c_border)
-                                                    .child(git_log_view::git_log_view(
-                                                        cwd.clone(),
-                                                        &self.git_log,
-                                                        head_branch,
-                                                        cx,
-                                                    )),
-                                            ))
-                                            // 右：提交详情
-                                            .child(
-                                                resizable_panel()
-                                                    .size(px(380.))
-                                                    .size_range(px(240.)..px(640.))
-                                                    .child(
-                                                        div()
-                                                            .size_full()
-                                                            .flex()
-                                                            .min_w_0()
-                                                            .min_h_0()
-                                                            .child(
-                                                                git_log_view::commit_detail_pane(
-                                                                    cwd,
-                                                                    &self.git_log,
-                                                                    cx,
-                                                                ),
-                                                            ),
-                                                    ),
-                                            ),
-                                    )
-                                }
-                            };
-
-                            v_flex().flex_1().min_h_0().child(sub_tabs).child(body).into_any_element()
-                        }
-                        MainView::Hotspot => {
-                            let cwd = self.cur().and_then(|s| s.cwd(cx));
-                            let data = cwd
-                                .as_ref()
-                                .and_then(|r| self.hotspot_data.get(r).map(|(_, d)| d.clone()));
-                            hotspot_view(cwd, data, cx).into_any_element()
-                        }
-                        MainView::History => {
-                            let cwd = self.cur().and_then(|s| s.cwd(cx));
-                            let list_key = cwd
-                                .as_ref()
-                                .map(|c| session_history::session_list_key(self.history_agent, c));
-                            let sessions = list_key
-                                .as_ref()
-                                .and_then(|k| self.session_list.get(k).map(|(_, d)| d.clone()));
-                            let list_state = match sessions {
-                                None => HistoryListState::Loading,
-                                Some(s) if s.is_empty() => HistoryListState::Empty,
-                                Some(s) => HistoryListState::Ready(s),
-                            };
-                            // 没选项目时给 Some(空表)，走「还没有记忆」而不是一直转圈。
-                            let memories = match &cwd {
-                                Some(root) => self.memory_list.get(root).map(|(_, d)| d.clone()),
-                                None => Some(Rc::new(Vec::new())),
-                            };
-                            history_view(
-                                self.history_pane,
-                                self.history_agent,
-                                cwd,
-                                list_state,
-                                &self.session_detail,
-                                memories,
-                                self.memory_selected,
-                                cx,
+                                            .size_full()
+                                            .flex()
+                                            .flex_col()
+                                            .min_h_0()
+                                            .border_r_1()
+                                            .border_color(c_border)
+                                            .children(search_box)
+                                            .child(body),
+                                    ),
                             )
-                            .into_any_element()
+                            .child(resizable_panel().child(content)),
+                    )
+                    .into_any_element()
+            }
+            MainView::Git => {
+                let cwd = self.cur().and_then(|s| s.cwd(cx));
+                let c_border = cx.theme().border;
+                // 「改动 / 日志」子标签。两者同属 Git 工具窗口，不占两个
+                // 顶层标签（JetBrains 也是这个结构）。
+                let sub_tabs = {
+                    let (fg, muted, accent) = {
+                        let t = cx.theme();
+                        (t.foreground, t.muted_foreground, t.accent)
+                    };
+                    h_flex()
+                        .gap_1()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(c_border)
+                        .children([(GitTab::Changes, "改动"), (GitTab::Log, "日志")].map(
+                            |(tab, label)| {
+                                let on = self.git_tab == tab;
+                                div()
+                                    .id(label)
+                                    .px_2()
+                                    .py(px(1.0))
+                                    .text_sm()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_color(if on { fg } else { muted })
+                                    .when(on, |d| d.bg(accent))
+                                    .hover(|d| d.opacity(0.8))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.git_tab = tab;
+                                        cx.notify();
+                                    }))
+                                    .child(label)
+                            },
+                        ))
+                        // 热力图入口：原顶部 TabBar 撤掉后挂靠在 Git 页
+                        // （同为「看仓库」维度的全屏视图）。
+                        .child(
+                            div()
+                                .id("git-tab-hotspot")
+                                .px_2()
+                                .py(px(1.0))
+                                .text_sm()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(muted)
+                                .hover(|d| d.opacity(0.8))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.stage_override = Some(MainView::Hotspot);
+                                    cx.notify();
+                                }))
+                                .child("热力图"),
+                        )
+                };
+
+                let body = match self.git_tab {
+                    GitTab::Changes => {
+                        let status = cwd
+                            .as_ref()
+                            .and_then(|r| self.git_status.get(r).map(|(_, d)| d));
+                        let branches = cwd
+                            .as_ref()
+                            .and_then(|r| self.branches.get(r).map(|(_, d)| d));
+                        // 评论输入框懒创建（需要 window），跟文件树搜索框同一套模式。
+                        if self.git_diff.is_some() && self.diff_comment_input.is_none() {
+                            use gpui_component::input::InputState;
+                            let state = cx.new(|cx| {
+                                InputState::new(window, cx)
+                                    .placeholder("给选中的行写评论，发送前可以再改改…")
+                            });
+                            self.diff_comment_input = Some(state);
                         }
+                        // commit message 输入框懒创建，跟上面评论框同一套模式；只要
+                        // 进了 Git 页就常驻（不像评论框依赖已经打开某个 diff）。
+                        if self.commit_msg_input.is_none() {
+                            use gpui_component::input::InputState;
+                            let state = cx.new(|cx| {
+                                // 多行 + 自增高：commit message 的规范写法是
+                                // 「标题空行正文」，单行框根本写不了 body，
+                                // AI 生成的多段说明也会被挤成一行。
+                                InputState::new(window, cx)
+                                    .multi_line(true)
+                                    .auto_grow(2, 8)
+                                    .placeholder("Commit message（可多行；点「AI 生成」起草）")
+                            });
+                            self.commit_msg_input = Some(state);
+                        }
+                        git_view(
+                            cwd.clone(),
+                            status,
+                            branches,
+                            &self.git_diff,
+                            self.diff_split,
+                            &self.diff_selected,
+                            self.diff_comment_input.as_ref(),
+                            self.commit_msg_input.as_ref(),
+                            self.commit_msg_generating,
+                            self.pushing,
+                            &self.git_files_scroll,
+                            &self.diff_scroll,
+                            self.active_hunk,
+                            &self.git_left_resize,
+                            self.git_left_w,
+                            &self.git_tree_collapsed,
+                            self.diff_scope,
+                            cx,
+                        )
+                    }
+                    GitTab::Log => {
+                        if let Some(root) = cwd.clone() {
+                            // 进页面就保证数据在（内部按 root 去重，不会每帧拉）；
+                            // 分支列表复用 Git 页那份缓存，左侧树才有内容。
+                            self.ensure_git_log(root.clone(), cx);
+                            self.ensure_branches(root, cx);
+                        }
+                        // 状态在这里取好再传下去：渲染函数内部绝不能 read 自己的
+                        // entity（render 期间它正被可变借用，重入会直接 abort）。
+                        let branches = cwd
+                            .as_ref()
+                            .and_then(|r| self.branches.get(r))
+                            .map(|(_, b)| b);
+                        // 当前检出的分支：日志默认看它，分支树里也要标出来。
+                        // 复用 Git 页已有的 status 缓存，不另跑一次 git。
+                        let head_branch = cwd
+                            .as_ref()
+                            .and_then(|r| self.git_status.get(r))
+                            .map(|(_, d)| d.branch_name().to_string())
+                            .filter(|b| !b.is_empty());
+                        // 三栏都可拖拽：窗口窄的时候能自己腾地方，写死
+                        // 宽度的话中间的提交列表会被挤得没法看。
+                        div().flex_1().min_h_0().flex().child(
+                            h_resizable("git-log-split")
+                                .with_state(&self.git_log_resize)
+                                // 左：分支树
+                                .child(
+                                    resizable_panel()
+                                        .size(px(200.))
+                                        .size_range(px(140.)..px(360.))
+                                        .child(
+                                            div()
+                                                .size_full()
+                                                .min_h_0()
+                                                .border_r_1()
+                                                .border_color(c_border)
+                                                .child(git_log_view::branch_tree(
+                                                    cwd.clone(),
+                                                    branches,
+                                                    &self.git_log.scope,
+                                                    head_branch.clone(),
+                                                    cx,
+                                                )),
+                                        ),
+                                )
+                                // 中：分支图 + 提交列表
+                                // wrapper 必须 .flex()：div 默认 Block，
+                                // 里面 flex_1 根节点会高度塌 0（同 Git
+                                // 改动页 diff 面板的坑）。
+                                .child(
+                                    resizable_panel().child(
+                                        div()
+                                            .size_full()
+                                            .flex()
+                                            .min_w_0()
+                                            .min_h_0()
+                                            .border_r_1()
+                                            .border_color(c_border)
+                                            .child(git_log_view::git_log_view(
+                                                cwd.clone(),
+                                                &self.git_log,
+                                                head_branch,
+                                                cx,
+                                            )),
+                                    ),
+                                )
+                                // 右：提交详情
+                                .child(
+                                    resizable_panel()
+                                        .size(px(380.))
+                                        .size_range(px(240.)..px(640.))
+                                        .child(div().size_full().flex().min_w_0().min_h_0().child(
+                                            git_log_view::commit_detail_pane(
+                                                cwd,
+                                                &self.git_log,
+                                                cx,
+                                            ),
+                                        )),
+                                ),
+                        )
+                    }
+                };
+
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(sub_tabs)
+                    .child(body)
+                    .into_any_element()
+            }
+            MainView::Hotspot => {
+                let cwd = self.cur().and_then(|s| s.cwd(cx));
+                let data = cwd
+                    .as_ref()
+                    .and_then(|r| self.hotspot_data.get(r).map(|(_, d)| d.clone()));
+                hotspot_view(cwd, data, cx).into_any_element()
+            }
+            MainView::History => {
+                let cwd = self.cur().and_then(|s| s.cwd(cx));
+                let list_key = cwd
+                    .as_ref()
+                    .map(|c| session_history::session_list_key(self.history_agent, c));
+                let sessions = list_key
+                    .as_ref()
+                    .and_then(|k| self.session_list.get(k).map(|(_, d)| d.clone()));
+                let list_state = match sessions {
+                    None => HistoryListState::Loading,
+                    Some(s) if s.is_empty() => HistoryListState::Empty,
+                    Some(s) => HistoryListState::Ready(s),
+                };
+                // 没选项目时给 Some(空表)，走「还没有记忆」而不是一直转圈。
+                let memories = match &cwd {
+                    Some(root) => self.memory_list.get(root).map(|(_, d)| d.clone()),
+                    None => Some(Rc::new(Vec::new())),
+                };
+                history_view(
+                    self.history_pane,
+                    self.history_agent,
+                    cwd,
+                    list_state,
+                    &self.session_detail,
+                    memories,
+                    self.memory_selected,
+                    cx,
+                )
+                .into_any_element()
+            }
         }
     }
 }
@@ -4819,8 +5336,15 @@ impl Render for Workspace {
         // Dock 角标 + 菜单栏图标角标/下拉菜单：同一份状态数据源（AgentStatus），
         // 变了才调 Cocoa API 更新（避免每次 render 都发一遍）。
         let statuses: Vec<AgentStatus> = self.sessions.iter().map(|s| s.status(cx)).collect();
-        let attention_count =
-            statuses.iter().filter(|s| matches!(s, AgentStatus::WaitingApproval | AgentStatus::NeedsAttention)).count();
+        let attention_count = statuses
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    AgentStatus::WaitingApproval | AgentStatus::NeedsAttention
+                )
+            })
+            .count();
         if self.dock_badge_count != Some(attention_count) {
             self.dock_badge_count = Some(attention_count);
             dock::set_badge(attention_count);
@@ -4842,7 +5366,12 @@ impl Render for Workspace {
                     AgentStatus::Done => "已完成",
                     AgentStatus::Idle => "空闲",
                 };
-                status_item::SessionEntry { session_ix: ix, title: self.sessions[ix].title(cx), status_text, color }
+                status_item::SessionEntry {
+                    session_ix: ix,
+                    title: self.sessions[ix].title(cx),
+                    status_text,
+                    color,
+                }
             })
             .collect();
         if self.status_menu_snapshot.as_ref() != Some(&menu_snapshot) {
@@ -4938,8 +5467,10 @@ impl Render for Workspace {
 
         // Git 页：后台刷新改动列表 + 分支列表（git status/for-each-ref 慢，绝不在
         // render 里同步跑）。
-        if matches!(self.stage_override, Some(MainView::Git | MainView::DiffDetail))
-            || (self.inspector_open && self.inspector_tab == inspector::InspectorTab::Git)
+        if matches!(
+            self.stage_override,
+            Some(MainView::Git | MainView::DiffDetail)
+        ) || (self.inspector_open && self.inspector_tab == inspector::InspectorTab::Git)
         {
             if let Some(root) = self.cur().and_then(|s| s.cwd(cx)) {
                 // 进 Git 页主动 fetch 一次，让 ahead/behind 反映远端最新。render 每帧都会
@@ -4979,20 +5510,21 @@ impl Render for Workspace {
 
         // 文件树页：后台刷新根目录 + 所有已展开目录的直接子项列表（fs::read_dir 绝不
         // 在 render 里同步跑）。展开新目录时它会先落空，下一帧缓存到位后自动出现。
-        if matches!(self.stage_override, Some(MainView::Files | MainView::FileDetail))
-            || (self.inspector_open && self.inspector_tab == inspector::InspectorTab::Files)
+        if matches!(
+            self.stage_override,
+            Some(MainView::Files | MainView::FileDetail)
+        ) || (self.inspector_open && self.inspector_tab == inspector::InspectorTab::Files)
         {
             // 搜索输入框懒创建（需要 window）：键入即 notify，触发文件名 + 内容搜索。
             if self.file_filter.is_none() {
                 use gpui_component::input::{InputEvent, InputState};
                 let state =
                     cx.new(|cx| InputState::new(window, cx).placeholder("搜索文件名 / 内容…"));
-                self._file_filter_sub =
-                    Some(cx.subscribe(&state, |_, _, ev: &InputEvent, cx| {
-                        if matches!(ev, InputEvent::Change) {
-                            cx.notify();
-                        }
-                    }));
+                self._file_filter_sub = Some(cx.subscribe(&state, |_, _, ev: &InputEvent, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        cx.notify();
+                    }
+                }));
                 self.file_filter = Some(state);
             }
             let query = self
@@ -5039,8 +5571,11 @@ impl Render for Workspace {
                 let dt = now.duration_since(prev).as_secs_f32();
                 if dt > 0.0 {
                     let inst = 1.0 / dt;
-                    self.fps_ema =
-                        if self.fps_ema <= 0.0 { inst } else { self.fps_ema * 0.9 + inst * 0.1 };
+                    self.fps_ema = if self.fps_ema <= 0.0 {
+                        inst
+                    } else {
+                        self.fps_ema * 0.9 + inst * 0.1
+                    };
                 }
             }
             self.last_frame = Some(now);
@@ -5061,7 +5596,13 @@ impl Render for Workspace {
         // 主题色 token（跟随 gpui-component 主题，替代硬编码）
         let (c_bg, c_border, c_popover, c_muted, c_fg) = {
             let t = cx.theme();
-            (t.background, t.border, t.popover, t.muted_foreground, t.foreground)
+            (
+                t.background,
+                t.border,
+                t.popover,
+                t.muted_foreground,
+                t.foreground,
+            )
         };
 
         // 会话标题（取活动终端的 cwd 末段）
@@ -5137,12 +5678,8 @@ impl Render for Workspace {
                 .flex_col()
                 .children(stage_header)
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        .flex()
-                        .child(match &self.sessions[self.active_session].kind {
+                    div().flex_1().min_w_0().min_h_0().flex().child(
+                        match &self.sessions[self.active_session].kind {
                             SessionKind::Term { .. } => self.render_pane(
                                 self.sessions[self.active_session]
                                     .term_layout()
@@ -5152,7 +5689,8 @@ impl Render for Workspace {
                             ),
                             // ACP 会话：整块主区就是消息流视图（无分屏树）。
                             SessionKind::Acp(view) => view.clone().into_any_element(),
-                        }),
+                        },
+                    ),
                 )
                 .children(term_bar)
         } else {
@@ -5178,7 +5716,11 @@ impl Render for Workspace {
                 .items_center()
                 .justify_center()
                 .gap_4()
-                .child(Icon::new(IconName::SquareTerminal).size(px(40.)).text_color(c_muted))
+                .child(
+                    Icon::new(IconName::SquareTerminal)
+                        .size(px(40.))
+                        .text_color(c_muted),
+                )
                 .child(div().text_color(c_muted).child("还没有会话"))
                 .child(
                     div()
@@ -5253,6 +5795,13 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewTask, window, cx| {
                 this.open_new_task_modal(window, cx);
             }))
+            // Cmd+↑ / Cmd+↓：上/下一个会话（按侧栏视觉顺序）。
+            .on_action(cx.listener(|this, _: &PrevSession, window, cx| {
+                this.cycle_session(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextSession, window, cx| {
+                this.cycle_session(1, window, cx);
+            }))
             // 应用菜单「检查更新…」：顺手发起一次检查，再把设置窗口开到「更新」页看进度。
             .on_action(cx.listener(|this, _: &CheckForUpdate, window, cx| {
                 if this.llm_inputs.is_none() {
@@ -5275,23 +5824,31 @@ impl Render for Workspace {
                 cx.open_url("https://github.com/smelt-ai/smelt/issues/new/choose");
             }))
             // 文件内容视图右键菜单里的「发送选中内容到终端」，见 send_open_file_selection。
-            .on_action(cx.listener(|this, _: &SendSelectionToTerminal, _window, cx| {
-                this.send_open_file_selection(cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &SendSelectionToTerminal, _window, cx| {
+                    this.send_open_file_selection(cx);
+                }),
+            )
             // 全局快捷键：Cmd+K 面板 / Cmd+B 侧栏 / Cmd+[ ] 切当前会话内的 pane /
             // Cmd+1~9 跳到第 N 个会话（键位分工对齐 iTerm2）
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
                 // 文件树键盘导航：搜索框 / 编辑器聚焦时不抢键。
-                if matches!(this.stage_override, Some(MainView::Files | MainView::FileDetail))
-                    && !ks.modifiers.platform && !ks.modifiers.control {
+                if matches!(
+                    this.stage_override,
+                    Some(MainView::Files | MainView::FileDetail)
+                ) && !ks.modifiers.platform
+                    && !ks.modifiers.control
+                {
                     use gpui::Focusable;
-                    let search_focused = this.file_filter.as_ref().is_some_and(|s| {
-                        s.read(cx).focus_handle(cx).is_focused(window)
-                    });
-                    let editor_focused = this.open_file.as_ref().is_some_and(|of| {
-                        of.editor.read(cx).focus_handle(cx).is_focused(window)
-                    });
+                    let search_focused = this
+                        .file_filter
+                        .as_ref()
+                        .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+                    let editor_focused = this
+                        .open_file
+                        .as_ref()
+                        .is_some_and(|of| of.editor.read(cx).focus_handle(cx).is_focused(window));
                     if !search_focused && !editor_focused {
                         match ks.key.as_str() {
                             "up" => {
@@ -5320,8 +5877,10 @@ impl Render for Workspace {
                 }
                 // Git 页 F7 / Shift+F7：在改动块之间跳（对齐 JetBrains 的 next/previous
                 // difference）。不带 Cmd，所以要赶在下面的 platform 判断之前处理。
-                if matches!(this.stage_override, Some(MainView::Git | MainView::DiffDetail))
-                    && this.git_tab == GitTab::Changes
+                if matches!(
+                    this.stage_override,
+                    Some(MainView::Git | MainView::DiffDetail)
+                ) && this.git_tab == GitTab::Changes
                     && ks.key == "f7"
                     && !ks.modifiers.platform
                 {
@@ -5337,6 +5896,7 @@ impl Render for Workspace {
                     && !this.show_new_task_modal
                     && !this.show_quit_confirm
                     && this.delete_worktree_target.is_none()
+                    && this.close_project_target.is_none()
                 {
                     this.set_stage_override(None, window, cx);
                     return;
@@ -5367,7 +5927,7 @@ impl Render for Workspace {
                         let visible: Vec<usize> = this
                             .project_groups(cx)
                             .into_iter()
-                            .flat_map(|(_, _, ixs)| ixs)
+                            .flat_map(|g| g.sessions)
                             .collect();
                         if let Some(&ix) = visible.get(n) {
                             this.activate(ix, window, cx);
@@ -5386,7 +5946,11 @@ impl Render for Workspace {
                     "w" => this.close_active(window, cx),
                     // Cmd+S：保存文件树里打开的文件（仅 Files 页，避免切到别的
                     // 视图时背着用户悄悄写盘）。
-                    "s" if matches!(this.stage_override, Some(MainView::Files | MainView::FileDetail)) => {
+                    "s" if matches!(
+                        this.stage_override,
+                        Some(MainView::Files | MainView::FileDetail)
+                    ) =>
+                    {
                         this.save_open_file(cx)
                     }
                     // Cmd+Shift+F 切换调试 HUD（右上角帧率 + 内存）
@@ -5563,10 +6127,13 @@ impl Render for Workspace {
                                     // 有新版本在下载/已就绪，或守护落后于磁盘二进制 → 齿轮角上
                                     // 缀一个红点提醒「有待处理事项」，图标本身颜色不跟着变——
                                     // 之前让整个图标变蓝，看着像常驻高亮状态，容易被当成卡住了。
-                                    let needs_attention =
-                                        self.update_available() || self.daemon_outdated == Some(true);
+                                    let needs_attention = self.update_available()
+                                        || self.daemon_outdated == Some(true);
                                     let gear: AnyElement = if needs_attention {
-                                        Badge::new().dot().child(Icon::new(IconName::Settings)).into_any_element()
+                                        Badge::new()
+                                            .dot()
+                                            .child(Icon::new(IconName::Settings))
+                                            .into_any_element()
                                     } else {
                                         Icon::new(IconName::Settings).into_any_element()
                                     };
@@ -5601,34 +6168,34 @@ impl Render for Workspace {
             // 主体：左侧会话侧栏 + 右侧主区，占满标题栏以下的剩余高度。
             .child(
                 div().flex_1().min_h_0().flex().child(
-                div()
-                    .size_full()
-                    .flex()
-                    // 会话列表（280px，按项目分组）
-                    .child(list_el)
-                    // 主区：顶部视图切换 + 内容
-                    .child(
-                        div()
-                            .flex_1()
-                            // min_w_0：主区在根 flex 行里默认 min-width:auto，会被最长终端行
-                            // 撑到不肯收缩，导致宽度被内容反向放大。归零后才能正常按剩余空间收缩。
-                            .min_w_0()
-                    .flex()
-                    .flex_col()
-                    // 舞台：覆盖页（旧全屏页）优先，否则显示当前会话。
-                    // 覆盖页顶部带显式返回条——Esc 之外总得有个能点的出口。
-                    .child(match self.stage_override {
-                        Some(v) => v_flex()
-                            .flex_1()
-                            .min_h_0()
-                            .child(self.render_stage_back_bar(v, cx))
-                            .child(self.render_stage_override(v, window, cx))
-                            .into_any_element(),
-                        None => content.into_any_element(),
-                    }),
-                    )
-                    .children(inspector_panel_el)
-                    .child(inspector_rail_el),
+                    div()
+                        .size_full()
+                        .flex()
+                        // 会话列表（280px，按项目分组）
+                        .child(list_el)
+                        // 主区：顶部视图切换 + 内容
+                        .child(
+                            div()
+                                .flex_1()
+                                // min_w_0：主区在根 flex 行里默认 min-width:auto，会被最长终端行
+                                // 撑到不肯收缩，导致宽度被内容反向放大。归零后才能正常按剩余空间收缩。
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                // 舞台：覆盖页（旧全屏页）优先，否则显示当前会话。
+                                // 覆盖页顶部带显式返回条——Esc 之外总得有个能点的出口。
+                                .child(match self.stage_override {
+                                    Some(v) => v_flex()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .child(self.render_stage_back_bar(v, cx))
+                                        .child(self.render_stage_override(v, window, cx))
+                                        .into_any_element(),
+                                    None => content.into_any_element(),
+                                }),
+                        )
+                        .children(inspector_panel_el)
+                        .child(inspector_rail_el),
                 ),
             )
             // 底部状态栏
@@ -5640,19 +6207,59 @@ impl Render for Workspace {
             // 退出确认拦截弹层
             .children(self.show_quit_confirm.then(|| self.render_quit_confirm(cx)))
             // 会话管理弹窗（设置页「更新」tab 点开）
-            .children(self.session_manager_open.then(|| self.render_session_manager(cx)))
+            .children(
+                self.session_manager_open
+                    .then(|| self.render_session_manager(cx)),
+            )
             // 会话重命名拦截弹层
-            .children(self.rename_target.is_some().then(|| self.render_rename_session(cx)))
+            .children(
+                self.rename_target
+                    .is_some()
+                    .then(|| self.render_rename_session(cx)),
+            )
             // 新建任务弹窗
-            .children(self.show_new_task_modal.then(|| self.render_new_task_modal(cx)))
+            .children(
+                self.show_new_task_modal
+                    .then(|| self.render_new_task_modal(cx)),
+            )
             // 删除 Worktree 确认拦截弹层
-            .children(self.delete_worktree_target.is_some().then(|| self.render_delete_worktree_confirm(cx)))
-            .children(self.discard_hunk_target.is_some().then(|| self.render_discard_hunk_confirm(cx)))
-            .children(self.discard_file_target.is_some().then(|| self.render_discard_file_confirm(cx)))
-            .children(self.discard_all_target.is_some().then(|| self.render_discard_all_confirm(cx)))
-            .children(self.delete_branch_target.is_some().then(|| self.render_delete_branch_confirm(cx)))
+            .children(
+                self.delete_worktree_target
+                    .is_some()
+                    .then(|| self.render_delete_worktree_confirm(cx)),
+            )
+            // 关闭项目确认拦截弹层（会连带 kill 掉它下面的会话）
+            .children(
+                self.close_project_target
+                    .is_some()
+                    .then(|| self.render_close_project_confirm(cx)),
+            )
+            .children(
+                self.discard_hunk_target
+                    .is_some()
+                    .then(|| self.render_discard_hunk_confirm(cx)),
+            )
+            .children(
+                self.discard_file_target
+                    .is_some()
+                    .then(|| self.render_discard_file_confirm(cx)),
+            )
+            .children(
+                self.discard_all_target
+                    .is_some()
+                    .then(|| self.render_discard_all_confirm(cx)),
+            )
+            .children(
+                self.delete_branch_target
+                    .is_some()
+                    .then(|| self.render_delete_branch_confirm(cx)),
+            )
             // 删除文件二次确认拦截弹层
-            .children(self.delete_file_target.is_some().then(|| self.render_delete_file_confirm(cx)))
+            .children(
+                self.delete_file_target
+                    .is_some()
+                    .then(|| self.render_delete_file_confirm(cx)),
+            )
             // 重启守护确认弹层改挂在设置窗（SettingsWindow::render），不在主窗口画。
             // Finder 拖文件/文件夹：只在有拖拽时叠全窗 drop 层。
             // 常驻 hitbox 会盖住按钮（「新建终端」像没反应）；对齐「有 drag 才出现」。
@@ -5680,7 +6287,10 @@ impl Render for Workspace {
                     .map(|target| self.render_unsaved_file_confirm(target, cx)),
             )
             // 通知面板浮层
-            .children(self.notifications_open.then(|| self.render_notifications(cx)))
+            .children(
+                self.notifications_open
+                    .then(|| self.render_notifications(cx)),
+            )
             // 调试 HUD：右上角帧率 + 帧耗时 + RSS（Cmd+Shift+F 切换）
             .children(self.debug_hud.then(|| {
                 let fps = self.fps_ema;
@@ -5726,15 +6336,20 @@ fn placeholder_view(text: &str, muted: Hsla) -> Div {
         .child(text.to_string())
 }
 
-
-
 /// ACP 启动命令 → 标题栏胶囊的展示名（`bunx @scope/claude-agent-acp@0.59.0` →
 /// `claude-agent-acp`，`copilot --acp` → `copilot`）。与 acp_view 输入栏胶囊
 /// 同一套抠名逻辑；没有模型名数据源，不硬编。
 fn acp_agent_label(cmd: &str) -> String {
-    let tok = cmd.split_whitespace().rev().find(|t| !t.starts_with('-')).unwrap_or("agent");
+    let tok = cmd
+        .split_whitespace()
+        .rev()
+        .find(|t| !t.starts_with('-'))
+        .unwrap_or("agent");
     let name = tok.rsplit('/').next().unwrap_or(tok);
-    name.split('@').find(|s| !s.is_empty()).unwrap_or(name).to_string()
+    name.split('@')
+        .find(|s| !s.is_empty())
+        .unwrap_or(name)
+        .to_string()
 }
 
 /// 标题栏 agent 胶囊的文字：命令还是出厂值就显示人话名（`Claude Code`），用户
@@ -5812,7 +6427,10 @@ fn file_url_to_path(url: &str) -> Option<std::path::PathBuf> {
 /// 开一扇主工作台窗口（Workspace + Root 包装），返回其 weak 引用。
 /// 首启和「点 Dock 图标重开」共用这一份：`Workspace::new` 本来就会从存档 + smeltd
 /// 重新拼出会话布局，跟正常重启应用效果一致。
-fn open_workspace_window(cx: &mut App, window_bg: WindowBackgroundAppearance) -> WeakEntity<Workspace> {
+fn open_workspace_window(
+    cx: &mut App,
+    window_bg: WindowBackgroundAppearance,
+) -> WeakEntity<Workspace> {
     let window_options = WindowOptions {
         // 透明标题栏：红绿灯浮在内容上，拖拽 / 双击最大化由自定义 TitleBar 接管。
         titlebar: Some(TitleBar::title_bar_options()),
@@ -5860,7 +6478,10 @@ fn main() {
         // 回调（宠物浮窗一直挂着，是否会被系统计入可见窗口未经验证，这里做好兜底：
         // 主窗口还活着就什么都不做，只有真的没了才重新开一扇）。
         app.on_reopen(move |cx| {
-            let alive = current_ws.borrow().as_ref().is_some_and(|w| w.upgrade().is_some());
+            let alive = current_ws
+                .borrow()
+                .as_ref()
+                .is_some_and(|w| w.upgrade().is_some());
             if !alive {
                 let window_bg = cx
                     .try_global::<Appearance>()
@@ -5898,10 +6519,21 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-shift-n", NewTask, None),
+            // 会话上/下切换（跨项目按侧栏视觉顺序，到头循环）。用 cmd+方向键：
+            // 比 cmd-shift-[ 好按，且不会串进 shell——终端的 keystroke_to_bytes 开头
+            // 就是 `if m.platform { return None }`，带 cmd 的键一律不发给 PTY；
+            // gpui-component 输入框也只绑了裸 up/down，没绑 cmd-up/cmd-down。
+            // 原有的 cmd-[ / cmd-] 保持原样，不覆盖、不接管。
+            KeyBinding::new("cmd-up", PrevSession, None),
+            KeyBinding::new("cmd-down", NextSession, None),
             // 把 Tab/Shift-Tab 从 gpui-component Root 的全局焦点跳转手里要回来，
             // 终端聚焦时改发给 shell（见 terminal_view.rs 里 TerminalTab 的注释）。
             KeyBinding::new("tab", terminal_view::TerminalTab, Some("Terminal")),
-            KeyBinding::new("shift-tab", terminal_view::TerminalBackTab, Some("Terminal")),
+            KeyBinding::new(
+                "shift-tab",
+                terminal_view::TerminalBackTab,
+                Some("Terminal"),
+            ),
         ]);
         cx.set_menus(vec![Menu::new("Smelt").items([
             MenuItem::action("新建任务…", NewTask),
@@ -5941,9 +6573,11 @@ fn main() {
         cx.set_global(settings::load_agent_ui_config());
         let (daemon_state_tx, daemon_state_rx) =
             smol::channel::unbounded::<terminal::DaemonStateEvent>();
-        thread::spawn(move || loop {
-            terminal::subscribe_daemon_states_blocking(&daemon_state_tx);
-            thread::sleep(Duration::from_secs(2)); // 断线/连不上，等一下重试
+        thread::spawn(move || {
+            loop {
+                terminal::subscribe_daemon_states_blocking(&daemon_state_tx);
+                thread::sleep(Duration::from_secs(2)); // 断线/连不上，等一下重试
+            }
         });
         cx.spawn(async move |cx| {
             while let Ok(event) = daemon_state_rx.recv().await {
@@ -5953,9 +6587,7 @@ fn main() {
                         .try_global::<settings::AgentUiConfig>()
                         .map(|c| c.notify_awaiting)
                         .unwrap_or(true);
-                    let pending = cx
-                        .try_global::<PendingAgentNotifs>()
-                        .map(|p| p.0.clone());
+                    let pending = cx.try_global::<PendingAgentNotifs>().map(|p| p.0.clone());
                     {
                         let mut map = states.lock().unwrap();
                         match event {
@@ -5983,8 +6615,8 @@ fn main() {
                                             .unwrap_or_else(|| {
                                                 format!("会话 {}", &s.id[..8.min(s.id.len())])
                                             });
-                                        let is_appr = s.phase
-                                            == terminal::DaemonPhase::AwaitingApproval;
+                                        let is_appr =
+                                            s.phase == terminal::DaemonPhase::AwaitingApproval;
                                         q.lock().unwrap().push((title, msg, is_appr));
                                     }
                                 }
@@ -6107,15 +6739,12 @@ fn main() {
 
                         // 2) 隧道：同样先 status 再 start；最终以「有 token 才能展示 URL」为准
                         let tunnel_rt = if want_tunnel {
-                            let has_token =
-                                remote_rt.token.as_ref().is_some_and(|t| !t.is_empty());
+                            let has_token = remote_rt.token.as_ref().is_some_and(|t| !t.is_empty());
                             if !has_token {
                                 settings::TunnelRuntimeState {
                                     connecting: false,
                                     url: None,
-                                    error: Some(
-                                        "本机远程网关没起来，无法建立隧道".into(),
-                                    ),
+                                    error: Some("本机远程网关没起来，无法建立隧道".into()),
                                     write: false,
                                 }
                             } else {
@@ -6224,7 +6853,10 @@ fn main() {
         // 没了就跟 on_reopen 一样重开一扇（此时会话下标已经没意义，只重开窗口）。
         cx.spawn(async move |cx| {
             while let Ok(event) = status_rx.recv().await {
-                let alive = current_ws_status.borrow().as_ref().is_some_and(|w| w.upgrade().is_some());
+                let alive = current_ws_status
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|w| w.upgrade().is_some());
                 if alive {
                     if let status_item::StatusItemEvent::JumpToSession(ix) = event {
                         let ws = current_ws_status.borrow().clone();
@@ -6256,6 +6888,179 @@ fn main() {
         })
         .detach();
     });
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::{
+        AcpSaved, PaneState, ProjectGroup, SessionState, SplitAxis, disambiguate_labels,
+        project_root_of, session_state_cwd,
+    };
+
+    fn group(root: &str, label: &str) -> ProjectGroup {
+        ProjectGroup {
+            root: root.into(),
+            label: label.into(),
+            sessions: Vec::new(),
+        }
+    }
+
+    /// 跑一遍消歧，取回显示名（base 就是各组当前的 label）。
+    fn labels(mut groups: Vec<ProjectGroup>) -> Vec<String> {
+        let bases: Vec<String> = groups.iter().map(|g| g.label.clone()).collect();
+        disambiguate_labels(&mut groups, &bases);
+        groups.into_iter().map(|g| g.label).collect()
+    }
+
+    /// 不重名就别乱加前缀（大多数情况该保持干净的目录名）。
+    #[test]
+    fn unique_labels_are_left_alone() {
+        assert_eq!(
+            labels(vec![group("/a/smelt", "smelt"), group("/a/other", "other")]),
+            vec!["smelt", "other"]
+        );
+    }
+
+    /// 末段同名的两个项目必须区分得开——否则侧栏并排两个一模一样的「smelt」，
+    /// 用户根本分不清哪个是哪个。
+    #[test]
+    fn duplicate_labels_get_parent_segments() {
+        assert_eq!(
+            labels(vec![
+                group("/x/dev/smelt", "smelt"),
+                group("/y/work/smelt", "smelt")
+            ]),
+            vec!["dev · smelt", "work · smelt"]
+        );
+    }
+
+    /// 补一段还撞车就继续往上补，直到分开。
+    #[test]
+    fn keeps_climbing_until_unique() {
+        assert_eq!(
+            labels(vec![
+                group("/a/dev/smelt", "smelt"),
+                group("/b/dev/smelt", "smelt")
+            ]),
+            vec!["a/dev · smelt", "b/dev · smelt"]
+        );
+    }
+
+    /// worktree 的显示名本来就是「仓库 · 分支」，消歧时整体当末段，前缀补在最前。
+    #[test]
+    fn worktree_labels_keep_their_branch_suffix() {
+        assert_eq!(
+            labels(vec![
+                group("/x/wt/smelt", "smelt · feat"),
+                group("/y/wt/smelt", "smelt · feat"),
+            ]),
+            vec!["x/wt · smelt · feat", "y/wt · smelt · feat"]
+        );
+    }
+
+    /// 路径补到顶还重名（真·同路径）→ 必须收敛退出，不能在循环里空转。
+    #[test]
+    fn gives_up_instead_of_looping_forever() {
+        assert_eq!(
+            labels(vec![group("/smelt", "smelt"), group("/smelt", "smelt")]),
+            vec!["smelt", "smelt"]
+        );
+    }
+
+    fn leaf(cwd: &str) -> PaneState {
+        PaneState::Leaf {
+            cwd: Some(cwd.into()),
+            id: None,
+            custom_title: None,
+            launch_label: None,
+            launch_cmd: None,
+        }
+    }
+
+    fn projects(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// cwd 就是项目根、或落在项目根之下，都该归这个项目。
+    #[test]
+    fn cwd_belongs_to_its_project_root() {
+        let p = projects(&["/Users/me/dev/smelt"]);
+        assert_eq!(
+            project_root_of(&p, "/Users/me/dev/smelt").as_deref(),
+            Some("/Users/me/dev/smelt")
+        );
+        assert_eq!(
+            project_root_of(&p, "/Users/me/dev/smelt/crates/smeltd").as_deref(),
+            Some("/Users/me/dev/smelt")
+        );
+        assert_eq!(project_root_of(&p, "/Users/me/dev/other"), None);
+        assert_eq!(project_root_of(&p, ""), None);
+    }
+
+    /// 前缀必须卡在完整路径段上：`/a/smelt-old` 不是 `/a/smelt` 的子目录，
+    /// 否则名字相近的两个项目会互相吞会话。
+    #[test]
+    fn prefix_must_be_a_whole_path_segment() {
+        let p = projects(&["/a/smelt"]);
+        assert_eq!(project_root_of(&p, "/a/smelt-old"), None);
+        assert_eq!(project_root_of(&p, "/a/smeltd"), None);
+        assert_eq!(
+            project_root_of(&p, "/a/smelt/sub").as_deref(),
+            Some("/a/smelt")
+        );
+    }
+
+    /// 父子项目都打开着时，会话归最深的那个（不然子项目永远空着）。
+    #[test]
+    fn deepest_matching_project_wins() {
+        let p = projects(&["/a", "/a/b", "/a/b/c"]);
+        assert_eq!(project_root_of(&p, "/a/b/c/x").as_deref(), Some("/a/b/c"));
+        assert_eq!(project_root_of(&p, "/a/b/x").as_deref(), Some("/a/b"));
+        assert_eq!(project_root_of(&p, "/a/x").as_deref(), Some("/a"));
+    }
+
+    /// 结尾斜杠是路径写法差异，不该影响归属判定。
+    #[test]
+    fn trailing_slashes_are_ignored() {
+        let p = projects(&["/a/b/"]);
+        assert_eq!(project_root_of(&p, "/a/b").as_deref(), Some("/a/b"));
+        assert_eq!(project_root_of(&p, "/a/b/").as_deref(), Some("/a/b"));
+        assert_eq!(project_root_of(&p, "/a/b/c").as_deref(), Some("/a/b"));
+    }
+
+    /// 旧存档迁移：项目列表从会话 cwd 反推，终端会话取分屏树里第一个叶子的 cwd。
+    #[test]
+    fn legacy_archive_cwd_comes_from_first_leaf() {
+        let ss = SessionState {
+            layout: PaneState::Split {
+                axis: SplitAxis::H,
+                children: vec![leaf("/a/proj"), leaf("/b/other")],
+                sizes: Vec::new(),
+            },
+            active: 0,
+            custom_title: None,
+            acp: None,
+        };
+        assert_eq!(session_state_cwd(&ss).as_deref(), Some("/a/proj"));
+    }
+
+    /// ACP 会话的 cwd 存在自己的元数据里，layout 只是占位叶子，别取错。
+    #[test]
+    fn acp_archive_cwd_comes_from_acp_meta() {
+        let ss = SessionState {
+            layout: leaf("/placeholder"),
+            active: 0,
+            custom_title: None,
+            acp: Some(AcpSaved {
+                cwd: Some("/a/acp-proj".into()),
+                cmd: "claude --acp".into(),
+                agent: None,
+                entries: Vec::new(),
+                resume_session_id: None,
+            }),
+        };
+        assert_eq!(session_state_cwd(&ss).as_deref(), Some("/a/acp-proj"));
+    }
 }
 
 #[cfg(test)]
@@ -6320,14 +7125,15 @@ mod pane_state_tests {
 
 #[cfg(test)]
 mod acp_agent_tests {
-    use super::{acp_agent_from_cmd, acp_pill_label, AcpSaved};
+    use super::{AcpSaved, acp_agent_from_cmd, acp_pill_label};
     use crate::settings::AcpAgentKind;
 
     /// 多 agent 之前的 ACP 存档没有 `agent` 字段：必须读得进来（None），
     /// 不能整条会话解析失败——那等于用户重开 GUI 少一个会话。
     #[test]
     fn old_acp_archive_without_agent_field_still_loads() {
-        let old = r#"{"cwd":"/tmp/x","cmd":"bunx --bun @agentclientprotocol/claude-agent-acp@0.59.0"}"#;
+        let old =
+            r#"{"cwd":"/tmp/x","cmd":"bunx --bun @agentclientprotocol/claude-agent-acp@0.59.0"}"#;
         let back: AcpSaved = serde_json::from_str(old).unwrap();
         assert!(back.agent.is_none(), "旧存档不该凭空冒出 agent 字段");
         assert_eq!(acp_agent_from_cmd(&back.cmd), AcpAgentKind::Claude);
@@ -6358,6 +7164,9 @@ mod acp_agent_tests {
     fn pill_label_tells_truth_about_custom_cmd() {
         let claude = AcpAgentKind::Claude;
         assert_eq!(acp_pill_label(claude, &claude.default_cmd()), "Claude Code");
-        assert_eq!(acp_pill_label(claude, "bunx my-own-acp@1.2.3"), "my-own-acp");
+        assert_eq!(
+            acp_pill_label(claude, "bunx my-own-acp@1.2.3"),
+            "my-own-acp"
+        );
     }
 }

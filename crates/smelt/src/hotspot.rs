@@ -83,7 +83,11 @@ pub fn compute(root: &str) -> Vec<HotspotEntry> {
             days_since: ((now - last_ts) as f64 / 86400.0).max(0.0),
         })
         .collect();
-    entries.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    entries.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     entries
 }
 
@@ -125,7 +129,8 @@ fn layout(sizes: &[f64], out: &mut [Rect], x: f32, y: f32, w: f32, h: f32) {
     let mut row_sum = sizes[0];
     while row_end < sizes.len() {
         let next_sum = row_sum + sizes[row_end];
-        if worst_ratio(&sizes[..row_end], row_sum, side) >= worst_ratio(&sizes[..=row_end], next_sum, side)
+        if worst_ratio(&sizes[..row_end], row_sum, side)
+            >= worst_ratio(&sizes[..=row_end], next_sum, side)
         {
             row_sum = next_sum;
             row_end += 1;
@@ -144,7 +149,12 @@ fn layout(sizes: &[f64], out: &mut [Rect], x: f32, y: f32, w: f32, h: f32) {
         let mut cy = y;
         for (i, &s) in row.iter().enumerate() {
             let item_h = (s / row_sum) as f32 * h;
-            out_row[i] = Rect { x, y: cy, w: col_w, h: item_h };
+            out_row[i] = Rect {
+                x,
+                y: cy,
+                w: col_w,
+                h: item_h,
+            };
             cy += item_h;
         }
         layout(rest, out_rest, x + col_w, y, (w - col_w).max(0.0), h);
@@ -154,7 +164,12 @@ fn layout(sizes: &[f64], out: &mut [Rect], x: f32, y: f32, w: f32, h: f32) {
         let mut cx = x;
         for (i, &s) in row.iter().enumerate() {
             let item_w = (s / row_sum) as f32 * w;
-            out_row[i] = Rect { x: cx, y, w: item_w, h: row_h };
+            out_row[i] = Rect {
+                x: cx,
+                y,
+                w: item_w,
+                h: row_h,
+            };
             cx += item_w;
         }
         layout(rest, out_rest, x, y + row_h, w, (h - row_h).max(0.0));
@@ -184,13 +199,17 @@ use gpui_component::*;
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::{placeholder_view, MainView, Workspace};
+use crate::{MainView, Workspace, placeholder_view};
 
 /// 冷→热配色：t∈[0,1]（由排名百分位归一化，见 hotspot_view）从冷蓝经琥珀到警示红。
 fn heat_color(t: f32) -> Hsla {
     let t = t.clamp(0.0, 1.0);
     let stops: [(u8, u8, u8); 3] = [(0x2a, 0x41, 0x5c), (0xd9, 0x8a, 0x2e), (0xe0, 0x38, 0x38)];
-    let (lo, hi, local_t) = if t < 0.5 { (stops[0], stops[1], t / 0.5) } else { (stops[1], stops[2], (t - 0.5) / 0.5) };
+    let (lo, hi, local_t) = if t < 0.5 {
+        (stops[0], stops[1], t / 0.5)
+    } else {
+        (stops[1], stops[2], (t - 0.5) / 0.5)
+    };
     let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * local_t).round() as u32;
     let packed = (lerp(lo.0, hi.0) << 16) | (lerp(lo.1, hi.1) << 8) | lerp(lo.2, hi.2);
     rgb(packed).into()
@@ -247,7 +266,10 @@ pub fn hotspot_view(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| entry.rel_path.clone());
-            let abs_path = std::path::Path::new(&root).join(&entry.rel_path).to_string_lossy().into_owned();
+            let abs_path = std::path::Path::new(&root)
+                .join(&entry.rel_path)
+                .to_string_lossy()
+                .into_owned();
             let this = this.clone();
             let show_label = rect.w > 0.05 && rect.h > 0.06;
 
@@ -278,34 +300,32 @@ pub fn hotspot_view(
 
             // 太小的方块放不下文字，索性留白，靠颜色传达信息即可。
             if show_label {
-                tile = tile
-                    // 底部暗角渐变：不管方块本身冷暖，文字永远压在深色底上，保证可读。
-                    .child(
-                        div().absolute().inset_0().bg(linear_gradient(
+                tile =
+                    tile
+                        // 底部暗角渐变：不管方块本身冷暖，文字永远压在深色底上，保证可读。
+                        .child(div().absolute().inset_0().bg(linear_gradient(
                             180.,
                             linear_color_stop(rgba(0x00000000), 0.0),
                             linear_color_stop(rgba(0x00000099), 1.0),
-                        )),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .bottom_0()
-                            .p(px(4.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(1.))
-                            .text_xs()
-                            .text_color(rgb(0xf3f5f8))
-                            .child(div().overflow_hidden().whitespace_nowrap().child(name))
-                            .child(
-                                div()
-                                    .text_color(rgba(0xffffffa8))
-                                    .child(format!("×{} · {:.0}d", entry.commits, entry.days_since)),
-                            ),
-                    );
+                        )))
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .p(px(4.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.))
+                                .text_xs()
+                                .text_color(rgb(0xf3f5f8))
+                                .child(div().overflow_hidden().whitespace_nowrap().child(name))
+                                .child(div().text_color(rgba(0xffffffa8)).child(format!(
+                                    "×{} · {:.0}d",
+                                    entry.commits, entry.days_since
+                                ))),
+                        );
             }
             // 最近改动：右上角一颗小圆点，不影响整体边框/网格的干净观感。
             if recent {
@@ -380,7 +400,8 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.hotspot_inflight.remove(&root);
-                this.hotspot_data.insert(root, (Instant::now(), Rc::new(entries)));
+                this.hotspot_data
+                    .insert(root, (Instant::now(), Rc::new(entries)));
                 cx.notify();
             });
         })
@@ -402,7 +423,10 @@ mod tests {
         assert_eq!(rects.len(), 4);
         // 面积总和应约等于 1（浮点误差容忍）。
         let total_area: f32 = rects.iter().map(|r| r.w * r.h).sum();
-        assert!((total_area - 1.0).abs() < 0.01, "总面积应约为 1，实际 {total_area}");
+        assert!(
+            (total_area - 1.0).abs() < 0.01,
+            "总面积应约为 1，实际 {total_area}"
+        );
         // 权重最大的第一块面积也应最大。
         let areas: Vec<f32> = rects.iter().map(|r| r.w * r.h).collect();
         assert!(areas[0] >= areas[1] && areas[1] >= areas[2] && areas[2] >= areas[3]);

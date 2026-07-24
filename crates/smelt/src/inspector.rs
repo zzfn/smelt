@@ -9,7 +9,7 @@ use gpui::*;
 use gpui_component::*;
 
 use crate::tasks::TaskStore;
-use crate::{ui_theme, MainView, Workspace, SETTINGS_PAGE_APPEARANCE};
+use crate::{MainView, SETTINGS_PAGE_APPEARANCE, Workspace, ui_theme};
 
 /// 侧栏任务卡片的 hover group 名：卡片 `.group()` + 操作条 `.group_hover()` 配对，
 /// 鼠标移到卡片才显形「编辑 / 删除」。名字全卡共享，靠 DOM 祖先关系就近生效。
@@ -112,12 +112,11 @@ impl Workspace {
                             .hover(|d| d.bg(rgb(ui_theme::bg_hover())))
                     }
                 })
-                .child(
-                    div()
-                        .size(px(7.))
-                        .rounded_xs()
-                        .bg(if active { rgb(ui_theme::accent()) } else { rgb(ui_theme::border_focus()) }),
-                )
+                .child(div().size(px(7.)).rounded_xs().bg(if active {
+                    rgb(ui_theme::accent())
+                } else {
+                    rgb(ui_theme::border_focus())
+                }))
                 .child(
                     div()
                         .text_size(px(9.))
@@ -161,12 +160,37 @@ impl Workspace {
             .bg(rgb(ui_theme::bg_rail()))
             .border_l_1()
             .border_color(rgb(ui_theme::border_dim()))
-            .child(item(InspectorTab::Files, 0, open && cur == InspectorTab::Files, this.clone()))
-            .child(item(InspectorTab::Git, git_changes, open && cur == InspectorTab::Git, this.clone()))
-            .child(item(InspectorTab::Tasks, 0, open && cur == InspectorTab::Tasks, this.clone()))
-            .child(item(InspectorTab::Skills, 0, open && cur == InspectorTab::Skills, this.clone()))
+            .child(item(
+                InspectorTab::Files,
+                0,
+                open && cur == InspectorTab::Files,
+                this.clone(),
+            ))
+            .child(item(
+                InspectorTab::Git,
+                git_changes,
+                open && cur == InspectorTab::Git,
+                this.clone(),
+            ))
+            .child(item(
+                InspectorTab::Tasks,
+                0,
+                open && cur == InspectorTab::Tasks,
+                this.clone(),
+            ))
+            .child(item(
+                InspectorTab::Skills,
+                0,
+                open && cur == InspectorTab::Skills,
+                this.clone(),
+            ))
             .child(div().flex_1())
-            .child(item(InspectorTab::Settings, 0, open && cur == InspectorTab::Settings, this))
+            .child(item(
+                InspectorTab::Settings,
+                0,
+                open && cur == InspectorTab::Settings,
+                this,
+            ))
     }
 
     /// 面板统一头：36px，标题 + 可选「展开」（盖到舞台）按钮 + 自定义右侧内容。
@@ -341,7 +365,11 @@ impl Workspace {
                 .rounded(px(9.))
                 .border_1()
                 .border_color(rgb(ui_theme::border_mid()))
-                .bg(if done { rgb(ui_theme::bg_panel()) } else { rgb(ui_theme::bg_card()) })
+                .bg(if done {
+                    rgb(ui_theme::bg_panel())
+                } else {
+                    rgb(ui_theme::bg_card())
+                })
                 .when(done, |d| d.opacity(0.55))
                 .overflow_hidden()
                 .flex()
@@ -406,7 +434,14 @@ impl Workspace {
             list = list.child(card);
         }
 
-        div().flex_1().min_h_0().flex().flex_col().child(header).child(list).into_any_element()
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(list)
+            .into_any_element()
     }
 
     /// FILES 面板：文件树（复用全屏页的 file_tree 组件）。点文件不替换本面板，
@@ -447,11 +482,7 @@ impl Workspace {
 
     /// GIT 面板：窄版 SOURCE CONTROL（实现见 git_panel.rs 的 git_narrow_panel，
     /// 需要访问 GitStatusData / DiffLine 的模块内私有字段）。
-    fn render_inspector_git(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_inspector_git(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.git_narrow_panel(window, cx)
     }
 
@@ -541,7 +572,11 @@ impl Workspace {
                                 .text_size(px(10.))
                                 .font_semibold()
                                 .text_color(rgb(ui_theme::text_faint()))
-                                .child(if sk.project_scope { "项目级" } else { "用户级" }),
+                                .child(if sk.project_scope {
+                                    "项目级"
+                                } else {
+                                    "用户级"
+                                }),
                         );
                     }
                     let dot = if sk.project_scope {
@@ -597,14 +632,23 @@ impl Workspace {
                             })
                             .on_click(move |_ev, window, cx| {
                                 let cmd = cmd.clone();
-                                e_use.update(cx, |ws, cx| ws.send_skill_to_session(&cmd, window, cx));
+                                e_use.update(cx, |ws, cx| {
+                                    ws.send_skill_to_session(&cmd, window, cx)
+                                });
                             }),
                     );
                 }
             }
         }
 
-        div().flex_1().min_h_0().flex().flex_col().child(header).child(list).into_any_element()
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(list)
+            .into_any_element()
     }
 
     /// SETTINGS 面板：分组列表，点击跳独立设置窗对应页（面板内嵌不现实——
@@ -621,7 +665,14 @@ impl Workspace {
             ("更新", crate::SETTINGS_PAGE_UPDATE),
             ("远程", 5),
         ];
-        let mut list = div().flex_1().min_h_0().overflow_hidden().flex().flex_col().gap_1().p_2();
+        let mut list = div()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2();
         for (label, ix) in pages {
             let e = this.clone();
             list = list.child(
@@ -633,7 +684,10 @@ impl Workspace {
                     .text_sm()
                     .text_color(rgb(ui_theme::text_mid()))
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(ui_theme::bg_hover())).text_color(rgb(ui_theme::text_bright())))
+                    .hover(|d| {
+                        d.bg(rgb(ui_theme::bg_hover()))
+                            .text_color(rgb(ui_theme::text_bright()))
+                    })
                     .child(label)
                     .on_click(move |_ev, window, cx| {
                         e.update(cx, |ws, cx| {
@@ -647,6 +701,13 @@ impl Workspace {
                     }),
             );
         }
-        div().flex_1().min_h_0().flex().flex_col().child(header).child(list).into_any_element()
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(list)
+            .into_any_element()
     }
 }

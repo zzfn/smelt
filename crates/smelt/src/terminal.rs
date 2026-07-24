@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,7 +19,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{
-    point_to_viewport, viewport_to_point, Config, Term, TermDamage, TermMode, SEMANTIC_ESCAPE_CHARS,
+    Config, SEMANTIC_ESCAPE_CHARS, Term, TermDamage, TermMode, point_to_viewport, viewport_to_point,
 };
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 
@@ -44,28 +44,66 @@ const DEFAULT_FG_LIGHT: u32 = 0x0024_292e;
 const DEFAULT_BG_LIGHT: u32 = 0x00f6_f8fa;
 
 pub fn default_fg() -> u32 {
-    if is_dark() { DEFAULT_FG_DARK } else { DEFAULT_FG_LIGHT }
+    if is_dark() {
+        DEFAULT_FG_DARK
+    } else {
+        DEFAULT_FG_LIGHT
+    }
 }
 
 pub fn default_bg() -> u32 {
-    if is_dark() { DEFAULT_BG_DARK } else { DEFAULT_BG_LIGHT }
+    if is_dark() {
+        DEFAULT_BG_DARK
+    } else {
+        DEFAULT_BG_LIGHT
+    }
 }
 
 /// 16 色 ANSI 调色板：深色沿用 Tokyo Night（白/亮白改为灰白/纯白，iTerm2 风格）；
 /// 浅色是同色相压深/加饱和的对应版本，保证在浅底上仍有足够对比度。
 const PALETTE_DARK: [u32; 16] = [
-    0x0015_161e, 0x00f7_768e, 0x009e_ce6a, 0x00e0_af68, 0x007a_a2f7, 0x00bb_9af7, 0x007d_cfff,
-    0x00c7_c7c7, 0x002c_3149, 0x00f7_768e, 0x009e_ce6a, 0x00e0_af68, 0x007a_a2f7, 0x00bb_9af7,
-    0x007d_cfff, 0x00ff_ffff,
+    0x0015_161e,
+    0x00f7_768e,
+    0x009e_ce6a,
+    0x00e0_af68,
+    0x007a_a2f7,
+    0x00bb_9af7,
+    0x007d_cfff,
+    0x00c7_c7c7,
+    0x002c_3149,
+    0x00f7_768e,
+    0x009e_ce6a,
+    0x00e0_af68,
+    0x007a_a2f7,
+    0x00bb_9af7,
+    0x007d_cfff,
+    0x00ff_ffff,
 ];
 const PALETTE_LIGHT: [u32; 16] = [
-    0x0024_283b, 0x00c0_324a, 0x004e_8a2f, 0x00a1_690f, 0x0037_60bf, 0x0078_47bd, 0x000f_7b9e,
-    0x004a_4a4a, 0x006b_7089, 0x00d7_495f, 0x005f_ae3f, 0x00c4_8511, 0x002e_6fe0, 0x0091_61d9,
-    0x0010_93c2, 0x001a_1b26,
+    0x0024_283b,
+    0x00c0_324a,
+    0x004e_8a2f,
+    0x00a1_690f,
+    0x0037_60bf,
+    0x0078_47bd,
+    0x000f_7b9e,
+    0x004a_4a4a,
+    0x006b_7089,
+    0x00d7_495f,
+    0x005f_ae3f,
+    0x00c4_8511,
+    0x002e_6fe0,
+    0x0091_61d9,
+    0x0010_93c2,
+    0x001a_1b26,
 ];
 
 fn palette() -> &'static [u32; 16] {
-    if is_dark() { &PALETTE_DARK } else { &PALETTE_LIGHT }
+    if is_dark() {
+        &PALETTE_DARK
+    } else {
+        &PALETTE_LIGHT
+    }
 }
 
 /// 一个渲染用的终端单元：字符 + 前景/背景 rgb + 字形修饰 + 是否在选区内。
@@ -187,13 +225,7 @@ fn indexed_rgb(i: u8) -> u32 {
         0..=15 => palette()[i as usize],
         16..=231 => {
             let i = i - 16;
-            let step = |v: u8| -> u32 {
-                if v == 0 {
-                    0
-                } else {
-                    55 + v as u32 * 40
-                }
-            };
+            let step = |v: u8| -> u32 { if v == 0 { 0 } else { 55 + v as u32 * 40 } };
             (step(i / 36) << 16) | (step((i % 36) / 6) << 8) | step(i % 6)
         }
         232..=255 => {
@@ -364,7 +396,9 @@ fn os_clipboard_read() -> String {
 // ===================== smeltd 守护连接层 =====================
 
 fn sock_path() -> std::path::PathBuf {
-    let dir = dirs::home_dir().unwrap_or_else(|| "/tmp".into()).join(".smelt");
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| "/tmp".into())
+        .join(".smelt");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("smeltd.sock")
 }
@@ -388,11 +422,8 @@ pub fn managed_daemon_path() -> std::path::PathBuf {
 
 /// 路径是否落在某个 `.app` 包内（装 DMG 会被覆盖/删除）。
 fn path_inside_app_bundle(p: &std::path::Path) -> bool {
-    p.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|s| s.ends_with(".app"))
-    })
+    p.components()
+        .any(|c| c.as_os_str().to_str().is_some_and(|s| s.ends_with(".app")))
 }
 
 /// 规范化路径后比较是否指向同一文件（symlink / 相对路径）。
@@ -511,9 +542,10 @@ fn handoff_daemon_to_managed(src: &std::path::Path) -> UpgradeOutcome {
 
     // 正在跑的是否已在 managed 路径上（覆盖同路径必须用 .next）。
     let running_on_managed = match probe_daemon_detail() {
-        DaemonProbe::Running { exe_path: Some(ref p), .. } => {
-            exe_is_managed(std::path::Path::new(p))
-        }
+        DaemonProbe::Running {
+            exe_path: Some(ref p),
+            ..
+        } => exe_is_managed(std::path::Path::new(p)),
         _ => false,
     };
 
@@ -693,10 +725,7 @@ fn connect_daemon() -> std::io::Result<UnixStream> {
             if fallback.is_file() {
                 fallback
             } else {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!("smeltd 不可用：{e}"),
-                ));
+                return Err(std::io::Error::new(e.kind(), format!("smeltd 不可用：{e}")));
             }
         }
     };
@@ -710,9 +739,7 @@ fn connect_daemon() -> std::io::Result<UnixStream> {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
         let exe = std::env::current_exe().ok();
-        let in_app_bundle = exe
-            .as_ref()
-            .is_some_and(|e| path_inside_app_bundle(e));
+        let in_app_bundle = exe.as_ref().is_some_and(|e| path_inside_app_bundle(e));
         let mut cmd = std::process::Command::new(&daemon);
         cmd.process_group(0)
             .stdin(Stdio::null())
@@ -1082,7 +1109,10 @@ fn force_kill_socket_owner(path: &std::path::Path) {
     }
     if let Ok(out) = child.wait_with_output() {
         for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-            let _ = std::process::Command::new("kill").arg("-9").arg(pid).status();
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid)
+                .status();
         }
     }
     let _ = std::fs::remove_file(path);
@@ -1096,7 +1126,9 @@ pub fn ensure_daemon_running() {
 
 /// 让守护杀掉某会话（用户主动关 pane 时调用；GUI 退出不调 → 会话持久活着）。
 pub fn kill_remote(id: &str) {
-    let Ok(mut s) = UnixStream::connect(sock_path()) else { return };
+    let Ok(mut s) = UnixStream::connect(sock_path()) else {
+        return;
+    };
     let _ = writeln!(s, "{}", serde_json::json!({ "op": "kill", "id": id }));
     // 等守护回执，确保 kill 落地后再继续（避免关 pane 后立刻退出时丢命令）。
     let mut resp = String::new();
@@ -1107,7 +1139,9 @@ pub fn kill_remote(id: &str) {
 /// 孤儿、忘了关的临时会话同样计在内。设置页「会话管理」弹窗用；跟 daemon_info()
 /// 同一套阻塞调用模式，调用方自己扔后台线程。
 pub fn list_daemon_sessions() -> Vec<DaemonSessionState> {
-    let Ok(mut s) = UnixStream::connect(sock_path()) else { return Vec::new() };
+    let Ok(mut s) = UnixStream::connect(sock_path()) else {
+        return Vec::new();
+    };
     if writeln!(s, "{}", serde_json::json!({ "op": "list" })).is_err() {
         return Vec::new();
     }
@@ -1122,7 +1156,9 @@ pub fn list_daemon_sessions() -> Vec<DaemonSessionState> {
         #[serde(default)]
         states: Vec<DaemonSessionState>,
     }
-    serde_json::from_str::<ListResp>(&resp).map(|r| r.states).unwrap_or_default()
+    serde_json::from_str::<ListResp>(&resp)
+        .map(|r| r.states)
+        .unwrap_or_default()
 }
 
 /// 内嵌远程网关（见 smeltd.rs「内嵌远程网关」一节）的运行状态，供设置页「远程」
@@ -1142,8 +1178,12 @@ pub fn remote_start(bind: &str, write: bool) -> Result<RemoteStatus, String> {
     let Ok(mut s) = UnixStream::connect(sock_path()) else {
         return Err("连不上守护".to_string());
     };
-    if writeln!(s, "{}", serde_json::json!({ "op": "remote_start", "bind": bind, "write": write }))
-        .is_err()
+    if writeln!(
+        s,
+        "{}",
+        serde_json::json!({ "op": "remote_start", "bind": bind, "write": write })
+    )
+    .is_err()
     {
         return Err("发送请求失败".to_string());
     }
@@ -1166,7 +1206,9 @@ pub fn remote_start(bind: &str, write: bool) -> Result<RemoteStatus, String> {
 
 /// 关掉内嵌远程网关。
 pub fn remote_stop() {
-    let Ok(mut s) = UnixStream::connect(sock_path()) else { return };
+    let Ok(mut s) = UnixStream::connect(sock_path()) else {
+        return;
+    };
     let _ = writeln!(s, "{}", serde_json::json!({ "op": "remote_stop" }));
     let mut resp = String::new();
     let _ = BufReader::new(s).read_line(&mut resp);
@@ -1209,7 +1251,13 @@ pub fn tunnel_start(write: bool) -> Result<TunnelStatus, String> {
     let Ok(mut s) = UnixStream::connect(sock_path()) else {
         return Err("连不上守护".to_string());
     };
-    if writeln!(s, "{}", serde_json::json!({ "op": "tunnel_start", "write": write })).is_err() {
+    if writeln!(
+        s,
+        "{}",
+        serde_json::json!({ "op": "tunnel_start", "write": write })
+    )
+    .is_err()
+    {
         return Err("发送请求失败".to_string());
     }
     // 守护那边最多等 30s 建隧道，这里的读超时要留够余量。
@@ -1232,7 +1280,9 @@ pub fn tunnel_start(write: bool) -> Result<TunnelStatus, String> {
 
 /// 关掉 Cloudflare Tunnel（不影响本机远程网关本身）。
 pub fn tunnel_stop() {
-    let Ok(mut s) = UnixStream::connect(sock_path()) else { return };
+    let Ok(mut s) = UnixStream::connect(sock_path()) else {
+        return;
+    };
     let _ = writeln!(s, "{}", serde_json::json!({ "op": "tunnel_stop" }));
     let mut resp = String::new();
     let _ = BufReader::new(s).read_line(&mut resp);
@@ -1352,13 +1402,17 @@ pub enum DaemonStateEvent {
 /// 阻塞：连守护的 `subscribe`，逐行解析转发，直到连接断开（守护重启/没起来）才
 /// 返回。调用方负责重连（这个函数本身不重试，一次连接的生命周期而已）。
 pub fn subscribe_daemon_states_blocking(tx: &smol::channel::Sender<DaemonStateEvent>) {
-    let Ok(mut s) = UnixStream::connect(sock_path()) else { return };
+    let Ok(mut s) = UnixStream::connect(sock_path()) else {
+        return;
+    };
     if writeln!(s, "{}", serde_json::json!({ "op": "subscribe" })).is_err() {
         return;
     }
     let reader = BufReader::new(s);
     for line in reader.lines().map_while(Result::ok) {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
         if let Some(sessions) = v.get("sessions") {
             if let Ok(list) = serde_json::from_value::<Vec<DaemonSessionState>>(sessions.clone()) {
                 if tx.try_send(DaemonStateEvent::Snapshot(list)).is_err() {
@@ -1406,7 +1460,11 @@ fn encode_mouse(mode: TermMode, button: u8, pressed: bool, row: usize, col: usiz
     let cx = col.saturating_add(1);
     let cy = row.saturating_add(1);
     if mode.contains(TermMode::SGR_MOUSE) {
-        format!("\x1b[<{button};{cx};{cy}{}", if pressed { 'M' } else { 'm' }).into_bytes()
+        format!(
+            "\x1b[<{button};{cx};{cy}{}",
+            if pressed { 'M' } else { 'm' }
+        )
+        .into_bytes()
     } else {
         // X10：各值偏移 32，坐标裁到 223。
         let cb = button.min(223);
@@ -1738,8 +1796,11 @@ impl Terminal {
                     Ok(n) => {
                         // OSC 9/99/777 通知：alacritty 不解析，自己扫字节提取
                         for (i, &b) in buf[..n].iter().enumerate() {
-                            let target =
-                                if bytes_seen + i < replay_len { &sink } else { &notify_reader };
+                            let target = if bytes_seen + i < replay_len {
+                                &sink
+                            } else {
+                                &notify_reader
+                            };
                             if let Some(msg) = osc.feed(b) {
                                 if let Ok(mut g) = target.lock() {
                                     *g = Some(msg);
@@ -2053,7 +2114,7 @@ impl Terminal {
                     rows: Vec::new(),
                     cursor: None,
                     cursor_pos: None,
-                }
+                };
             }
         };
         let content = term.renderable_content();
@@ -2069,7 +2130,9 @@ impl Terminal {
         let mut count = 0usize;
         for indexed in content.display_iter {
             let cell = indexed.cell;
-            let selected = sel_range.as_ref().is_some_and(|r| r.contains(indexed.point));
+            let selected = sel_range
+                .as_ref()
+                .is_some_and(|r| r.contains(indexed.point));
             let flags = cell.flags;
             let inverse = flags.contains(Flags::INVERSE);
             let mut fg = resolve(cell.fg, true);
@@ -2085,7 +2148,11 @@ impl Terminal {
             // 列号不再连续 → 自动断成新的一批、按 grid 列重新定位。字形本身宽窄不影响
             // 后续字符的位置，所以这里不必再区分「字形正好两格的 CJK」和「宽度不足的
             // emoji」——那个区分只在「靠字形宽度自然占位」的旧渲染下才有意义。
-            let ch = if flags.contains(Flags::WIDE_CHAR_SPACER) { '\0' } else { cell.c };
+            let ch = if flags.contains(Flags::WIDE_CHAR_SPACER) {
+                '\0'
+            } else {
+                cell.c
+            };
             row.push(Cell {
                 ch,
                 fg,
@@ -2142,7 +2209,11 @@ impl Terminal {
             }),
         };
 
-        Frame { rows, cursor, cursor_pos }
+        Frame {
+            rows,
+            cursor,
+            cursor_pos,
+        }
     }
 
     /// 上下滚动历史缓冲：正数向上翻看历史，负数向下。（Shift+PageUp 用，强制本地历史。）
@@ -2174,7 +2245,9 @@ impl Terminal {
         match scroll_wheel_plan(mode, lines, row, col) {
             ScrollWheelPlan::Send(bytes) => self.send_input(&bytes),
             ScrollWheelPlan::LocalHistory(delta) => {
-                let Ok(mut term) = self.term.lock() else { return };
+                let Ok(mut term) = self.term.lock() else {
+                    return;
+                };
                 term.scroll_display(Scroll::Delta(delta));
             }
         }
@@ -2263,7 +2336,11 @@ impl Terminal {
             }
         }
         SearchStatus {
-            current: if total == 0 { 0 } else { self.search_index.lock().map(|g| *g + 1).unwrap_or(1) },
+            current: if total == 0 {
+                0
+            } else {
+                self.search_index.lock().map(|g| *g + 1).unwrap_or(1)
+            },
             total,
         }
     }
@@ -2275,11 +2352,7 @@ impl Terminal {
             self.clear_search();
             return SearchStatus::default();
         }
-        let query_changed = self
-            .search_query
-            .lock()
-            .ok()
-            .is_none_or(|g| *g != q);
+        let query_changed = self.search_query.lock().ok().is_none_or(|g| *g != q);
         if query_changed {
             let _ = self.set_search_query(&q);
             // 新查询：后退从末条起，前进从首条起
@@ -2360,7 +2433,8 @@ impl Terminal {
         let offset = term.grid().display_offset();
         let mut out = Vec::new();
         for (i, (start, end)) in matches.iter().enumerate() {
-            if let Some(hit) = match_to_viewport_hit(*start, *end, offset, self.size.cols, i == active_idx)
+            if let Some(hit) =
+                match_to_viewport_hit(*start, *end, offset, self.size.cols, i == active_idx)
             {
                 out.push(hit);
             }
@@ -2435,8 +2509,16 @@ impl Terminal {
 
     /// 开始一段选区。`left_side`：起点落在单元格左半还是右半（alacritty 用它决定
     /// 该格是否纳入选区——同格同侧的空 Simple 选区不产出内容，单击/微抖不会误选）。
-    pub fn selection_start(&mut self, row: usize, col: usize, left_side: bool, kind: SelectionKind) {
-        let Ok(mut term) = self.term.lock() else { return };
+    pub fn selection_start(
+        &mut self,
+        row: usize,
+        col: usize,
+        left_side: bool,
+        kind: SelectionKind,
+    ) {
+        let Ok(mut term) = self.term.lock() else {
+            return;
+        };
         let ty = match kind {
             SelectionKind::Simple => SelectionType::Simple,
             SelectionKind::Word => SelectionType::Semantic,
@@ -2450,7 +2532,9 @@ impl Terminal {
     /// 拖动更新选区活动端。坐标按当前 display_offset 重算，所以滚动后再拖、
     /// 或拖着不动光滚动（拖边缘自动滚动）都落在正确的缓冲区行上。
     pub fn selection_update(&mut self, row: usize, col: usize, left_side: bool) {
-        let Ok(mut term) = self.term.lock() else { return };
+        let Ok(mut term) = self.term.lock() else {
+            return;
+        };
         let point = self.grid_point(&term, row, col);
         let side = if left_side { Side::Left } else { Side::Right };
         if let Some(sel) = term.selection.as_mut() {
@@ -2471,7 +2555,6 @@ impl Terminal {
         let term = self.term.lock().ok()?;
         term.selection_to_string().filter(|s| !s.is_empty())
     }
-
 }
 
 #[cfg(test)]
@@ -2499,8 +2582,8 @@ mod damage_gate_tests {
     /// ——这正是要堵的洞，不是走个形式验证 Rust 语言特性。
     #[test]
     fn guard_cleans_up_even_when_body_panics() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         struct Guard(Arc<AtomicBool>);
         impl Drop for Guard {
@@ -2516,7 +2599,10 @@ mod damage_gate_tests {
             panic!("模拟测试中途 assert 失败");
         }));
         assert!(result.is_err(), "闭包应该 panic 了");
-        assert!(cleaned.load(Ordering::SeqCst), "即使 panic，Drop 也该执行清理，不能被跳过");
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "即使 panic，Drop 也该执行清理，不能被跳过"
+        );
     }
 
     /// P0 性能修复的验证：真空闲时 take_damage() 应稳定为 false（跳过重画），
@@ -2565,7 +2651,10 @@ mod damage_gate_tests {
                 idle_true_count += 1;
             }
         }
-        assert_eq!(idle_true_count, 0, "真空闲时 take_damage() 不该返回 true（次数={idle_true_count}）");
+        assert_eq!(
+            idle_true_count, 0,
+            "真空闲时 take_damage() 不该返回 true（次数={idle_true_count}）"
+        );
 
         // 写入真实字节：cat 回显，应被判定为变化。
         term.send_input(b"hi\n");
@@ -2616,7 +2705,11 @@ mod damage_gate_tests {
 
         let frame = term.snapshot();
         let (row, col, kind) = frame.cursor.expect("shell 正常状态光标应可见");
-        assert_eq!(Some((row, col)), frame.cursor_pos, "光标可见时位置应与 cursor_pos 一致");
+        assert_eq!(
+            Some((row, col)),
+            frame.cursor_pos,
+            "光标可见时位置应与 cursor_pos 一致"
+        );
         assert_eq!(kind, CursorKind::Block, "没发过 DECSCUSR 时是默认的实心块");
 
         let inject = |bytes: &[u8]| {
@@ -2627,11 +2720,20 @@ mod damage_gate_tests {
 
         inject(b"\x1b[?25l");
         let frame = term.snapshot();
-        assert!(frame.cursor.is_none(), "CSI ?25l 隐藏后不该再交给渲染层画反色块");
-        assert!(frame.cursor_pos.is_some(), "隐藏光标的位置（IME 定位用）不该丢");
+        assert!(
+            frame.cursor.is_none(),
+            "CSI ?25l 隐藏后不该再交给渲染层画反色块"
+        );
+        assert!(
+            frame.cursor_pos.is_some(),
+            "隐藏光标的位置（IME 定位用）不该丢"
+        );
 
         inject(b"\x1b[?25h");
-        assert!(term.snapshot().cursor.is_some(), "CSI ?25h 后光标应恢复可见");
+        assert!(
+            term.snapshot().cursor.is_some(),
+            "CSI ?25h 后光标应恢复可见"
+        );
 
         // DECSCUSR：zsh vi-mode 靠它在插入态切竖线、普通态切回方块。形状必须带到渲染层，
         // 不能一律画成块。
@@ -2671,7 +2773,10 @@ mod damage_gate_tests {
         term.selection_start(5, 0, true, SelectionKind::Simple);
         term.selection_update(5, 8, false);
         let text_before = term.selection_text().expect("建完选区应有文本");
-        assert!(text_before.starts_with("content-"), "选到的应是注入的内容行，实际: {text_before:?}");
+        assert!(
+            text_before.starts_with("content-"),
+            "选到的应是注入的内容行，实际: {text_before:?}"
+        );
         let frame = term.snapshot();
         let sel_row_before = frame.rows.iter().position(|r| r.iter().any(|c| c.selected));
         assert_eq!(sel_row_before, Some(5), "选区高亮应画在第 5 行");
@@ -2680,15 +2785,26 @@ mod damage_gate_tests {
         term.scroll(3);
         let frame = term.snapshot();
         let sel_row_after = frame.rows.iter().position(|r| r.iter().any(|c| c.selected));
-        assert_eq!(sel_row_after, Some(8), "滚动 3 行后选区高亮应跟随内容移到第 8 行");
-        assert_eq!(term.selection_text().as_deref(), Some(text_before.as_str()), "滚动不该改变选区文本");
+        assert_eq!(
+            sel_row_after,
+            Some(8),
+            "滚动 3 行后选区高亮应跟随内容移到第 8 行"
+        );
+        assert_eq!(
+            term.selection_text().as_deref(),
+            Some(text_before.as_str()),
+            "滚动不该改变选区文本"
+        );
         // 清理交给 _guard 的 Drop（含 panic 路径），不再手写。
     }
 
     /// 不依赖 uuid crate（terminal.rs 本身不需要它），用 pid+时间戳拼一个够唯一的 id。
     fn uuid_like() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         format!("{}-{nanos}", std::process::id())
     }
 }
@@ -2727,7 +2843,9 @@ mod event_proxy_answers_tests {
 
     fn make_proxy() -> (EventProxy, UnixStream) {
         let (probe, sock) = UnixStream::pair().expect("pair 失败");
-        probe.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        probe
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
         let proxy = EventProxy {
             notify: Arc::new(Mutex::new(None)),
             title: Arc::new(Mutex::new(None)),
@@ -2745,11 +2863,18 @@ mod event_proxy_answers_tests {
     /// 读一帧 [type:u8][len:u32 BE][payload] 并返回 (type, payload 字符串)。
     fn read_frame(probe: &mut UnixStream) -> (u8, String) {
         let mut header = [0u8; 5];
-        probe.read_exact(&mut header).expect("应该收到回应帧，说明 PtyWrite 被丢了");
+        probe
+            .read_exact(&mut header)
+            .expect("应该收到回应帧，说明 PtyWrite 被丢了");
         let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
         let mut payload = vec![0u8; len];
-        probe.read_exact(&mut payload).expect("帧头声明的长度和实际 payload 对不上");
-        (header[0], String::from_utf8(payload).expect("回应应该是纯文本转义序列"))
+        probe
+            .read_exact(&mut payload)
+            .expect("帧头声明的长度和实际 payload 对不上");
+        (
+            header[0],
+            String::from_utf8(payload).expect("回应应该是纯文本转义序列"),
+        )
     }
 
     /// `ESC[6n`（Cursor Position Report 查询）：alacritty 解析后应该通过
@@ -2787,7 +2912,10 @@ mod event_proxy_answers_tests {
 
         let (ty, resp) = read_frame(&mut probe);
         assert_eq!(ty, 0);
-        assert!(resp.contains("rgb:1a1a/1b1b/2626"), "应含 DEFAULT_BG 的 rgb 十六进制，实际: {resp:?}");
+        assert!(
+            resp.contains("rgb:1a1a/1b1b/2626"),
+            "应含 DEFAULT_BG 的 rgb 十六进制，实际: {resp:?}"
+        );
     }
 
     /// TextAreaSizeRequest：应用查文本区尺寸时必须按当前 metrics 回应，不能吞掉。
@@ -2796,9 +2924,14 @@ mod event_proxy_answers_tests {
         let (proxy, mut probe) = make_proxy();
         // 直接发事件（不经 parser）：验证 EventProxy 分支真的写帧。
         use alacritty_terminal::event::WindowSize;
-        proxy.send_event(Event::TextAreaSizeRequest(std::sync::Arc::new(|ws: WindowSize| {
-            format!("{}x{}@{}x{}", ws.num_cols, ws.num_lines, ws.cell_width, ws.cell_height)
-        })));
+        proxy.send_event(Event::TextAreaSizeRequest(std::sync::Arc::new(
+            |ws: WindowSize| {
+                format!(
+                    "{}x{}@{}x{}",
+                    ws.num_cols, ws.num_lines, ws.cell_width, ws.cell_height
+                )
+            },
+        )));
         let (ty, resp) = read_frame(&mut probe);
         assert_eq!(ty, 0);
         assert_eq!(resp, "80x24@8x16", "应回 metrics 里的 80×24 格、8×16 像素");
@@ -2920,7 +3053,11 @@ mod search_resync_tests {
         assert_eq!((st.current, st.total), (1, 1));
         let hits = t.viewport_search_hits();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hit_text(&t, &hits[0]), "needle", "滚动前高亮就该在命中文本上");
+        assert_eq!(
+            hit_text(&t, &hits[0]),
+            "needle",
+            "滚动前高亮就该在命中文本上"
+        );
 
         // 新输出滚 2 行：needle 行进 scrollback，贴底视口里已没有命中
         feed(&t, b"\r\nnew-1\r\nnew-2");
@@ -2978,7 +3115,7 @@ mod mouse_encode_tests {
 
 #[cfg(test)]
 mod scroll_wheel_plan_tests {
-    use super::{scroll_wheel_plan, ScrollWheelPlan};
+    use super::{ScrollWheelPlan, scroll_wheel_plan};
     use alacritty_terminal::term::TermMode;
 
     #[test]
@@ -3034,7 +3171,7 @@ mod scroll_wheel_plan_tests {
 
 #[cfg(test)]
 mod search_literal_tests {
-    use super::{escape_regex_literal, match_to_viewport_hit, SearchHit};
+    use super::{SearchHit, escape_regex_literal, match_to_viewport_hit};
     use alacritty_terminal::index::{Column, Line, Point};
 
     #[test]

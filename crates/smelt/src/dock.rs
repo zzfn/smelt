@@ -21,7 +21,9 @@ pub fn set_badge(count: usize) {
         let label: *mut Object = if count == 0 {
             std::ptr::null_mut() // nil 清空角标
         } else {
-            let Ok(c_string) = std::ffi::CString::new(count.to_string()) else { return };
+            let Ok(c_string) = std::ffi::CString::new(count.to_string()) else {
+                return;
+            };
             msg_send![class!(NSString), stringWithUTF8String: c_string.as_ptr()]
         };
         let _: () = msg_send![dock_tile, setBadgeLabel: label];

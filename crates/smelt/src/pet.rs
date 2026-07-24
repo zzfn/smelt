@@ -83,7 +83,13 @@ pub struct PetConfig {
 
 impl Default for PetConfig {
     fn default() -> Self {
-        Self { enabled: true, notify: true, color: 0x6be3c9, scale: 1.0, pos: None }
+        Self {
+            enabled: true,
+            notify: true,
+            color: 0x6be3c9,
+            scale: 1.0,
+            pos: None,
+        }
     }
 }
 
@@ -306,17 +312,19 @@ impl PetView {
         // 拖拽跟手时钟：单独用更高帧率（DRAG_TICK）驱动位置追踪 + 滚动相位，
         // 不跟随上面那个 20fps 的慢时钟——见 handle_drag_move 和 DRAG_TICK 的注释。
         // 没在拖时这里立刻判负返回，几乎零开销，不影响空闲功耗。
-        cx.spawn(async move |this, cx| loop {
-            Timer::after(DRAG_TICK).await;
-            let alive = this
-                .update_in(cx, |this, window, cx| {
-                    if this.drag_start.is_some() {
-                        this.handle_drag_move(window, cx);
-                    }
-                })
-                .is_ok();
-            if !alive {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(DRAG_TICK).await;
+                let alive = this
+                    .update_in(cx, |this, window, cx| {
+                        if this.drag_start.is_some() {
+                            this.handle_drag_move(window, cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
             }
         })
         .detach();
@@ -356,7 +364,10 @@ impl PetView {
             .as_deref()
             .map(|a| format!("在用 {a}，"))
             .unwrap_or_default();
-        format!("（主人现在{app_part}此刻状态偏「{}」）", Self::mood_label(self.mood()))
+        format!(
+            "（主人现在{app_part}此刻状态偏「{}」）",
+            Self::mood_label(self.mood())
+        )
     }
 
     /// 推出当前情绪：光标静止久 → 悠闲放空；最近频繁切 app → 忙碌紧张；否则专注陪伴。
@@ -387,7 +398,10 @@ impl PetView {
         canned: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let notify = cx.try_global::<PetConfig>().map(|c| c.notify).unwrap_or(true);
+        let notify = cx
+            .try_global::<PetConfig>()
+            .map(|c| c.notify)
+            .unwrap_or(true);
         if !notify || self.speech.is_some() {
             return;
         }
@@ -409,7 +423,9 @@ impl PetView {
     /// 路程。由 DRAG_TICK 高帧率时钟轮询调用（固定节奏，不挂在原始 mouse move
     /// 事件上——见 DRAG_TICK 的注释），没有正在按住（drag_start 为空）就什么都不做。
     fn handle_drag_move(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some((sx, sy, swx, swy)) = self.drag_start else { return };
+        let Some((sx, sy, swx, swy)) = self.drag_start else {
+            return;
+        };
         let (mx, my, _, _) = cursor_and_window_origin(window);
         let (dx, dy) = (mx - sx, my - sy);
         if !self.native_drag && (dx.abs() > 2.0 || dy.abs() > 2.0) {
@@ -702,7 +718,11 @@ impl Render for PetView {
             // —— 交互：按住拖动 / 轻点蹦跳说话 ——
             // 悬停时张开手（可抓起来），实际拖动时合上手，跟系统拖拽的 grab/grabbing
             // 语义一致。
-            .cursor(if self.native_drag { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+            .cursor(if self.native_drag {
+                CursorStyle::ClosedHand
+            } else {
+                CursorStyle::OpenHand
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -836,7 +856,7 @@ fn ns_window_of(window: &Window) -> *mut objc::runtime::Object {
 /// 的正常激活流程就不会被它截胡了。
 #[cfg(target_os = "macos")]
 fn strip_native_chrome(window: &Window) {
-    use objc::runtime::{Object, NO};
+    use objc::runtime::{NO, Object};
     use objc::{class, msg_send, sel, sel_impl};
 
     let ns_window = ns_window_of(window);
@@ -969,7 +989,10 @@ fn mouse_state(window: &Window, s: f32) -> (f32, f32, bool) {
         let (ox, oy) = if len < 1.0 {
             (0.0, 0.0)
         } else {
-            ((vx / len) as f32 * EYE_LOOK_MAX, -(vy / len) as f32 * EYE_LOOK_MAX)
+            (
+                (vx / len) as f32 * EYE_LOOK_MAX,
+                -(vy / len) as f32 * EYE_LOOK_MAX,
+            )
         };
 
         // 命中测试：身体椭圆（含少量外扩，便于抓取）。
@@ -1002,7 +1025,12 @@ fn cursor_and_window_origin(window: &Window) -> (f32, f32, f32, f32) {
     unsafe {
         let frame: NSRect = msg_send![ns_window, frame];
         let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-        (mouse.x as f32, mouse.y as f32, frame.origin.x as f32, frame.origin.y as f32)
+        (
+            mouse.x as f32,
+            mouse.y as f32,
+            frame.origin.x as f32,
+            frame.origin.y as f32,
+        )
     }
 }
 
@@ -1093,7 +1121,10 @@ fn set_window_origin(window: &Window, x: f32, y: f32) {
     if ns_window.is_null() {
         return;
     }
-    let point = NSPoint { x: x as f64, y: y as f64 };
+    let point = NSPoint {
+        x: x as f64,
+        y: y as f64,
+    };
     unsafe {
         let _: () = msg_send![ns_window, setFrameOrigin: point];
     }
@@ -1127,7 +1158,9 @@ fn frontmost_app() -> Option<String> {
         if utf8.is_null() {
             return None;
         }
-        let s = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+        let s = std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned();
         (!s.is_empty()).then_some(s)
     }
 }

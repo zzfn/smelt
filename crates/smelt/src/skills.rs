@@ -32,24 +32,32 @@ pub fn scan_skills(project_cwd: Option<&str>) -> Vec<SkillEntry> {
     }
     // 项目级在前（更贴近手头的活），组内按名字排。
     out.sort_by(|a, b| {
-        b.project_scope.cmp(&a.project_scope).then_with(|| a.name.cmp(&b.name))
+        b.project_scope
+            .cmp(&a.project_scope)
+            .then_with(|| a.name.cmp(&b.name))
     });
     out
 }
 
 fn collect_dir(dir: &PathBuf, project_scope: bool, out: &mut Vec<SkillEntry>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
         let md = path.join("SKILL.md");
-        let Ok(text) = std::fs::read_to_string(&md) else { continue };
+        let Ok(text) = std::fs::read_to_string(&md) else {
+            continue;
+        };
         let (name, description) = parse_frontmatter(&text);
         // frontmatter 缺 name 就退回目录名——目录名本来就是 skill 的调用名。
         let name = name.unwrap_or_else(|| {
-            path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
         });
         if name.is_empty() {
             continue;
@@ -95,7 +103,9 @@ fn parse_frontmatter(text: &str) -> (Option<String>, Option<String>) {
             }
             buf.clear();
         }
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         match k.trim() {
             "name" => {
                 pending = Some("name");
@@ -136,11 +146,7 @@ pub type SkillsCache = Option<(std::time::Instant, Rc<Vec<SkillEntry>>)>;
 impl crate::Workspace {
     /// SKILLS 面板：确保缓存新鲜（>30s 或换了项目就后台重扫）。
     /// 跟 ensure_memory_list 同一套模板——读盘绝不放在 render 里同步做。
-    pub(crate) fn ensure_skills(
-        &mut self,
-        cwd: Option<String>,
-        cx: &mut gpui::Context<Self>,
-    ) {
+    pub(crate) fn ensure_skills(&mut self, cwd: Option<String>, cx: &mut gpui::Context<Self>) {
         use std::time::{Duration, Instant};
         let fresh = self
             .skills_cache
@@ -176,7 +182,9 @@ impl crate::Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some(sess) = self.sessions.get(self.active_session) else { return };
+        let Some(sess) = self.sessions.get(self.active_session) else {
+            return;
+        };
         match &sess.kind {
             crate::SessionKind::Acp(view) => {
                 let view = view.clone();

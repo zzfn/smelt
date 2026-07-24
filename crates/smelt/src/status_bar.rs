@@ -5,7 +5,7 @@
 
 use gpui::*;
 
-use crate::{ui_theme, AgentStatus, MainView, Workspace};
+use crate::{AgentStatus, MainView, Workspace, ui_theme};
 
 impl Workspace {
     /// 26px 底部状态栏。
@@ -39,8 +39,8 @@ impl Workspace {
         let groups = self.project_groups(cx);
         let blocked = groups
             .iter()
-            .filter(|(_, _, ixs)| {
-                ixs.iter().any(|&ix| {
+            .filter(|g| {
+                g.sessions.iter().any(|&ix| {
                     matches!(
                         statuses.get(ix),
                         Some(AgentStatus::WaitingApproval | AgentStatus::NeedsAttention)
@@ -79,11 +79,11 @@ impl Workspace {
             .text_xs()
             .font_family("monospace")
             .text_color(rgb(ui_theme::text_muted()))
-            .children(
-                branch.map(|b| {
-                    div().text_color(rgb(ui_theme::accent())).child(format!("⎇ {b}"))
-                }),
-            )
+            .children(branch.map(|b| {
+                div()
+                    .text_color(rgb(ui_theme::accent()))
+                    .child(format!("⎇ {b}"))
+            }))
             .child(
                 div()
                     .flex()

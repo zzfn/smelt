@@ -120,7 +120,10 @@ mod imp {
     /// 生成一枚指定颜色的实心小圆点图标，当菜单项左侧的状态灯——`NSBezierPath` 现画
     /// 现填，不需要预先切图。调用方用完（挂到菜单项上）后自己 release 这一份。
     unsafe fn dot_image(color: (u8, u8, u8)) -> *mut Object {
-        let size = NSSize { width: 10.0, height: 10.0 };
+        let size = NSSize {
+            width: 10.0,
+            height: 10.0,
+        };
         let image: *mut Object = msg_send![class!(NSImage), alloc];
         let image: *mut Object = msg_send![image, initWithSize: size];
         let _: () = msg_send![image, lockFocus];
@@ -130,7 +133,13 @@ mod imp {
             blue: color.2 as f64 / 255.0
             alpha: 1.0f64];
         let _: () = msg_send![ns_color, set];
-        let rect = NSRect { origin: NSPoint { x: 1.0, y: 1.0 }, size: NSSize { width: 8.0, height: 8.0 } };
+        let rect = NSRect {
+            origin: NSPoint { x: 1.0, y: 1.0 },
+            size: NSSize {
+                width: 8.0,
+                height: 8.0,
+            },
+        };
         let path: *mut Object = msg_send![class!(NSBezierPath), bezierPathWithOvalInRect: rect];
         let _: () = msg_send![path, fill];
         let _: () = msg_send![image, unlockFocus];
@@ -185,7 +194,11 @@ mod imp {
         let Some(&ptr) = BUTTON_PTR.get() else { return };
         unsafe {
             let button = ptr as *mut Object;
-            let title = if count == 0 { String::new() } else { count.to_string() };
+            let title = if count == 0 {
+                String::new()
+            } else {
+                count.to_string()
+            };
             let _: () = msg_send![button, setTitle: nsstring(&title)];
         }
     }

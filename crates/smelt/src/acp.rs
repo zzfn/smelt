@@ -13,24 +13,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use std::collections::BTreeMap;
 
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
-    CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction,
-    ElicitationCapabilities, ElicitationContentValue, ElicitationFormCapabilities,
-    ElicitationMode, ElicitationPropertySchema, ElicitationSchema, ImageContent, InitializeRequest,
+    CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
+    ElicitationContentValue, ElicitationFormCapabilities, ElicitationMode,
+    ElicitationPropertySchema, ElicitationSchema, ImageContent, InitializeRequest,
     LoadSessionRequest, MultiSelectItems, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PromptRequest, PromptResponse,
-    Plan, ResumeSessionRequest, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory,
-    SessionConfigSelectOptions, SessionConfigValueId, SetSessionConfigOptionRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
-    ToolCall, ToolCallId, ToolCallUpdate,
+    Plan, PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCall, ToolCallId, ToolCallUpdate,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{
-    ActiveSession, AcpAgent, Agent, Client, ConnectionTo, LineDirection, SessionMessage,
+    AcpAgent, ActiveSession, Agent, Client, ConnectionTo, LineDirection, SessionMessage,
 };
 
 /// 一次 ACP 会话的启动参数。
@@ -70,7 +68,10 @@ pub struct PromptImage {
 pub enum AcpCommand {
     /// 发一轮 prompt（agent 空闲时才该发；UI 侧负责在 turn 进行中排队/禁用）。
     /// `images` 空 = 纯文本那条老路径。
-    Prompt { text: String, images: Vec<PromptImage> },
+    Prompt {
+        text: String,
+        images: Vec<PromptImage>,
+    },
     /// 取消当前 turn（session/cancel 通知）。
     Cancel,
     /// 切换模型：值 id 来自 `AcpEvent::Model` 给的候选列表。
@@ -93,7 +94,10 @@ pub enum AcpEvent {
         supports_image: bool,
     },
     /// assistant 正文 / 思考块的流式增量（content 已文本化）。
-    AgentChunk { thought: bool, text: String },
+    AgentChunk {
+        thought: bool,
+        text: String,
+    },
     ToolCall(ToolCall),
     ToolCallUpdate(ToolCallUpdate),
     /// agent 的任务计划（步骤清单 + 三态进度）：每次全量覆盖，回合态不落盘。
@@ -123,7 +127,11 @@ pub enum AcpEvent {
     AvailableCommands(Vec<(String, String)>),
     /// 上下文用量：已用 / 窗口大小（token），外加本轮缓存读取量（agent 给才有）。
     /// UI 据此显示「上下文 32%」这类指示。
-    Usage { used: u64, size: u64, cached_read: Option<u64> },
+    Usage {
+        used: u64,
+        size: u64,
+        cached_read: Option<u64>,
+    },
     /// agent 的选择题 / 表单（AskUserQuestion 类）：UI 渲染字段，凭 responder 回填。
     Elicitation {
         message: String,
@@ -160,9 +168,7 @@ pub struct ModelState {
 
 /// 权限回执守卫：UI 点按钮时消费；**被 drop（视图关闭、卡片被弃置）自动回
 /// Cancelled**，保证 agent 侧永远等得到答案、不会挂起。
-pub struct PermissionResponder(
-    Option<agent_client_protocol::Responder<RequestPermissionResponse>>,
-);
+pub struct PermissionResponder(Option<agent_client_protocol::Responder<RequestPermissionResponse>>);
 
 impl PermissionResponder {
     /// 选中某个选项（allow / reject 都是「选中」，语义在 option.kind 里）。
@@ -269,8 +275,14 @@ fn parse_elicit_fields(schema: &ElicitationSchema) -> Option<Vec<ElicitField>> {
                 key: key.clone(),
                 title: b.title.clone().unwrap_or_else(|| key.clone()),
                 kind: ElicitFieldKind::Select(vec![
-                    ElicitOption { value: ElicitationContentValue::Boolean(true), label: "是".into() },
-                    ElicitOption { value: ElicitationContentValue::Boolean(false), label: "否".into() },
+                    ElicitOption {
+                        value: ElicitationContentValue::Boolean(true),
+                        label: "是".into(),
+                    },
+                    ElicitOption {
+                        value: ElicitationContentValue::Boolean(false),
+                        label: "否".into(),
+                    },
                 ]),
             }),
             ElicitationPropertySchema::Array(a) => {
@@ -307,7 +319,11 @@ fn parse_elicit_fields(schema: &ElicitationSchema) -> Option<Vec<ElicitField>> {
             None => {} // 可选且按钮化不了：跳过
         }
     }
-    if fields.is_empty() { None } else { Some(fields) }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields)
+    }
 }
 
 /// UI 侧持有的会话句柄。drop cmd_tx（整个句柄）即请求连接收摊。
@@ -323,14 +339,9 @@ pub struct AcpHandle {
 /// 漏杀一个不听话的 agent，也不能让整个 App 退出卡死在它上面。
 pub async fn wait_for_shutdown(handle: AcpHandle, timeout: std::time::Duration) {
     let AcpHandle { event_rx, .. } = handle;
-    smol::future::race(
-        async {
-            while event_rx.recv().await.is_ok() {}
-        },
-        async {
-            smol::Timer::after(timeout).await;
-        },
-    )
+    smol::future::race(async { while event_rx.recv().await.is_ok() {} }, async {
+        smol::Timer::after(timeout).await;
+    })
     .await;
 }
 
@@ -392,7 +403,11 @@ async fn run_connection(
     let cwd = launch
         .cwd
         .clone()
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| "/".to_string());
 
     let perm_tx = event_tx.clone();
@@ -437,9 +452,8 @@ async fn run_connection(
                             });
                             Ok(())
                         }
-                        None => responder.respond(CreateElicitationResponse::new(
-                            ElicitationAction::Decline,
-                        )),
+                        None => responder
+                            .respond(CreateElicitationResponse::new(ElicitationAction::Decline)),
                     }
                 }
             },
@@ -536,8 +550,15 @@ async fn run_connection(
                                 .config_options(loaded.config_options)
                                 .meta(loaded.meta);
                             let session = connection.attach_session(resp, Default::default())?;
-                            return drive_session(session, cmd_rx, event_tx, ReadyKind::ResumedWithReplay, supports_image, model_cfg)
-                                .await;
+                            return drive_session(
+                                session,
+                                cmd_rx,
+                                event_tx,
+                                ReadyKind::ResumedWithReplay,
+                                supports_image,
+                                model_cfg,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             // 旧会话可能已被清理/损坏——不是致命错误，退回全新会话，
@@ -567,7 +588,15 @@ async fn run_connection(
                     id
                 });
             let session = connection.attach_session(created, Default::default())?;
-            drive_session(session, cmd_rx, event_tx, ReadyKind::Fresh, supports_image, model_cfg).await
+            drive_session(
+                session,
+                cmd_rx,
+                event_tx,
+                ReadyKind::Fresh,
+                supports_image,
+                model_cfg,
+            )
+            .await
         })
         .await
 }
@@ -599,10 +628,9 @@ async fn drive_session<'r>(
         }
         let next = {
             let read = session.read_update();
-            smol::future::race(
-                async { Next::Cmd(cmd_rx.recv().await.ok()) },
-                async move { Next::Update(read.await) },
-            )
+            smol::future::race(async { Next::Cmd(cmd_rx.recv().await.ok()) }, async move {
+                Next::Update(read.await)
+            })
             .await
         };
         match next {
@@ -647,7 +675,9 @@ async fn drive_session<'r>(
             Next::Cmd(Some(AcpCommand::SetModel(value_id))) => {
                 // 没拿到模型配置项 id 说明这个 agent 压根没报模型 → 无从切起，
                 // UI 侧本来也不会给出下拉（options 为空）。
-                let Some(cfg_id) = model_config_id.clone() else { continue };
+                let Some(cfg_id) = model_config_id.clone() else {
+                    continue;
+                };
                 let req = SetSessionConfigOptionRequest::new(
                     session.session_id().clone(),
                     cfg_id,
@@ -768,7 +798,9 @@ fn build_agent(
                     ))
                 })?
             };
-            std::iter::once(prog).chain(tokens.map(String::from)).collect()
+            std::iter::once(prog)
+                .chain(tokens.map(String::from))
+                .collect()
         }
         None => Vec::new(),
     };
@@ -793,7 +825,10 @@ fn claude_raw_sdk_meta(cmd: &str) -> Option<serde_json::Map<String, serde_json::
         return None;
     }
     let mut inner = serde_json::Map::new();
-    inner.insert("emitRawSDKMessages".to_string(), serde_json::Value::Bool(true));
+    inner.insert(
+        "emitRawSDKMessages".to_string(),
+        serde_json::Value::Bool(true),
+    );
     let mut meta = serde_json::Map::new();
     meta.insert("claudeCode".to_string(), serde_json::Value::Object(inner));
     Some(meta)
@@ -811,7 +846,9 @@ pub(crate) fn model_from_config(
     let opt = options
         .iter()
         .find(|o| matches!(o.category, Some(SessionConfigOptionCategory::Model)))?;
-    let SessionConfigKind::Select(sel) = &opt.kind else { return None };
+    let SessionConfigKind::Select(sel) = &opt.kind else {
+        return None;
+    };
     let cur = &sel.current_value;
     // 选项可能是平铺的，也可能按厂商/档位分组，两种都要翻。
     let flat: Vec<&agent_client_protocol::schema::v1::SessionConfigSelectOption> =
@@ -834,7 +871,13 @@ pub(crate) fn model_from_config(
         .iter()
         .map(|o| (o.value.to_string(), o.name.clone()))
         .collect();
-    Some((opt.id.clone(), ModelState { current_name: name, options }))
+    Some((
+        opt.id.clone(),
+        ModelState {
+            current_name: name,
+            options,
+        },
+    ))
 }
 
 /// 权限卡片的问题摘要：tool call 有标题用标题，否则退回工具 id。
@@ -883,7 +926,12 @@ const BUN_ZIP_DIR: &str = "bun-darwin-aarch64";
 const BUN_ZIP_DIR: &str = "bun-darwin-x64";
 
 fn managed_bun_path() -> Option<std::path::PathBuf> {
-    Some(dirs::home_dir()?.join(".smelt/runtime").join(format!("bun-v{BUN_VERSION}")).join("bun"))
+    Some(
+        dirs::home_dir()?
+            .join(".smelt/runtime")
+            .join(format!("bun-v{BUN_VERSION}"))
+            .join("bun"),
+    )
 }
 
 /// 确保受管 bun 就位（不在则下载 + sha256 校验 + 冒烟），返回可执行路径。
@@ -919,7 +967,9 @@ fn ensure_bun(status: &dyn Fn(&str)) -> Result<std::path::PathBuf, String> {
     let got = got.split_whitespace().next().unwrap_or("");
     if got != want_sha {
         let _ = std::fs::remove_file(&zip);
-        return Err(format!("Bun 下载校验失败（期望 {want_sha}，实际 {got}），已丢弃"));
+        return Err(format!(
+            "Bun 下载校验失败（期望 {want_sha}，实际 {got}），已丢弃"
+        ));
     }
     let unzip = std::process::Command::new("unzip")
         .args(["-o", "-q"])
@@ -929,7 +979,10 @@ fn ensure_bun(status: &dyn Fn(&str)) -> Result<std::path::PathBuf, String> {
         .output()
         .map_err(|e| format!("无法执行 unzip：{e}"))?;
     if !unzip.status.success() {
-        return Err(format!("解压 Bun 失败：{}", String::from_utf8_lossy(&unzip.stderr).trim()));
+        return Err(format!(
+            "解压 Bun 失败：{}",
+            String::from_utf8_lossy(&unzip.stderr).trim()
+        ));
     }
     let _ = std::fs::remove_file(&zip);
     std::fs::rename(dir.join(BUN_ZIP_DIR).join("bun"), &bun)
@@ -968,13 +1021,8 @@ fn resolve_runtime_command(cmd: &str, status: &dyn Fn(&str)) -> Result<String, S
         }
         Err(e) => {
             // 受管失败：系统里用户自己装过 bun 就用系统的。
-            let sys_has = std::env::split_paths(login_shell_path())
-                .any(|p| p.join(head).is_file());
-            if sys_has {
-                Ok(cmd.to_string())
-            } else {
-                Err(e)
-            }
+            let sys_has = std::env::split_paths(login_shell_path()).any(|p| p.join(head).is_file());
+            if sys_has { Ok(cmd.to_string()) } else { Err(e) }
         }
     }
 }
@@ -1080,7 +1128,10 @@ mod path_env_tests {
                    __SMELT_PATH_BEGIN__/Users/me/.grok/bin:/usr/bin:/bin__SMELT_PATH_END__";
         let got = extract_marked_path(raw).expect("应能抠出 PATH");
         assert_eq!(got, "/Users/me/.grok/bin:/usr/bin:/bin");
-        assert!(got.starts_with("/Users/me/.grok/bin"), "第一段目录不能被 OSC 噪音污染");
+        assert!(
+            got.starts_with("/Users/me/.grok/bin"),
+            "第一段目录不能被 OSC 噪音污染"
+        );
     }
 
     /// 没有标记（shell 直接失败、没跑到 printf）返回 None，让调用方回退到进程 PATH。
@@ -1180,7 +1231,11 @@ mod runtime_tests {
     #[test]
     fn non_bun_commands_pass_through() {
         let noop = |_: &str| {};
-        for cmd in ["npx -y foo@1", "/usr/local/bin/some-acp --flag", "node adapter.js"] {
+        for cmd in [
+            "npx -y foo@1",
+            "/usr/local/bin/some-acp --flag",
+            "node adapter.js",
+        ] {
             assert_eq!(resolve_runtime_command(cmd, &noop).unwrap(), cmd);
         }
     }
@@ -1188,7 +1243,9 @@ mod runtime_tests {
     /// 受管 bun 已就位时，bunx 前缀改写为 `<managed-bun> x …`。
     #[test]
     fn bunx_rewrites_to_managed_bun_when_present() {
-        let Some(bun) = managed_bun_path() else { return };
+        let Some(bun) = managed_bun_path() else {
+            return;
+        };
         if !bun.is_file() {
             return; // 受管 bun 未安装的机器上跳过（真实下载见 manual_ensure_bun）
         }
@@ -1202,7 +1259,9 @@ mod runtime_tests {
     /// `x` 后面、包名前面——`bun x --bun pkg@version`，不能被误吞或挪位置。
     #[test]
     fn bunx_dash_dash_bun_flag_passes_through_in_order() {
-        let Some(bun) = managed_bun_path() else { return };
+        let Some(bun) = managed_bun_path() else {
+            return;
+        };
         if !bun.is_file() {
             return;
         }
@@ -1214,7 +1273,10 @@ mod runtime_tests {
         .unwrap();
         assert_eq!(
             out,
-            format!("{} x --bun @agentclientprotocol/claude-agent-acp@0.59.0", bun.to_string_lossy())
+            format!(
+                "{} x --bun @agentclientprotocol/claude-agent-acp@0.59.0",
+                bun.to_string_lossy()
+            )
         );
     }
 
@@ -1224,9 +1286,16 @@ mod runtime_tests {
     fn manual_ensure_bun() {
         let path = ensure_bun(&|msg| eprintln!("[status] {msg}")).expect("ensure_bun");
         assert!(path.is_file());
-        let out = std::process::Command::new(&path).arg("--version").output().unwrap();
+        let out = std::process::Command::new(&path)
+            .arg("--version")
+            .output()
+            .unwrap();
         assert!(out.status.success());
-        eprintln!("bun @ {} → {}", path.display(), String::from_utf8_lossy(&out.stdout).trim());
+        eprintln!(
+            "bun @ {} → {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
     }
 }
 
@@ -1237,7 +1306,10 @@ mod path_resolve_tests {
     #[test]
     fn absolute_or_slashed_returned_asis() {
         // 带斜杠的（绝对路径 / 受管 bun 全路径）不查 PATH，原样返回。
-        assert_eq!(resolve_in_path("/usr/bin/env", "/nonexistent").as_deref(), Some("/usr/bin/env"));
+        assert_eq!(
+            resolve_in_path("/usr/bin/env", "/nonexistent").as_deref(),
+            Some("/usr/bin/env")
+        );
         assert_eq!(resolve_in_path("./x", "/bin").as_deref(), Some("./x"));
     }
 
@@ -1283,7 +1355,10 @@ mod model_tests {
     use agent_client_protocol::schema::v1::SessionConfigValueId;
 
     fn opt(value: &str, name: &str) -> SessionConfigSelectOption {
-        SessionConfigSelectOption::new(SessionConfigValueId::new(value.to_string()), name.to_string())
+        SessionConfigSelectOption::new(
+            SessionConfigValueId::new(value.to_string()),
+            name.to_string(),
+        )
     }
 
     fn model_option(current: &str, options: SessionConfigSelectOptions) -> SessionConfigOption {
@@ -1313,7 +1388,12 @@ mod model_tests {
         assert_eq!(state.current_name, "Claude Sonnet 4.5");
         // 候选要带全，UI 靠它渲染下拉
         assert_eq!(state.options.len(), 2);
-        assert!(state.options.iter().any(|(v, n)| v == "opus-4-8" && n == "Claude Opus 4.8"));
+        assert!(
+            state
+                .options
+                .iter()
+                .any(|(v, n)| v == "opus-4-8" && n == "Claude Opus 4.8")
+        );
     }
 
     /// 选项按厂商/档位分组时同样要能翻出来。

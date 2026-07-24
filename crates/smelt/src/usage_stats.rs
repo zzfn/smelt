@@ -64,7 +64,10 @@ struct RawUsage {
 }
 
 pub fn projects_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".claude").join("projects")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".claude")
+        .join("projects")
 }
 
 /// 扫描 `~/.claude/projects/` 下所有会话 transcript，聚合成用量 + 工具调用事件。
@@ -75,7 +78,9 @@ pub fn scan() -> UsageData {
 
 fn scan_root(root: &Path) -> UsageData {
     let mut data = UsageData::default();
-    let Ok(project_dirs) = std::fs::read_dir(root) else { return data };
+    let Ok(project_dirs) = std::fs::read_dir(root) else {
+        return data;
+    };
     for entry in project_dirs.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -83,7 +88,9 @@ fn scan_root(root: &Path) -> UsageData {
         }
         let project_key = entry.file_name().to_string_lossy().into_owned();
         let mut project_label = project_key.clone();
-        let Ok(files) = std::fs::read_dir(&path) else { continue };
+        let Ok(files) = std::fs::read_dir(&path) else {
+            continue;
+        };
         for file in files.flatten() {
             let fpath = file.path();
             if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -103,15 +110,24 @@ fn scan_root(root: &Path) -> UsageData {
 /// 消耗，该算进用量；真正的子代理转录文件存在独立的 `subagents/` 子目录里，
 /// scan_root 用非递归 read_dir 已经天然跳过了那些文件（参考 codux 同款处理）。
 /// 按 `uuid` 去重，防止同一条消息因日志重写/追加异常被重复计数。
-fn parse_transcript(path: &Path, project_key: &str, project_label: &mut String, out: &mut UsageData) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
+fn parse_transcript(
+    path: &Path,
+    project_key: &str,
+    project_label: &mut String,
+    out: &mut UsageData,
+) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
     let mut seen_uuids: HashSet<String> = HashSet::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(raw) = serde_json::from_str::<RawLine>(line) else { continue };
+        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
+            continue;
+        };
         if raw.kind.as_deref() != Some("assistant") {
             continue;
         }
@@ -120,7 +136,10 @@ fn parse_transcript(path: &Path, project_key: &str, project_label: &mut String, 
                 continue;
             }
         }
-        let Some(ts) = raw.timestamp.as_deref().and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        let Some(ts) = raw
+            .timestamp
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         else {
             continue;
         };
@@ -134,7 +153,10 @@ fn parse_transcript(path: &Path, project_key: &str, project_label: &mut String, 
         for block in &msg.content {
             if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                 if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
-                    out.tools.push(ToolEvent { project_label: project_label.clone(), tool: name.to_string() });
+                    out.tools.push(ToolEvent {
+                        project_label: project_label.clone(),
+                        tool: name.to_string(),
+                    });
                 }
             }
         }
@@ -144,7 +166,12 @@ fn parse_transcript(path: &Path, project_key: &str, project_label: &mut String, 
                 + usage.cache_creation_input_tokens
                 + usage.cache_read_input_tokens;
             if tokens > 0 {
-                out.events.push(UsageEvent { ts, project_label: project_label.clone(), model, tokens });
+                out.events.push(UsageEvent {
+                    ts,
+                    project_label: project_label.clone(),
+                    model,
+                    tokens,
+                });
             }
         }
     }
@@ -154,7 +181,10 @@ fn parse_transcript(path: &Path, project_key: &str, project_label: &mut String, 
 /// 传 `Some(cwd)`（如 `session.cwd(cx)`）筛选「当前项目」。
 pub fn by_model(events: &[UsageEvent], project_label: Option<&str>) -> Vec<(String, u64)> {
     let mut m: HashMap<String, u64> = HashMap::new();
-    for e in events.iter().filter(|e| project_label.map_or(true, |p| e.project_label == p)) {
+    for e in events
+        .iter()
+        .filter(|e| project_label.map_or(true, |p| e.project_label == p))
+    {
         *m.entry(e.model.clone()).or_default() += e.tokens;
     }
     sorted_desc(m)
@@ -163,7 +193,10 @@ pub fn by_model(events: &[UsageEvent], project_label: Option<&str>) -> Vec<(Stri
 /// 按工具调用次数聚合，按次数降序。
 pub fn by_tool(tools: &[ToolEvent], project_label: Option<&str>) -> Vec<(String, u64)> {
     let mut m: HashMap<String, u64> = HashMap::new();
-    for t in tools.iter().filter(|t| project_label.map_or(true, |p| t.project_label == p)) {
+    for t in tools
+        .iter()
+        .filter(|t| project_label.map_or(true, |p| t.project_label == p))
+    {
         *m.entry(t.tool.clone()).or_default() += 1;
     }
     sorted_desc(m)
@@ -217,7 +250,7 @@ use gpui_component::*;
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::{placeholder_view, Workspace};
+use crate::{Workspace, placeholder_view};
 
 /// 大数字加 K/M 单位（千/百万才简化，保留一位小数），token 数 / 调用数这类展示都拿它过一遍。
 pub fn format_count(n: u64) -> String {
@@ -276,13 +309,26 @@ fn usage_section(title: &str, caption: &str, muted: Hsla, border: Hsla, body: An
 }
 
 /// 用量页的一个「按 X 拆分」柱状图区块；data 为空时显示「无数据」占位。
-fn bar_section(title: &str, muted: Hsla, border: Hsla, color: Hsla, data: Vec<(String, u64)>) -> Div {
+fn bar_section(
+    title: &str,
+    muted: Hsla,
+    border: Hsla,
+    color: Hsla,
+    data: Vec<(String, u64)>,
+) -> Div {
     // 种类一多（尤其工具名，含各种 mcp__xxx__yyy 前缀）柱子会挤成一团、x 轴标签
     // 叠在一起看不清，只画头部几项，其余合并成一根"其他"柱子。
     let data = cap_top_n(data, 6);
     let total: u64 = data.iter().map(|(_, v)| *v).sum();
     let body = if data.is_empty() {
-        div().h(px(180.)).flex().items_center().justify_center().text_color(muted).text_sm().child("无数据")
+        div()
+            .h(px(180.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(muted)
+            .text_sm()
+            .child("无数据")
     } else {
         div().h(px(180.)).child(
             BarChart::new(data)
@@ -292,7 +338,13 @@ fn bar_section(title: &str, muted: Hsla, border: Hsla, color: Hsla, data: Vec<(S
                 .tick_margin(1),
         )
     };
-    usage_section(title, &format!("共 {}", format_count(total)), muted, border, body.into_any_element())
+    usage_section(
+        title,
+        &format!("共 {}", format_count(total)),
+        muted,
+        border,
+        body.into_any_element(),
+    )
 }
 
 /// 用量页：本地 Claude Code 会话用量统计——今日走势 + 活动热力图（全局口径），
@@ -312,16 +364,24 @@ pub fn usage_view(
         return placeholder_view("统计中…", muted);
     };
     if data.events.is_empty() {
-        return placeholder_view("没有找到本地 Claude Code 会话记录（~/.claude/projects）", muted);
+        return placeholder_view(
+            "没有找到本地 Claude Code 会话记录（~/.claude/projects）",
+            muted,
+        );
     }
 
     // 活动热力图：近 12 周，按周对齐成「列=周，行=周一到周日」的日历格（全局口径）。
     let heat = daily_heatmap(&data.events, 12);
     let heat_total: u64 = heat.iter().map(|(_, v)| *v).sum();
     let max_heat = heat.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
-    let lead = heat.first().map(|(d, _)| d.weekday().num_days_from_monday()).unwrap_or(0) as usize;
-    let mut cells: Vec<Option<u64>> =
-        std::iter::repeat(None).take(lead).chain(heat.iter().map(|(_, v)| Some(*v))).collect();
+    let lead = heat
+        .first()
+        .map(|(d, _)| d.weekday().num_days_from_monday())
+        .unwrap_or(0) as usize;
+    let mut cells: Vec<Option<u64>> = std::iter::repeat(None)
+        .take(lead)
+        .chain(heat.iter().map(|(_, v)| Some(*v)))
+        .collect();
     while cells.len() % 7 != 0 {
         cells.push(None);
     }
@@ -331,7 +391,10 @@ pub fn usage_view(
             v_flex()
                 .gap(px(2.))
                 .children(week.iter().map(|cell| {
-                    div().size(px(11.)).rounded(px(2.)).bg(heat_cell_color(*cell, max_heat, chart_1))
+                    div()
+                        .size(px(11.))
+                        .rounded(px(2.))
+                        .bg(heat_cell_color(*cell, max_heat, chart_1))
                 }))
                 .into_any_element()
         })
@@ -341,26 +404,66 @@ pub fn usage_view(
         &format!("共 {} tokens", format_count(heat_total)),
         muted,
         c_border,
-        h_flex().gap(px(2.)).p_2().children(week_columns).into_any_element(),
+        h_flex()
+            .gap(px(2.))
+            .p_2()
+            .children(week_columns)
+            .into_any_element(),
     );
 
     // 当前项目 / 全局汇总的按模型、按工具拆分（全局另加按项目拆分）。
-    let cur_model = cur_project.as_deref().map(|p| by_model(&data.events, Some(p))).unwrap_or_default();
-    let cur_tool = cur_project.as_deref().map(|p| by_tool(&data.tools, Some(p))).unwrap_or_default();
+    let cur_model = cur_project
+        .as_deref()
+        .map(|p| by_model(&data.events, Some(p)))
+        .unwrap_or_default();
+    let cur_tool = cur_project
+        .as_deref()
+        .map(|p| by_tool(&data.tools, Some(p)))
+        .unwrap_or_default();
     let global_model = by_model(&data.events, None);
     let global_tool = by_tool(&data.tools, None);
     let global_project = by_project(&data.events);
 
     let cur_project_row = h_flex()
         .gap_3()
-        .child(bar_section("当前项目 · 按模型", muted, c_border, chart_1, cur_model))
-        .child(bar_section("当前项目 · 按工具", muted, c_border, chart_2, cur_tool));
+        .child(bar_section(
+            "当前项目 · 按模型",
+            muted,
+            c_border,
+            chart_1,
+            cur_model,
+        ))
+        .child(bar_section(
+            "当前项目 · 按工具",
+            muted,
+            c_border,
+            chart_2,
+            cur_tool,
+        ));
 
     let global_row = h_flex()
         .gap_3()
-        .child(bar_section("全局 · 按模型", muted, c_border, chart_1, global_model))
-        .child(bar_section("全局 · 按工具", muted, c_border, chart_2, global_tool))
-        .child(bar_section("全局 · 按项目", muted, c_border, chart_1, global_project));
+        .child(bar_section(
+            "全局 · 按模型",
+            muted,
+            c_border,
+            chart_1,
+            global_model,
+        ))
+        .child(bar_section(
+            "全局 · 按工具",
+            muted,
+            c_border,
+            chart_2,
+            global_tool,
+        ))
+        .child(bar_section(
+            "全局 · 按项目",
+            muted,
+            c_border,
+            chart_1,
+            global_project,
+        ));
 
     div()
         .flex_1()
@@ -422,7 +525,11 @@ impl Workspace {
         let data = self.usage_cache.as_ref().map(|(_, d)| d.clone());
         // usage_view 内部用 flex_1/min_h_0 撑满，依赖外层是个 flex 容器（原先挂在
         // 主窗口的 flex_col 主区里），独立窗口里補上这层容器它才能正确撑满。
-        div().size_full().flex().flex_col().child(usage_view(cur_project, data, cx))
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(usage_view(cur_project, data, cx))
     }
 
     /// 打开独立用量窗口：已经开着就聚焦提到前台，不重复开第二扇。跟
@@ -432,7 +539,10 @@ impl Workspace {
         let workspace = cx.entity();
         cx.defer(move |cx| {
             if let Some(handle) = cx.try_global::<UsageWindowHandle>().and_then(|h| h.0) {
-                if handle.update(cx, |_, window, _| window.activate_window()).is_ok() {
+                if handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+                {
                     return;
                 }
             }
@@ -448,7 +558,9 @@ impl Workspace {
             let handle = cx
                 .open_window(options, |window, cx| {
                     window.set_rem_size(px(19.));
-                    let view = cx.new(|_cx| UsageWindow { workspace: workspace.clone() });
+                    let view = cx.new(|_cx| UsageWindow {
+                        workspace: workspace.clone(),
+                    });
                     cx.new(|cx| Root::new(view, window, cx))
                 })
                 .expect("打开用量窗口失败");
@@ -462,7 +574,7 @@ mod tests {
     // 不用 `use super::*;`：本文件后面会加入 gpui/gpui_component 的 glob 导入，
     // 带进这个测试模块会让 trait 解析图爆炸式增长，`cargo test` 编译期会撞
     // rustc 的递归限制甚至直接崩溃——只导入测试真正用到的几个名字就够了。
-    use super::{by_model, by_project, by_tool, daily_heatmap, scan_root, UsageEvent};
+    use super::{UsageEvent, by_model, by_project, by_tool, daily_heatmap, scan_root};
     use chrono::{Local, Utc};
     use std::path::Path;
 
@@ -470,7 +582,13 @@ mod tests {
         std::fs::write(dir.join(name), lines.join("\n")).unwrap();
     }
 
-    fn assistant_line(ts: &str, cwd: &str, model: &str, tool: Option<&str>, tokens: (u64, u64)) -> String {
+    fn assistant_line(
+        ts: &str,
+        cwd: &str,
+        model: &str,
+        tool: Option<&str>,
+        tokens: (u64, u64),
+    ) -> String {
         let content = match tool {
             Some(t) => format!(r#"[{{"type":"tool_use","name":"{t}"}}]"#),
             None => "[]".to_string(),
@@ -494,15 +612,33 @@ mod tests {
             &proj_a,
             "s1.jsonl",
             &[
-                &assistant_line("2026-07-08T01:00:00Z", "/Users/c.chen/dev/proj-a", "claude-sonnet-5", Some("Read"), (10, 5)),
-                &assistant_line("2026-07-08T01:05:00Z", "/Users/c.chen/dev/proj-a", "claude-sonnet-5", Some("Edit"), (20, 8)),
+                &assistant_line(
+                    "2026-07-08T01:00:00Z",
+                    "/Users/c.chen/dev/proj-a",
+                    "claude-sonnet-5",
+                    Some("Read"),
+                    (10, 5),
+                ),
+                &assistant_line(
+                    "2026-07-08T01:05:00Z",
+                    "/Users/c.chen/dev/proj-a",
+                    "claude-sonnet-5",
+                    Some("Edit"),
+                    (20, 8),
+                ),
                 "not json",
             ],
         );
         write_transcript(
             &proj_b,
             "s1.jsonl",
-            &[&assistant_line("2026-07-08T02:00:00Z", "/Users/c.chen/dev/proj-b", "claude-opus-4-8", Some("Bash"), (100, 50))],
+            &[&assistant_line(
+                "2026-07-08T02:00:00Z",
+                "/Users/c.chen/dev/proj-b",
+                "claude-opus-4-8",
+                Some("Bash"),
+                (100, 50),
+            )],
         );
 
         let data = scan_root(&tmp);
@@ -512,8 +648,20 @@ mod tests {
         assert_eq!(data.tools.len(), 3);
 
         let by_model_global = by_model(&data.events, None);
-        assert_eq!(by_model_global.iter().find(|(m, _)| m == "claude-opus-4-8").map(|(_, v)| *v), Some(150));
-        assert_eq!(by_model_global.iter().find(|(m, _)| m == "claude-sonnet-5").map(|(_, v)| *v), Some(43));
+        assert_eq!(
+            by_model_global
+                .iter()
+                .find(|(m, _)| m == "claude-opus-4-8")
+                .map(|(_, v)| *v),
+            Some(150)
+        );
+        assert_eq!(
+            by_model_global
+                .iter()
+                .find(|(m, _)| m == "claude-sonnet-5")
+                .map(|(_, v)| *v),
+            Some(43)
+        );
 
         let label_a = "/Users/c.chen/dev/proj-a".to_string();
         let by_model_a = by_model(&data.events, Some(&label_a));
@@ -527,7 +675,10 @@ mod tests {
         let by_proj = by_project(&data.events);
         assert_eq!(by_proj.len(), 2);
         assert_eq!(
-            by_proj.iter().find(|(p, _)| p == "/Users/c.chen/dev/proj-b").map(|(_, v)| *v),
+            by_proj
+                .iter()
+                .find(|(p, _)| p == "/Users/c.chen/dev/proj-b")
+                .map(|(_, v)| *v),
             Some(150)
         );
     }
@@ -566,14 +717,12 @@ mod tests {
 
     #[test]
     fn daily_heatmap_covers_requested_week_span_including_today() {
-        let events = vec![
-            UsageEvent {
-                ts: Local::now().with_timezone(&Utc),
-                project_label: "p".to_string(),
-                model: "m".to_string(),
-                tokens: 7,
-            },
-        ];
+        let events = vec![UsageEvent {
+            ts: Local::now().with_timezone(&Utc),
+            project_label: "p".to_string(),
+            model: "m".to_string(),
+            tokens: 7,
+        }];
         let heat = daily_heatmap(&events, 2);
         assert_eq!(heat.len(), 14);
         assert_eq!(heat.last().map(|(_, v)| *v), Some(7));

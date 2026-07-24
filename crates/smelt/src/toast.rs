@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use gpui::*;
 use gpui_component::*;
 
-use crate::{ui_theme, AgentStatus, Workspace};
+use crate::{AgentStatus, Workspace, ui_theme};
 
 /// Snooze 时长：10 分钟。
 const SNOOZE: Duration = Duration::from_secs(600);
@@ -43,7 +43,10 @@ impl Workspace {
         let mut items: Vec<(usize, EntityId, String, String)> = Vec::new();
         for (ix, s) in self.sessions.iter().enumerate() {
             let st = statuses.get(ix).copied().unwrap_or(AgentStatus::Idle);
-            if !matches!(st, AgentStatus::WaitingApproval | AgentStatus::NeedsAttention) {
+            if !matches!(
+                st,
+                AgentStatus::WaitingApproval | AgentStatus::NeedsAttention
+            ) {
                 continue;
             }
             let id = s.anchor_id();
@@ -58,7 +61,9 @@ impl Workspace {
                 .find(|(si, _, _)| *si == ix)
                 .map(|(_, _, m)| m.clone())
                 .unwrap_or_else(|| match st {
-                    AgentStatus::WaitingApproval => "Agent 暂停中——需要你批准才能继续。".to_string(),
+                    AgentStatus::WaitingApproval => {
+                        "Agent 暂停中——需要你批准才能继续。".to_string()
+                    }
                     _ => "Agent 在等你处理。".to_string(),
                 });
             items.push((ix, id, s.title(cx), msg));
@@ -104,7 +109,12 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().size(px(8.)).rounded_full().bg(rgb(ui_theme::yellow())))
+                            .child(
+                                div()
+                                    .size(px(8.))
+                                    .rounded_full()
+                                    .bg(rgb(ui_theme::yellow())),
+                            )
                             .child(
                                 div()
                                     .flex_1()

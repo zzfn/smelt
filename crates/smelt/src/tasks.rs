@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::*;
 use gpui::prelude::FluentBuilder;
+use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::{active_launch_entries, icon_for_launch_command};
 use crate::terminal_view::TerminalView;
-use crate::{new_sid, Workspace};
+use crate::{Workspace, new_sid};
 
 // ===================== 模型 =====================
 
@@ -381,9 +381,10 @@ impl TaskStore {
     /// 该项目是否已有执行中任务（同 cwd 串行 worker）。
     pub fn has_running_for_cwd(cwd: &str) -> bool {
         let cwd = cwd.trim_end_matches('/');
-        Self::load().tasks.iter().any(|t| {
-            t.column.is_active() && t.project_cwd.trim_end_matches('/') == cwd
-        })
+        Self::load()
+            .tasks
+            .iter()
+            .any(|t| t.column.is_active() && t.project_cwd.trim_end_matches('/') == cwd)
     }
 
     /// 任务此刻是否可被**系统**自动取跑（待办 + `auto_run`；定时须已到期）。
@@ -411,9 +412,11 @@ impl TaskStore {
         }
         let mut file = Self::load();
         let now = now_secs();
-        if file.tasks.iter().any(|t| {
-            t.column.is_active() && t.project_cwd.trim_end_matches('/') == prefer
-        }) {
+        if file
+            .tasks
+            .iter()
+            .any(|t| t.column.is_active() && t.project_cwd.trim_end_matches('/') == prefer)
+        {
             return None;
         }
         let mut idxs: Vec<usize> = file
@@ -486,9 +489,7 @@ impl Workspace {
                 return Some(c.clone());
             }
         }
-        active_launch_entries(cx)
-            .first()
-            .map(|e| e.command.clone())
+        active_launch_entries(cx).first().map(|e| e.command.clone())
     }
 
     pub fn set_task_bind_project(&mut self, cwd: String, cx: &mut Context<Self>) {
@@ -531,12 +532,9 @@ impl Workspace {
                 .auto_grow(4, 12)
                 .placeholder("写给 agent 的第一条指令…")
         });
-        let title = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("留空则用指令首行")
-        });
-        let run_at = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("YYYY-MM-DD HH:MM（本地时间）")
-        });
+        let title = cx.new(|cx| InputState::new(window, cx).placeholder("留空则用指令首行"));
+        let run_at =
+            cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD HH:MM（本地时间）"));
         self._task_title_sub = None;
         self.task_body_input = Some(body);
         self.task_title_input = Some(title);
@@ -581,9 +579,7 @@ impl Workspace {
             }
         }
         if self.task_bind_launch.is_none() {
-            self.task_bind_launch = active_launch_entries(cx)
-                .first()
-                .map(|e| e.command.clone());
+            self.task_bind_launch = active_launch_entries(cx).first().map(|e| e.command.clone());
         }
         // 每次打开：默认普通 + 可自动执行，清空文案；焦点落在首包。
         self.task_kind = TaskKind::Once;
@@ -778,8 +774,8 @@ impl Workspace {
         self.task_auto_run = true;
 
         // 定时且未到点：只创建，扫描器稍后开跑。
-        let schedule_only = kind == TaskKind::Scheduled
-            && run_at.map(|at| at > now_secs()).unwrap_or(true);
+        let schedule_only =
+            kind == TaskKind::Scheduled && run_at.map(|at| at > now_secs()).unwrap_or(true);
         let should_run = run && !schedule_only;
 
         if let Some(sid) = sid {
@@ -808,10 +804,7 @@ impl Workspace {
             if TaskStore::has_running_for_cwd(&t.project_cwd) {
                 continue;
             }
-            eprintln!(
-                "[tasks] scheduled due id={} run_at={:?}",
-                id, t.run_at
-            );
+            eprintln!("[tasks] scheduled due id={} run_at={:?}", id, t.run_at);
             self.run_task(&id, window, cx);
         }
     }
@@ -836,9 +829,7 @@ impl Workspace {
         let Some(id) = TaskStore::claim_next_runnable(&cwd) else {
             return;
         };
-        eprintln!(
-            "[tasks] auto_run after session={session_id} → next={id} cwd={cwd}"
-        );
+        eprintln!("[tasks] auto_run after session={session_id} → next={id} cwd={cwd}");
         self.run_task(&id, window, cx);
     }
 
@@ -966,14 +957,14 @@ impl Workspace {
                                         let cwd = p.clone();
                                         let e = e.clone();
                                         let label = project_label(p);
-                                        menu = menu.item(
-                                            PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                                        menu = menu.item(PopupMenuItem::new(label).on_click(
+                                            move |_, _, cx| {
                                                 let cwd = cwd.clone();
                                                 e.update(cx, |ws, cx| {
                                                     ws.set_task_bind_project(cwd, cx);
                                                 });
-                                            }),
-                                        );
+                                            },
+                                        ));
                                     }
                                     menu
                                 }
@@ -1003,8 +994,7 @@ impl Workspace {
                                     let mut menu = menu;
                                     if launches.is_empty() {
                                         return menu.item(
-                                            PopupMenuItem::new("设置里暂无启动项")
-                                                .disabled(true),
+                                            PopupMenuItem::new("设置里暂无启动项").disabled(true),
                                         );
                                     }
                                     for entry in &launches {
@@ -1013,14 +1003,14 @@ impl Workspace {
                                         let e = e2.clone();
                                         let icon = icon_for_launch_command(&command);
                                         menu = menu.item(
-                                            PopupMenuItem::new(label)
-                                                .icon(icon)
-                                                .on_click(move |_, _, cx| {
+                                            PopupMenuItem::new(label).icon(icon).on_click(
+                                                move |_, _, cx| {
                                                     let command = command.clone();
                                                     e.update(cx, |ws, cx| {
                                                         ws.set_task_bind_launch(command, cx);
                                                     });
-                                                }),
+                                                },
+                                            ),
                                         );
                                     }
                                     menu
@@ -1053,16 +1043,11 @@ impl Workspace {
                         this.set_task_kind(TaskKind::Scheduled, window, cx);
                     })),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(if is_scheduled {
-                        "单次 · 到点自动开跑"
-                    } else {
-                        "普通待办"
-                    }),
-            );
+            .child(div().text_xs().text_color(muted).child(if is_scheduled {
+                "单次 · 到点自动开跑"
+            } else {
+                "普通待办"
+            }));
 
         // 任务级：是否允许系统自动执行（定时强制开）
         let auto_row = h_flex()
@@ -1090,18 +1075,13 @@ impl Workspace {
                         this.set_task_auto_run(false, cx);
                     })),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(if is_scheduled {
-                        "定时任务默认自动"
-                    } else if auto_run {
-                        "完成续跑 / 队列会取它"
-                    } else {
-                        "只等人点运行"
-                    }),
-            );
+            .child(div().text_xs().text_color(muted).child(if is_scheduled {
+                "定时任务默认自动"
+            } else if auto_run {
+                "完成续跑 / 队列会取它"
+            } else {
+                "只等人点运行"
+            }));
 
         let content = v_flex()
             .gap_3()
@@ -1130,12 +1110,7 @@ impl Workspace {
                         .child("已绑定侧栏选中的终端，运行会把指令发进该会话。"),
                 )
             })
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(field_label("类型"))
-                    .child(kind_row),
-            )
+            .child(v_flex().gap_1().child(field_label("类型")).child(kind_row))
             .child(
                 v_flex()
                     .gap_1()
@@ -1266,46 +1241,43 @@ impl Workspace {
             });
         }
 
-        let pill = |id: &'static str,
-                    text: String,
-                    col: Option<TaskColumn>,
-                    color: Hsla,
-                    bg: Hsla| {
-            // 「全部」仅在无筛选时高亮
-            let active = if col.is_none() {
-                self.task_column_filter.is_none()
-            } else {
-                self.task_column_filter == col
+        let pill =
+            |id: &'static str, text: String, col: Option<TaskColumn>, color: Hsla, bg: Hsla| {
+                // 「全部」仅在无筛选时高亮
+                let active = if col.is_none() {
+                    self.task_column_filter.is_none()
+                } else {
+                    self.task_column_filter == col
+                };
+                div()
+                    .id(id)
+                    .px(px(12.))
+                    .py(px(5.))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if active {
+                        color
+                    } else {
+                        Hsla::from(rgba(0x00000000))
+                    })
+                    .bg(if active { bg } else { soft_bg })
+                    .text_sm()
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if active { color } else { muted })
+                    .hover(|s| s.bg(bg).text_color(color))
+                    .child(text)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_task_column_filter(col, cx);
+                        }),
+                    )
             };
-            div()
-                .id(id)
-                .px(px(12.))
-                .py(px(5.))
-                .rounded_full()
-                .cursor_pointer()
-                .border_1()
-                .border_color(if active {
-                    color
-                } else {
-                    Hsla::from(rgba(0x00000000))
-                })
-                .bg(if active { bg } else { soft_bg })
-                .text_sm()
-                .font_weight(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::NORMAL
-                })
-                .text_color(if active { color } else { muted })
-                .hover(|s| s.bg(bg).text_color(color))
-                .child(text)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.set_task_column_filter(col, cx);
-                    }),
-                )
-        };
 
         let c_blue: Hsla = rgb(crate::ui_theme::blue()).into();
         let c_gray: Hsla = rgb(crate::ui_theme::text_muted()).into();
@@ -1319,13 +1291,7 @@ impl Workspace {
             .items_center()
             .gap_2()
             .flex_wrap()
-            .child(pill(
-                "tp-all",
-                format!("{n_all} 任务"),
-                None,
-                fg,
-                soft_bg,
-            ))
+            .child(pill("tp-all", format!("{n_all} 任务"), None, fg, soft_bg))
             .child(pill(
                 "tp-run",
                 format!("{n_run} 执行中"),
@@ -1366,13 +1332,7 @@ impl Workspace {
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_bold()
-                                    .text_color(fg)
-                                    .child("任务总览"),
-                            )
+                            .child(div().text_xl().font_bold().text_color(fg).child("任务总览"))
                             .child(
                                 div()
                                     .text_xs()
@@ -1409,29 +1369,24 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(
-                            Icon::new(IconName::Bot)
-                                .size(px(28.))
-                                .text_color(muted),
-                        ),
+                        .child(Icon::new(IconName::Bot).size(px(28.)).text_color(muted)),
                 )
-                .child(div().text_sm().text_color(fg).font_weight(FontWeight::MEDIUM).child(
-                    if n_all == 0 {
-                        "还没有任务"
-                    } else {
-                        "这个筛选下是空的"
-                    },
-                ))
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(muted)
+                        .text_sm()
+                        .text_color(fg)
+                        .font_weight(FontWeight::MEDIUM)
                         .child(if n_all == 0 {
-                            "新建一条，或在终端右键「新建任务」"
+                            "还没有任务"
                         } else {
-                            "换个状态 pill，或清除筛选看全部"
+                            "这个筛选下是空的"
                         }),
                 )
+                .child(div().text_xs().text_color(muted).child(if n_all == 0 {
+                    "新建一条，或在终端右键「新建任务」"
+                } else {
+                    "换个状态 pill，或清除筛选看全部"
+                }))
                 .when(n_all == 0, |d| {
                     d.child(
                         Button::new("tasks-empty-new")
@@ -1535,11 +1490,7 @@ impl Workspace {
         };
         // 待办且可自动执行时标一下（定时已有徽章可省略）
         let auto_label = if task.kind == TaskKind::Once && col.is_todo() {
-            Some(if task.auto_run {
-                "自动"
-            } else {
-                "手动"
-            })
+            Some(if task.auto_run { "自动" } else { "手动" })
         } else {
             None
         };
@@ -1619,10 +1570,7 @@ impl Workspace {
                     .min_w_0()
                     .child(
                         // 包一层 tint 底，让 ghost 下拉看起来像徽章而不是灰按钮
-                        div()
-                            .rounded_full()
-                            .bg(col_tint)
-                            .child(status_badge),
+                        div().rounded_full().bg(col_tint).child(status_badge),
                     )
                     .when(schedule_label.is_some(), |d| {
                         let lab = schedule_label.clone().unwrap_or_default();
@@ -1808,12 +1756,7 @@ impl Workspace {
     }
 
     /// 卡片主按钮：待办 → [`Self::run_task`]；已跑过 → 聚焦会话。
-    pub fn primary_task_action(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn primary_task_action(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.task_selected = Some(id.to_string());
         let Some(task) = TaskStore::get(id) else {
             return;
@@ -1835,12 +1778,7 @@ impl Workspace {
     }
 
     /// 侧栏快捷：有会话则聚焦，待办/无会话则开跑。
-    pub fn focus_or_run_task(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn focus_or_run_task(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.task_selected = Some(id.to_string());
         let Some(task) = TaskStore::get(id) else {
             return;
@@ -1886,12 +1824,7 @@ impl Workspace {
     /// 在侧栏**新开终端**跑任务：`base_launch + "首包"` 编进 smeltd launch（startup-arg）。
     ///
     /// **不**往 PTY 粘贴/回车——agent 进程启动即带第一条用户消息（可自循环调度）。
-    pub fn run_task_in_terminal(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn run_task_in_terminal(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task) = TaskStore::get(id) else {
             return;
         };
@@ -1904,11 +1837,7 @@ impl Workspace {
             .launch
             .clone()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                active_launch_entries(cx)
-                    .first()
-                    .map(|e| e.command.clone())
-            })
+            .or_else(|| active_launch_entries(cx).first().map(|e| e.command.clone()))
             .unwrap_or_else(|| "claude".into());
         let label = task.title.clone();
         let prompt = task_prompt(&task);
@@ -1973,8 +1902,8 @@ impl Workspace {
 #[cfg(test)]
 mod task_model_tests {
     use super::{
-        build_launch_with_prompt, parse_local_datetime, shell_single_quote, Task, TaskColumn,
-        TaskFile, TaskKind, TaskStore,
+        Task, TaskColumn, TaskFile, TaskKind, TaskStore, build_launch_with_prompt,
+        parse_local_datetime, shell_single_quote,
     };
     use std::path::Path;
 
@@ -2103,7 +2032,12 @@ mod task_model_tests {
 
     #[test]
     fn task_prompt_is_body_only() {
-        let t = Task::new("/x".into(), "侧栏标题".into(), "真正给 agent 的指令".into(), None);
+        let t = Task::new(
+            "/x".into(),
+            "侧栏标题".into(),
+            "真正给 agent 的指令".into(),
+            None,
+        );
         assert_eq!(super::task_prompt(&t), "真正给 agent 的指令");
     }
 
@@ -2115,10 +2049,7 @@ mod task_model_tests {
 
     #[test]
     fn title_from_prompt_takes_first_line() {
-        assert_eq!(
-            super::title_from_prompt("第一行\n第二行"),
-            "第一行"
-        );
+        assert_eq!(super::title_from_prompt("第一行\n第二行"), "第一行");
     }
 
     #[test]

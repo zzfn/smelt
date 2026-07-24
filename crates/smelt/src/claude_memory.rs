@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui::Context;
 
-use crate::session_history::memory_dir;
 use crate::Workspace;
+use crate::session_history::memory_dir;
 
 /// 一条记忆。
 #[derive(Clone, Debug)]
@@ -70,7 +70,9 @@ fn parse_memory(path: &Path) -> Option<MemoryEntry> {
         if line.starts_with(char::is_whitespace) {
             continue;
         }
-        let Some((key, val)) = line.split_once(':') else { continue };
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
         let val = val.trim().trim_matches('"').to_string();
         match key.trim() {
             "name" => name = val,
@@ -115,10 +117,14 @@ impl Workspace {
         self.memory_list_inflight.insert(cwd.clone());
         cx.spawn(async move |this, cx| {
             let c = cwd.clone();
-            let memories = cx.background_executor().spawn(async move { list_memories(&c) }).await;
+            let memories = cx
+                .background_executor()
+                .spawn(async move { list_memories(&c) })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.memory_list_inflight.remove(&cwd);
-                this.memory_list.insert(cwd, (Instant::now(), Rc::new(memories)));
+                this.memory_list
+                    .insert(cwd, (Instant::now(), Rc::new(memories)));
                 cx.notify();
             });
         })
@@ -177,10 +183,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("smelt-mem-{}-c", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         write(&dir, "MEMORY.md", "- [老的](old.md) — 索引行\n");
-        write(&dir, "old.md", "---\nname: old\ndescription: 旧的\n---\n\n旧正文\n");
+        write(
+            &dir,
+            "old.md",
+            "---\nname: old\ndescription: 旧的\n---\n\n旧正文\n",
+        );
         // 拉开修改时间，保证排序断言稳定（同秒写入时 mtime 可能相同）。
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        write(&dir, "fresh.md", "---\nname: fresh\ndescription: 新的\n---\n\n新正文\n");
+        write(
+            &dir,
+            "fresh.md",
+            "---\nname: fresh\ndescription: 新的\n---\n\n新正文\n",
+        );
 
         let list = list_memories_in(&dir);
         assert_eq!(list.len(), 2, "MEMORY.md 索引不该出现在列表里");

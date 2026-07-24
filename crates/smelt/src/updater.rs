@@ -21,10 +21,19 @@ pub enum UpdateStatus {
     Checking,
     UpToDate,
     /// `total` 为 `None` 表示服务端没给 Content-Length，进度条只能跑不确定动画。
-    Downloading { version: String, received: u64, total: Option<u64> },
+    Downloading {
+        version: String,
+        received: u64,
+        total: Option<u64>,
+    },
     /// dmg 下完了，正在挂载 + 拷贝 `.app`，耗时不可测。
-    Installing { version: String },
-    ReadyToInstall { version: String, staged_app: PathBuf },
+    Installing {
+        version: String,
+    },
+    ReadyToInstall {
+        version: String,
+        staged_app: PathBuf,
+    },
     Failed(String),
 }
 
@@ -133,7 +142,11 @@ pub async fn download_and_stage(
     let _ = std::fs::remove_dir_all(&staged_app);
     let copy_result = run(
         "cp",
-        &["-R", &mounted_app.to_string_lossy(), &staged_app.to_string_lossy()],
+        &[
+            "-R",
+            &mounted_app.to_string_lossy(),
+            &staged_app.to_string_lossy(),
+        ],
     );
     detach_dmg(&device);
     let _ = std::fs::remove_file(&dmg_path);
@@ -152,7 +165,10 @@ fn attach_dmg(dmg_path: &Path) -> anyhow::Result<(PathBuf, String)> {
         .arg(dmg_path)
         .output()?;
     if !out.status.success() {
-        anyhow::bail!("hdiutil attach 失败：{}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "hdiutil attach 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let text = String::from_utf8_lossy(&out.stdout);
     // 典型输出：/dev/disk4s1          Apple_HFS                      /Volumes/Smelt
@@ -174,13 +190,18 @@ fn attach_dmg(dmg_path: &Path) -> anyhow::Result<(PathBuf, String)> {
 }
 
 fn detach_dmg(device: &str) {
-    let _ = std::process::Command::new("hdiutil").args(["detach", device]).output();
+    let _ = std::process::Command::new("hdiutil")
+        .args(["detach", device])
+        .output();
 }
 
 fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
     let out = std::process::Command::new(cmd).args(args).output()?;
     if !out.status.success() {
-        anyhow::bail!("{cmd} {args:?} 失败：{}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "{cmd} {args:?} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }
@@ -220,8 +241,14 @@ pub fn finalize_pending_update(staged_app: &Path) -> anyhow::Result<()> {
 
     if std::fs::rename(staged_app, &app_bundle).is_err() {
         // 跨设备等 rename 失败场景，退化为拷贝。
-        if let Err(e) = run("cp", &["-R", &staged_app.to_string_lossy(), &app_bundle.to_string_lossy()])
-        {
+        if let Err(e) = run(
+            "cp",
+            &[
+                "-R",
+                &staged_app.to_string_lossy(),
+                &app_bundle.to_string_lossy(),
+            ],
+        ) {
             // 拷贝也失败：把旧版本挪回去，别把用户晾在一个空目录里。
             let _ = std::fs::rename(&backup, &app_bundle);
             return Err(e);
@@ -246,7 +273,9 @@ pub fn relaunch() -> anyhow::Result<()> {
     let quoted = shell_quote(&app.to_string_lossy());
     std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(format!("while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; open -n {quoted}"))
+        .arg(format!(
+            "while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; open -n {quoted}"
+        ))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -294,4 +323,3 @@ mod tests {
         }
     }
 }
-

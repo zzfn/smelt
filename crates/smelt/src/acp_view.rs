@@ -6,23 +6,22 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
-    Window,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
-use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable, StyledExt};
+use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
 
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, Plan, PlanEntryStatus, SessionId, ToolCallId,
 };
 
 use crate::acp::{
-    spawn_acp, AcpCommand, AcpEvent, AcpHandle, AcpLaunch, ElicitField, ElicitFieldKind,
-    ElicitationResponder, ModelState, PermissionResponder, ReadyKind,
+    AcpCommand, AcpEvent, AcpHandle, AcpLaunch, ElicitField, ElicitFieldKind, ElicitationResponder,
+    ModelState, PermissionResponder, ReadyKind, spawn_acp,
 };
 use crate::settings::AcpAgentKind;
 use crate::terminal::{DaemonPhase, DaemonSessionState};
@@ -34,8 +33,8 @@ use crate::ui_theme;
 /// 一遍「怎么把协议事件变成可展示内容」。这里整段 re-export，文件里大量既有的
 /// 裸 `AcpEntry::...` 用法不用逐处改路径。
 pub(crate) use smelt_core::acp_chat::{
-    diff_line_stats, diff_lines, is_interrupt_marker, strip_code_fence, AcpEntry, DiffLineTag,
-    ToolCallStatus, ToolKind, ToolOutputPart,
+    AcpEntry, DiffLineTag, ToolCallStatus, ToolKind, ToolOutputPart, diff_line_stats, diff_lines,
+    is_interrupt_marker, strip_code_fence,
 };
 
 /// agent_client_protocol 的协议类型 → 共享模型类型。就近放这里：那边的 crate
@@ -384,7 +383,10 @@ impl AcpView {
         self.tick_starting(cx);
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = event_rx.recv().await {
-                if this.update(cx, |view, cx| view.apply_event(ev, cx)).is_err() {
+                if this
+                    .update(cx, |view, cx| view.apply_event(ev, cx))
+                    .is_err()
+                {
                     return; // 视图已销毁
                 }
             }
@@ -473,8 +475,7 @@ impl AcpView {
             crate::acp_completion::Kind::At => self.file_list(),
             crate::acp_completion::Kind::Slash => std::rc::Rc::new(Vec::new()),
         };
-        let items =
-            crate::acp_completion::candidates(&trigger, &files, &self.available_commands);
+        let items = crate::acp_completion::candidates(&trigger, &files, &self.available_commands);
         self.completion = (!items.is_empty()).then(|| CompletionPopup {
             start: trigger.start,
             end: cursor,
@@ -486,7 +487,9 @@ impl AcpView {
 
     /// 上下移动补全选中项（返回 false = 当前没在补全，按键该交回输入框）。
     fn move_completion(&mut self, delta: i32, cx: &mut Context<Self>) -> bool {
-        let Some(popup) = &mut self.completion else { return false };
+        let Some(popup) = &mut self.completion else {
+            return false;
+        };
         let n = popup.items.len() as i32;
         popup.selected = (popup.selected as i32 + delta).rem_euclid(n) as usize;
         cx.notify();
@@ -495,9 +498,15 @@ impl AcpView {
 
     /// 把选中的候选替换进输入框（返回 false = 没在补全）。
     fn accept_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(popup) = self.completion.take() else { return false };
-        let Some(input) = self.input.clone() else { return false };
-        let Some(item) = popup.items.get(popup.selected) else { return false };
+        let Some(popup) = self.completion.take() else {
+            return false;
+        };
+        let Some(input) = self.input.clone() else {
+            return false;
+        };
+        let Some(item) = popup.items.get(popup.selected) else {
+            return false;
+        };
         let insert = item.insert.clone();
         input.update(cx, |s, cx| {
             let text = s.value().to_string();
@@ -525,9 +534,10 @@ impl AcpView {
             }
             let line = match e {
                 AcpEntry::User(t) => format!("> {}", t.lines().next().unwrap_or_default()),
-                AcpEntry::Assistant { text, thought: false } => {
-                    text.lines().last().unwrap_or_default().to_string()
-                }
+                AcpEntry::Assistant {
+                    text,
+                    thought: false,
+                } => text.lines().last().unwrap_or_default().to_string(),
                 AcpEntry::Assistant { thought: true, .. } => continue,
                 AcpEntry::ToolCall { title, .. } => format!("🔧 {title}"),
                 AcpEntry::Divider(_) => continue,
@@ -576,7 +586,9 @@ impl AcpView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(input) = self.input.clone() else { return };
+        let Some(input) = self.input.clone() else {
+            return;
+        };
         input.update(cx, |s, cx| {
             let cur = s.value().to_string();
             let merged = if cur.trim().is_empty() {
@@ -609,7 +621,13 @@ impl AcpView {
             .collect();
         let img_count = images.len();
         if let Some(h) = &self.handle {
-            if h.cmd_tx.try_send(AcpCommand::Prompt { text: text.clone(), images }).is_ok() {
+            if h.cmd_tx
+                .try_send(AcpCommand::Prompt {
+                    text: text.clone(),
+                    images,
+                })
+                .is_ok()
+            {
                 // 历史里只留「带了几张图」的标记：base64 动辄几 MB，进不得
                 // workspace.json（那是每条消息都要落盘的存档）。
                 let shown = match (text.is_empty(), img_count) {
@@ -631,9 +649,13 @@ impl AcpView {
     /// 剪贴板里是图就收进待发列表（返回 true 表示这次粘贴被图片消费掉了，
     /// 调用方据此拦下事件，别再让输入框按文本粘一遍）。
     fn take_clipboard_image(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(item) = cx.read_from_clipboard() else { return false };
-        let has_image =
-            item.entries().iter().any(|e| matches!(e, gpui::ClipboardEntry::Image(_)));
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let has_image = item
+            .entries()
+            .iter()
+            .any(|e| matches!(e, gpui::ClipboardEntry::Image(_)));
         if !has_image {
             return false;
         }
@@ -683,7 +705,9 @@ impl AcpView {
     }
 
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = self.input.clone() else { return };
+        let Some(input) = self.input.clone() else {
+            return;
+        };
         let text = input.read(cx).value().trim().to_string();
         // 只贴了图没打字也要能发。
         if text.is_empty() && self.pending_images.is_empty() {
@@ -697,14 +721,13 @@ impl AcpView {
     fn apply_event(&mut self, ev: AcpEvent, cx: &mut Context<Self>) {
         // 持久化要排除的事件（match 会消费 ev，得在此之前先记下来）：
         // AgentChunk 是逐块流式增量，触发太密；Plan 本来就不落盘，触发没意义。
-        let skip_persist =
-            matches!(
-                ev,
-                AcpEvent::AgentChunk { .. }
-                    | AcpEvent::Plan(_)
-                    | AcpEvent::Model(_)
-                    | AcpEvent::Usage { .. }
-            );
+        let skip_persist = matches!(
+            ev,
+            AcpEvent::AgentChunk { .. }
+                | AcpEvent::Plan(_)
+                | AcpEvent::Model(_)
+                | AcpEvent::Usage { .. }
+        );
         // 除 UserChunk/Status/AvailableCommands 外的任何事件都代表「已经过了
         // 等自己那条 prompt 回声的窗口」——后两者是跟对话轮次推进无关的元数据
         // 更新，agent 给出实质响应或者 turn 收尾才算真的翻篇。
@@ -739,7 +762,11 @@ impl AcpView {
                     }
                 }
             }
-            AcpEvent::Ready { session_id, kind, supports_image } => {
+            AcpEvent::Ready {
+                session_id,
+                kind,
+                supports_image,
+            } => {
                 self.acp_session_id = Some(session_id);
                 self.supports_image = supports_image;
                 match kind {
@@ -765,7 +792,10 @@ impl AcpView {
             AcpEvent::AgentChunk { thought, text } => {
                 // 连续同类 chunk 并入最后一条，流式追加不炸条目数。
                 match self.entries.last_mut() {
-                    Some(AcpEntry::Assistant { text: t, thought: th }) if *th == thought => {
+                    Some(AcpEntry::Assistant {
+                        text: t,
+                        thought: th,
+                    }) if *th == thought => {
                         t.push_str(&text);
                     }
                     _ => self.entries.push(AcpEntry::Assistant { text, thought }),
@@ -784,10 +814,17 @@ impl AcpView {
             }
             AcpEvent::ToolCallUpdate(u) => {
                 let update_id = u.tool_call_id.to_string();
-                if let Some(AcpEntry::ToolCall { title, kind, status, output, .. }) =
-                    self.entries.iter_mut().rev().find(|e| {
-                        matches!(e, AcpEntry::ToolCall { id, .. } if *id == update_id)
-                    })
+                if let Some(AcpEntry::ToolCall {
+                    title,
+                    kind,
+                    status,
+                    output,
+                    ..
+                }) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, AcpEntry::ToolCall { id, .. } if *id == update_id))
                 {
                     if let Some(t) = u.fields.title {
                         *title = t;
@@ -811,7 +848,12 @@ impl AcpView {
                 self.plan = Some(p);
                 self.phase = AcpPhase::Running;
             }
-            AcpEvent::Permission { question, tool_call_id, pub_options, responder } => {
+            AcpEvent::Permission {
+                question,
+                tool_call_id,
+                pub_options,
+                responder,
+            } => {
                 self.permission = Some(PermissionCard {
                     question: question.clone(),
                     tool_call_id,
@@ -826,11 +868,17 @@ impl AcpView {
                     .unwrap_or(true);
                 if notify_on {
                     if let Some(p) = cx.try_global::<crate::PendingAgentNotifs>() {
-                        p.0.lock().unwrap().push(("等你批准".to_string(), question, true));
+                        p.0.lock()
+                            .unwrap()
+                            .push(("等你批准".to_string(), question, true));
                     }
                 }
             }
-            AcpEvent::Elicitation { message, fields, responder } => {
+            AcpEvent::Elicitation {
+                message,
+                fields,
+                responder,
+            } => {
                 self.elicitation = Some(ElicitCard {
                     message: message.clone(),
                     fields,
@@ -844,7 +892,9 @@ impl AcpView {
                     .unwrap_or(true);
                 if notify_on {
                     if let Some(p) = cx.try_global::<crate::PendingAgentNotifs>() {
-                        p.0.lock().unwrap().push(("等你选择".to_string(), message, false));
+                        p.0.lock()
+                            .unwrap()
+                            .push(("等你选择".to_string(), message, false));
                     }
                 }
             }
@@ -878,7 +928,9 @@ impl AcpView {
     /// 把当前相位写进 DaemonStates 全局（key = `acp-` 前缀 sid）——Session::status、
     /// Dock 角标、菜单栏、总览全部经既有链路自动点亮。
     fn sync_daemon_state(&self, cx: &mut App) {
-        let Some(states) = cx.try_global::<crate::DaemonStates>() else { return };
+        let Some(states) = cx.try_global::<crate::DaemonStates>() else {
+            return;
+        };
         let phase = match &self.phase {
             AcpPhase::Starting | AcpPhase::Idle => DaemonPhase::Idle,
             AcpPhase::Running => {
@@ -886,7 +938,10 @@ impl AcpView {
                 let executing = self.entries.iter().any(|e| {
                     matches!(
                         e,
-                        AcpEntry::ToolCall { status: ToolCallStatus::InProgress | ToolCallStatus::Pending, .. }
+                        AcpEntry::ToolCall {
+                            status: ToolCallStatus::InProgress | ToolCallStatus::Pending,
+                            ..
+                        }
                     )
                 });
                 if executing {
@@ -923,8 +978,12 @@ impl AcpView {
 
     /// 选择题点选：单选字段直接置换；多选字段 toggle。单字段单选点了立即提交。
     fn pick_elicit_option(&mut self, field_ix: usize, opt_ix: usize, cx: &mut Context<Self>) {
-        let Some(card) = &mut self.elicitation else { return };
-        let Some(field) = card.fields.get(field_ix) else { return };
+        let Some(card) = &mut self.elicitation else {
+            return;
+        };
+        let Some(field) = card.fields.get(field_ix) else {
+            return;
+        };
         match &field.kind {
             ElicitFieldKind::Select(_) => {
                 card.chosen.insert(field_ix, vec![opt_ix]);
@@ -939,8 +998,8 @@ impl AcpView {
             }
         }
         // 快捷路径：整卡只有一个单选字段，点了就是答案，不用再按提交。
-        let single_select = card.fields.len() == 1
-            && matches!(card.fields[0].kind, ElicitFieldKind::Select(_));
+        let single_select =
+            card.fields.len() == 1 && matches!(card.fields[0].kind, ElicitFieldKind::Select(_));
         if single_select {
             self.submit_elicitation(cx);
         } else {
@@ -951,19 +1010,26 @@ impl AcpView {
     /// 每个字段都有选择后才可提交（渲染侧按这个亮按钮）。
     fn elicit_ready(&self) -> bool {
         self.elicitation.as_ref().is_some_and(|card| {
-            card.fields.iter().enumerate().all(|(ix, _)| {
-                card.chosen.get(&ix).is_some_and(|sel| !sel.is_empty())
-            })
+            card.fields
+                .iter()
+                .enumerate()
+                .all(|(ix, _)| card.chosen.get(&ix).is_some_and(|sel| !sel.is_empty()))
         })
     }
 
     fn submit_elicitation(&mut self, cx: &mut Context<Self>) {
         use agent_client_protocol::schema::v1::ElicitationContentValue as V;
-        let Some(mut card) = self.elicitation.take() else { return };
-        let Some(responder) = card.responder.take() else { return };
+        let Some(mut card) = self.elicitation.take() else {
+            return;
+        };
+        let Some(responder) = card.responder.take() else {
+            return;
+        };
         let mut content = std::collections::BTreeMap::new();
         for (ix, field) in card.fields.iter().enumerate() {
-            let Some(sel) = card.chosen.get(&ix) else { continue };
+            let Some(sel) = card.chosen.get(&ix) else {
+                continue;
+            };
             match &field.kind {
                 ElicitFieldKind::Select(options) => {
                     if let Some(opt) = sel.first().and_then(|&i| options.get(i)) {
@@ -1021,7 +1087,10 @@ impl AcpView {
             .find(|t| !t.starts_with('-'))
             .unwrap_or("agent");
         let name = tok.rsplit('/').next().unwrap_or(tok);
-        name.split('@').find(|s| !s.is_empty()).unwrap_or(name).to_string()
+        name.split('@')
+            .find(|s| !s.is_empty())
+            .unwrap_or(name)
+            .to_string()
     }
 
     /// PLAN 条：agent 上报的任务计划 → 消息流上方的可折叠进度条。
@@ -1046,11 +1115,20 @@ impl AcpView {
         // 「第几步 of 总数」：正在跑的算当前步；全完成就是 n of n。
         let current = (done + in_progress).min(total);
         let (summary, summary_color) = if done == total {
-            (format!("{total} of {total} · 完成"), gpui::rgb(ui_theme::green()))
+            (
+                format!("{total} of {total} · 完成"),
+                gpui::rgb(ui_theme::green()),
+            )
         } else if in_progress > 0 {
-            (format!("{current} of {total} · 进行中"), gpui::rgb(ui_theme::accent()))
+            (
+                format!("{current} of {total} · 进行中"),
+                gpui::rgb(ui_theme::accent()),
+            )
         } else {
-            (format!("{done} of {total}"), gpui::rgb(ui_theme::text_muted()))
+            (
+                format!("{done} of {total}"),
+                gpui::rgb(ui_theme::text_muted()),
+            )
         };
         let progress = (done as f32 + in_progress as f32 * 0.5) / total as f32;
 
@@ -1138,7 +1216,12 @@ impl AcpView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(div().size(px(7.)).rounded_xs().bg(gpui::rgb(ui_theme::accent()))),
+                                .child(
+                                    div()
+                                        .size(px(7.))
+                                        .rounded_xs()
+                                        .bg(gpui::rgb(ui_theme::accent())),
+                                ),
                         )
                         .child(
                             h_flex()
@@ -1186,7 +1269,10 @@ impl AcpView {
     fn pick_permission_primary(&mut self, cx: &mut Context<Self>) {
         let Some(card) = &self.permission else { return };
         let Some(pix) = card.options.iter().position(|o| {
-            matches!(o.kind, PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways)
+            matches!(
+                o.kind,
+                PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+            )
         }) else {
             return;
         };
@@ -1195,8 +1281,12 @@ impl AcpView {
 
     /// 审批按钮：消费 responder 回 RPC，卡片收起，相位回 Running（agent 会继续）。
     fn pick_permission(&mut self, option_ix: usize, cx: &mut Context<Self>) {
-        let Some(card) = &mut self.permission else { return };
-        let Some(opt) = card.options.get(option_ix) else { return };
+        let Some(card) = &mut self.permission else {
+            return;
+        };
+        let Some(opt) = card.options.get(option_ix) else {
+            return;
+        };
         let option_id = opt.option_id.clone();
         if let Some(responder) = card.responder.take() {
             responder.select(option_id);
@@ -1294,7 +1384,10 @@ impl Render for AcpView {
         });
         let mut perm_buttons: Option<gpui::AnyElement> = self.permission.as_ref().map(|card| {
             let primary_ix = card.options.iter().position(|o| {
-                matches!(o.kind, PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways)
+                matches!(
+                    o.kind,
+                    PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+                )
             });
             let mut buttons = h_flex().gap_2().items_center().flex_wrap();
             if let Some(pix) = primary_ix {
@@ -1364,12 +1457,7 @@ impl Render for AcpView {
                     .gap_2()
                     .my_1()
                     .child(div().flex_1().h(px(1.)).bg(t.border))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("已中断"),
-                    )
+                    .child(div().text_xs().text_color(muted).child("已中断"))
                     .child(div().flex_1().h(px(1.)).bg(t.border))
                     .into_any_element(),
                 // 用户气泡右对齐限宽（对齐设计稿）：整行铺满时跟 agent 正文
@@ -1402,14 +1490,25 @@ impl Render for AcpView {
                             .pt(px(2.)) // 跟头像文字视觉基线对齐
                             .text_sm()
                             .when(*thought, |d| d.text_color(muted).italic())
-                            .child(crate::markdown_mermaid::markdown_view(("acp-md", i), text.clone())),
+                            .child(crate::markdown_mermaid::markdown_view(
+                                ("acp-md", i),
+                                text.clone(),
+                            )),
                     )
                     .into_any_element(),
-                AcpEntry::ToolCall { id, title, kind, status, output } => {
+                AcpEntry::ToolCall {
+                    id,
+                    title,
+                    kind,
+                    status,
+                    output,
+                } => {
                     let accent = tool_accent_color(kind);
                     let (status_dot, status_label): (gpui::Hsla, &str) = match status {
                         ToolCallStatus::Pending => (t.muted_foreground, "待执行"),
-                        ToolCallStatus::InProgress => (gpui::rgb(ui_theme::blue()).into(), "执行中"),
+                        ToolCallStatus::InProgress => {
+                            (gpui::rgb(ui_theme::blue()).into(), "执行中")
+                        }
                         ToolCallStatus::Completed => (gpui::rgb(ui_theme::green()).into(), "完成"),
                         ToolCallStatus::Failed => (gpui::rgb(ui_theme::red()).into(), "失败"),
                     };
@@ -1419,15 +1518,16 @@ impl Render for AcpView {
                     let diff_totals: Vec<(usize, usize)> = output
                         .iter()
                         .filter_map(|p| match p {
-                            ToolOutputPart::Diff { old_text, new_text, .. } => {
-                                Some(diff_line_stats(old_text.as_deref().unwrap_or(""), new_text))
-                            }
+                            ToolOutputPart::Diff {
+                                old_text, new_text, ..
+                            } => Some(diff_line_stats(old_text.as_deref().unwrap_or(""), new_text)),
                             _ => None,
                         })
                         .collect();
                     let has_diff = !diff_totals.is_empty();
-                    let (total_added, total_removed) =
-                        diff_totals.iter().fold((0usize, 0usize), |(a, r), (da, dr)| (a + da, r + dr));
+                    let (total_added, total_removed) = diff_totals
+                        .iter()
+                        .fold((0usize, 0usize), |(a, r), (da, dr)| (a + da, r + dr));
 
                     let header_right: gpui::AnyElement = if has_diff {
                         h_flex()
@@ -1485,7 +1585,11 @@ impl Render for AcpView {
                         );
                     for (part_ix, part) in output.iter().enumerate() {
                         card = match part {
-                            ToolOutputPart::Diff { path, old_text, new_text } => card.child(
+                            ToolOutputPart::Diff {
+                                path,
+                                old_text,
+                                new_text,
+                            } => card.child(
                                 v_flex()
                                     .px_4()
                                     .pb_3()
@@ -1628,7 +1732,10 @@ impl Render for AcpView {
                                 .items_center()
                                 .child(div().text_sm().font_semibold().child("等你批准"))
                                 .child(
-                                    div().text_sm().text_color(muted).child(card.question.clone()),
+                                    div()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .child(card.question.clone()),
                                 ),
                         )
                         .child(buttons),
@@ -1653,7 +1760,12 @@ impl Render for AcpView {
                         .gap_2()
                         .items_center()
                         .child(div().text_sm().font_semibold().child("等你选择"))
-                        .child(div().text_sm().text_color(muted).child(card.message.clone())),
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(card.message.clone()),
+                        ),
                 );
             let multi_field = card.fields.len() > 1
                 || card
@@ -1676,7 +1788,11 @@ impl Render for AcpView {
                             .py_1()
                             .rounded_lg()
                             .border_1()
-                            .border_color(if selected { gpui::rgb(ui_theme::yellow()).into() } else { t.border })
+                            .border_color(if selected {
+                                gpui::rgb(ui_theme::yellow()).into()
+                            } else {
+                                t.border
+                            })
                             .when(selected, |d| d.bg(t.muted))
                             .text_sm()
                             .cursor_pointer()
@@ -1691,13 +1807,11 @@ impl Render for AcpView {
                     v_flex()
                         .gap_1()
                         .when(multi_field, |d| {
-                            d.child(
-                                div().text_xs().text_color(muted).child(format!(
-                                    "{}{}",
-                                    field.title.clone(),
-                                    if is_multi { "（可多选）" } else { "" }
-                                )),
-                            )
+                            d.child(div().text_xs().text_color(muted).child(format!(
+                                "{}{}",
+                                field.title.clone(),
+                                if is_multi { "（可多选）" } else { "" }
+                            )))
                         })
                         .child(row),
                 );
@@ -1756,8 +1870,11 @@ impl Render for AcpView {
             None => (self.agent_label(), false),
         };
         // 候选模型（协议给了才有）：胶囊变成可点下拉，点一项即切。
-        let model_options: Vec<(String, String)> =
-            self.model.as_ref().map(|m| m.options.clone()).unwrap_or_default();
+        let model_options: Vec<(String, String)> = self
+            .model
+            .as_ref()
+            .map(|m| m.options.clone())
+            .unwrap_or_default();
         let current_model = self.model.as_ref().map(|m| m.current_name.clone());
         // 补全弹层：画在输入框**上方**，而且是正常流式元素不是绝对定位浮层——
         // 输入框贴着窗口底边，往下开的菜单一定会被窗口边缘裁掉（组件自带那套
@@ -1879,15 +1996,14 @@ impl Render for AcpView {
                                             };
                                             let insert = format!("/{name}");
                                             let this = this.clone();
-                                            menu = menu.item(
-                                                PopupMenuItem::new(label)
-                                                    .on_click(move |_ev, window, cx| {
-                                                        let insert = insert.clone();
-                                                        this.update(cx, |v, cx| {
-                                                            v.insert_prompt_text(&insert, window, cx)
-                                                        });
-                                                    }),
-                                            );
+                                            menu = menu.item(PopupMenuItem::new(label).on_click(
+                                                move |_ev, window, cx| {
+                                                    let insert = insert.clone();
+                                                    this.update(cx, |v, cx| {
+                                                        v.insert_prompt_text(&insert, window, cx)
+                                                    });
+                                                },
+                                            ));
                                         }
                                         menu
                                     }),
@@ -2040,7 +2156,9 @@ impl Render for AcpView {
                                     .cursor_pointer()
                                     .hover(|d| d.opacity(0.8))
                                     .child("停止")
-                                    .on_click(cx.listener(|this, _ev, _window, _cx| this.cancel_turn())),
+                                    .on_click(
+                                        cx.listener(|this, _ev, _window, _cx| this.cancel_turn()),
+                                    ),
                             )
                         })
                         .child(
@@ -2084,24 +2202,28 @@ impl Render for AcpView {
             // 上/下/回车/Esc/Tab 在输入框里全都绑成了 action，冒泡阶段和
             // capture_key_down 都轮不到我们（见下面 ⌘V 那段的教训）。
             // 没在补全时一律不拦，按键原样交回输入框。
-            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveUp, _window, cx| {
-                if this.move_completion(-1, cx) {
-                    cx.stop_propagation();
-                }
-            }))
-            .capture_action(cx.listener(|this, _: &gpui_component::input::MoveDown, _window, cx| {
-                if this.move_completion(1, cx) {
-                    cx.stop_propagation();
-                }
-            }))
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::MoveUp, _window, cx| {
+                    if this.move_completion(-1, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .capture_action(cx.listener(
-                |this, _: &gpui_component::input::Enter, window, cx| {
-                    // 补全开着时回车是「选中这条」，不是发送——否则永远选不上。
-                    if this.accept_completion(window, cx) {
+                |this, _: &gpui_component::input::MoveDown, _window, cx| {
+                    if this.move_completion(1, cx) {
                         cx.stop_propagation();
                     }
                 },
             ))
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Enter, window, cx| {
+                    // 补全开着时回车是「选中这条」，不是发送——否则永远选不上。
+                    if this.accept_completion(window, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .capture_action(cx.listener(
                 |this, _: &gpui_component::input::IndentInline, window, cx| {
                     if this.accept_completion(window, cx) {
@@ -2109,12 +2231,14 @@ impl Render for AcpView {
                     }
                 },
             ))
-            .capture_action(cx.listener(|this, _: &gpui_component::input::Escape, _window, cx| {
-                if this.completion.take().is_some() {
-                    cx.notify();
-                    cx.stop_propagation();
-                }
-            }))
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, _window, cx| {
+                    if this.completion.take().is_some() {
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             // ⌘V 贴图（输入框聚焦时，也就是绝大多数情况）：必须拦 **Paste
             // action 的 capture 阶段**，不能拦 key_down。
             //
@@ -2124,14 +2248,14 @@ impl Render for AcpView {
             // 把 cmd-v 绑成了 Paste（gpui-component input/state.rs），于是这个
             // 事件永远轮不到我们。而 action 的 capture 阶段是从根往下走的，
             // 挂在这里就能抢在输入框（更深的节点）前面拿到。
-            .capture_action(cx.listener(
-                |this, _: &gpui_component::input::Paste, _window, cx| {
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Paste, _window, cx| {
                     // 只有剪贴板真是图片才截胡；文本粘贴照样放行给输入框。
                     if this.take_clipboard_image(cx) {
                         cx.stop_propagation();
                     }
-                },
-            ))
+                }),
+            )
             // 焦点不在输入框里（点了消息流等）时 Paste binding 不匹配，
             // action 那条路走不到——这条按 key_down 兜底。
             .capture_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
@@ -2284,8 +2408,14 @@ fn render_diff_lines(
             row = row.bg(bg);
         }
         rows = rows.child(
-            row.child(div().w(px(12.)).flex_shrink_0().text_color(fg).child(prefix.to_string()))
-                .child(div().flex_1().min_w_0().text_color(fg).child(line.text)),
+            row.child(
+                div()
+                    .w(px(12.))
+                    .flex_shrink_0()
+                    .text_color(fg)
+                    .child(prefix.to_string()),
+            )
+            .child(div().flex_1().min_w_0().text_color(fg).child(line.text)),
         );
     }
     rows.into_any_element()

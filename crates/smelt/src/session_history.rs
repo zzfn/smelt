@@ -16,7 +16,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// 项目目录编码规则：Claude Code 把项目路径里的 `/` 和 `.` 都换成 `-`
@@ -32,11 +34,16 @@ fn project_dir(cwd: &str) -> String {
 /// 存在与否 = 这段对话有没有真正落盘 = 续接有没有可能成功。acp.rs 靠它避开
 /// 注定失败的 `session/resume`（省下约 2 秒白等）。
 pub(crate) fn transcript_path(cwd: &str, session_id: &str) -> PathBuf {
-    projects_root().join(project_dir(cwd)).join(format!("{session_id}.jsonl"))
+    projects_root()
+        .join(project_dir(cwd))
+        .join(format!("{session_id}.jsonl"))
 }
 
 fn projects_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".claude").join("projects")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".claude")
+        .join("projects")
 }
 
 /// 某个项目的记忆目录（`<项目目录>/memory`）。编码规则只有这一份，claude_memory.rs
@@ -84,7 +91,9 @@ pub struct SessionDetail {
 /// 只读扫描，可能要几十毫秒（视会话数量），调用方应放后台线程跑。
 pub fn list_sessions(cwd: &str) -> Vec<SessionSummary> {
     let dir = projects_root().join(project_dir(cwd));
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     let mut out: Vec<SessionSummary> = entries
         .flatten()
         .map(|e| e.path())
@@ -118,7 +127,11 @@ fn claude_user_text(content: &Value) -> Option<String> {
 
 fn summarize_session(path: &Path) -> Option<SessionSummary> {
     let text = std::fs::read_to_string(path).ok()?;
-    let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+    let session_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
 
     let mut title: Option<String> = None;
     let mut started_at: Option<DateTime<Utc>> = None;
@@ -133,8 +146,12 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
         if line.is_empty() {
             continue;
         }
-        let Ok(row) = serde_json::from_str::<Value>(line) else { continue };
-        let Some(kind) = row.get("type").and_then(|v| v.as_str()) else { continue };
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(kind) = row.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
         if kind != "user" && kind != "assistant" {
             continue;
         }
@@ -149,8 +166,10 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
         }
 
         if kind == "user" {
-            if let Some(text) =
-                row.get("message").and_then(|m| m.get("content")).and_then(claude_user_text)
+            if let Some(text) = row
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(claude_user_text)
             {
                 message_count += 1;
                 if title.is_none() {
@@ -164,9 +183,15 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
                 .get("uuid")
                 .and_then(|v| v.as_str())
                 .is_some_and(|u| !seen_uuids.insert(u.to_string()));
-            let blocks = row.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array());
-            let has_text = blocks
-                .is_some_and(|blocks| blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")));
+            let blocks = row
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array());
+            let has_text = blocks.is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            });
             if has_text {
                 message_count += 1;
             }
@@ -216,11 +241,15 @@ pub fn load_session_detail(path: &Path) -> Option<SessionDetail> {
         if line.is_empty() {
             continue;
         }
-        let Ok(row) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if row.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
             continue;
         }
-        let Some(kind) = row.get("type").and_then(|v| v.as_str()) else { continue };
+        let Some(kind) = row.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
         if kind != "user" && kind != "assistant" {
             continue;
         }
@@ -232,8 +261,15 @@ pub fn load_session_detail(path: &Path) -> Option<SessionDetail> {
         let content = row.get("message").and_then(|m| m.get("content"));
 
         if kind == "user" {
-            let Some(text) = content.and_then(claude_user_text) else { continue };
-            turns.push(Turn { is_user: true, timestamp, text, tools: Vec::new() });
+            let Some(text) = content.and_then(claude_user_text) else {
+                continue;
+            };
+            turns.push(Turn {
+                is_user: true,
+                timestamp,
+                text,
+                tools: Vec::new(),
+            });
         } else {
             let blocks = content.and_then(|c| c.as_array());
             let Some(blocks) = blocks else { continue };
@@ -251,7 +287,12 @@ pub fn load_session_detail(path: &Path) -> Option<SessionDetail> {
             if text.trim().is_empty() && tools.is_empty() {
                 continue;
             }
-            turns.push(Turn { is_user: false, timestamp, text, tools });
+            turns.push(Turn {
+                is_user: false,
+                timestamp,
+                text,
+                tools,
+            });
         }
     }
 
@@ -274,7 +315,10 @@ fn truncate(s: &str, max_chars: usize) -> String {
 // 比 Claude 那版慢，调用方本来就放后台线程跑，可以接受。
 
 fn codex_sessions_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".codex").join("sessions")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".codex")
+        .join("sessions")
 }
 
 pub fn list_codex_sessions(cwd: &str) -> Vec<SessionSummary> {
@@ -327,10 +371,17 @@ fn summarize_codex_session(path: &Path, want_cwd: &str) -> Option<SessionSummary
     if payload.get("cwd").and_then(|v| v.as_str()) != Some(want_cwd) {
         return None; // 先过滤 cwd，不匹配就不用往下解析整份文件
     }
-    let session_id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let session_id = payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
 
     let mut title: Option<String> = None;
-    let started_at = meta.get("timestamp").and_then(|v| v.as_str()).and_then(parse_rfc3339);
+    let started_at = meta
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(parse_rfc3339);
     let mut last_active_at = started_at;
     let mut message_count = 0usize;
     let mut last_tool: Option<String> = None;
@@ -340,17 +391,27 @@ fn summarize_codex_session(path: &Path, want_cwd: &str) -> Option<SessionSummary
         if line.is_empty() {
             continue;
         }
-        let Ok(row) = serde_json::from_str::<Value>(line) else { continue };
-        if let Some(ts) = row.get("timestamp").and_then(|v| v.as_str()).and_then(parse_rfc3339) {
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(ts) = row
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339)
+        {
             last_active_at = Some(last_active_at.map_or(ts, |l: DateTime<Utc>| l.max(ts)));
         }
         if row.get("type").and_then(|v| v.as_str()) != Some("response_item") {
             continue;
         }
-        let Some(item) = row.get("payload") else { continue };
+        let Some(item) = row.get("payload") else {
+            continue;
+        };
         match item.get("type").and_then(|v| v.as_str()) {
             Some("message") => {
-                let Some(msg_text) = codex_message_text(item) else { continue };
+                let Some(msg_text) = codex_message_text(item) else {
+                    continue;
+                };
                 // role 不只有 user/assistant——实测还见过 system/developer 这类指令性
                 // 角色（比如 `<permissions instructions>` 说明块）。只认 user/assistant，
                 // 别的一律跳过：归到 assistant 会显示成「AI 说了这段系统指令」，误导人。
@@ -412,15 +473,24 @@ pub fn load_codex_session_detail(path: &Path) -> Option<SessionDetail> {
         if line.is_empty() {
             continue;
         }
-        let Ok(row) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if row.get("type").and_then(|v| v.as_str()) != Some("response_item") {
             continue;
         }
-        let timestamp = row.get("timestamp").and_then(|v| v.as_str()).and_then(parse_rfc3339);
-        let Some(item) = row.get("payload") else { continue };
+        let timestamp = row
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339);
+        let Some(item) = row.get("payload") else {
+            continue;
+        };
         match item.get("type").and_then(|v| v.as_str()) {
             Some("message") => {
-                let Some(msg_text) = codex_message_text(item) else { continue };
+                let Some(msg_text) = codex_message_text(item) else {
+                    continue;
+                };
                 let is_user = match item.get("role").and_then(|v| v.as_str()) {
                     Some("user") => true,
                     Some("assistant") => false,
@@ -429,10 +499,17 @@ pub fn load_codex_session_detail(path: &Path) -> Option<SessionDetail> {
                 if is_user && is_synthetic_codex_text(&msg_text) {
                     continue; // CLI 自己注入的 <environment_context>，不是真人发言
                 }
-                turns.push(Turn { is_user, timestamp, text: msg_text, tools: Vec::new() });
+                turns.push(Turn {
+                    is_user,
+                    timestamp,
+                    text: msg_text,
+                    tools: Vec::new(),
+                });
             }
             Some("function_call") => {
-                let Some(name) = item.get("name").and_then(|v| v.as_str()) else { continue };
+                let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
                 // 工具调用挂到「上一条 assistant 轮次」上——Codex 的日志比 Claude 更碎，
                 // 一次 assistant 发言常拆成「先一条 message 说要干嘛，再几条 function_call」，
                 // 没有上一条 assistant 轮次就单独开一条只带工具名、没有正文的轮次。
@@ -460,7 +537,10 @@ pub fn load_codex_session_detail(path: &Path) -> Option<SessionDetail> {
 // 反而是四家里最快的），`chat_history.jsonl` 才是完整对话内容。
 
 fn grok_sessions_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".grok").join("sessions")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".grok")
+        .join("sessions")
 }
 
 pub fn list_grok_sessions(cwd: &str) -> Vec<SessionSummary> {
@@ -484,11 +564,19 @@ fn summarize_grok_session(session_dir: &Path, want_cwd: &str) -> Option<SessionS
     let summary_path = session_dir.join("summary.json");
     let text = std::fs::read_to_string(&summary_path).ok()?;
     let summary: Value = serde_json::from_str(&text).ok()?;
-    if summary.get("info").and_then(|i| i.get("cwd")).and_then(|v| v.as_str()) != Some(want_cwd) {
+    if summary
+        .get("info")
+        .and_then(|i| i.get("cwd"))
+        .and_then(|v| v.as_str())
+        != Some(want_cwd)
+    {
         return None;
     }
-    let session_id =
-        session_dir.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+    let session_id = session_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
     let title = summary
         .get("session_summary")
         .and_then(|v| v.as_str())
@@ -499,8 +587,14 @@ fn summarize_grok_session(session_dir: &Path, want_cwd: &str) -> Option<SessionS
         path: session_dir.to_path_buf(),
         title,
         resume_id: session_id,
-        started_at: summary.get("created_at").and_then(|v| v.as_str()).and_then(parse_rfc3339),
-        last_active_at: summary.get("updated_at").and_then(|v| v.as_str()).and_then(parse_rfc3339),
+        started_at: summary
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339),
+        last_active_at: summary
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339),
         message_count: summary
             .get("num_chat_messages")
             .and_then(|v| v.as_u64())
@@ -538,8 +632,12 @@ fn grok_text_blocks(content: &Value) -> String {
 /// 让消息气泡里露出 XML 标签，剥掉更贴近「这就是用户打的字」。
 fn strip_user_query_wrapper(text: &str) -> &str {
     let t = text.trim();
-    let Some(rest) = t.strip_prefix("<user_query>") else { return text };
-    rest.strip_suffix("</user_query>").map(str::trim).unwrap_or(text)
+    let Some(rest) = t.strip_prefix("<user_query>") else {
+        return text;
+    };
+    rest.strip_suffix("</user_query>")
+        .map(str::trim)
+        .unwrap_or(text)
 }
 
 pub fn load_grok_session_detail(session_dir: &Path) -> Option<SessionDetail> {
@@ -552,10 +650,14 @@ pub fn load_grok_session_detail(session_dir: &Path) -> Option<SessionDetail> {
         if line.is_empty() {
             continue;
         }
-        let Ok(row) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         match row.get("type").and_then(|v| v.as_str()) {
             Some("user") => {
-                let Some(content) = row.get("content") else { continue };
+                let Some(content) = row.get("content") else {
+                    continue;
+                };
                 let raw = grok_text_blocks(content);
                 if raw.trim().is_empty() {
                     continue;
@@ -564,11 +666,19 @@ pub fn load_grok_session_detail(session_dir: &Path) -> Option<SessionDetail> {
                 if is_synthetic_grok_row(&row, &text) {
                     continue;
                 }
-                turns.push(Turn { is_user: true, timestamp: None, text, tools: Vec::new() });
+                turns.push(Turn {
+                    is_user: true,
+                    timestamp: None,
+                    text,
+                    tools: Vec::new(),
+                });
             }
             Some("assistant") => {
-                let text =
-                    row.get("content").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let text = row
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let tools: Vec<String> = row
                     .get("tool_calls")
                     .and_then(|v| v.as_array())
@@ -586,7 +696,12 @@ pub fn load_grok_session_detail(session_dir: &Path) -> Option<SessionDetail> {
                 // Grok 的 chat_history.jsonl 逐行不带时间戳（跟 Claude/Codex 不同），
                 // 只有整份会话的 created_at/updated_at（见 summary.json），没有更细的
                 // 逐轮时间可用，就都留 None，UI 本来就把 None 当「不显示时间」处理。
-                turns.push(Turn { is_user: false, timestamp: None, text, tools });
+                turns.push(Turn {
+                    is_user: false,
+                    timestamp: None,
+                    text,
+                    tools,
+                });
             }
             _ => {} // reasoning / system / tool_result：跳过，同 Claude 对 tool_result 的处理
         }
@@ -602,7 +717,10 @@ pub fn load_grok_session_detail(session_dir: &Path) -> Option<SessionDetail> {
 // 给 cwd/标题/时间，`events.jsonl` 才是完整对话内容。
 
 fn copilot_sessions_root() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".copilot").join("session-state")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".copilot")
+        .join("session-state")
 }
 
 /// 只认得住扁平 `key: value` 这一种形状——Copilot 目前这个文件就是这样（实测），
@@ -632,8 +750,11 @@ fn summarize_copilot_session(session_dir: &Path, want_cwd: &str) -> Option<Sessi
     if fields.get("cwd").map(String::as_str) != Some(want_cwd) {
         return None;
     }
-    let session_id =
-        session_dir.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+    let session_id = session_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
     let title = fields
         .get("summary")
         .or_else(|| fields.get("name"))
@@ -646,12 +767,16 @@ fn summarize_copilot_session(session_dir: &Path, want_cwd: &str) -> Option<Sessi
     let (mut message_count, mut last_tool) = (0usize, None);
     if let Ok(text) = std::fs::read_to_string(session_dir.join("events.jsonl")) {
         for line in text.lines() {
-            let Ok(row) = serde_json::from_str::<Value>(line.trim()) else { continue };
+            let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
             match row.get("type").and_then(|v| v.as_str()) {
                 Some("user.message") | Some("assistant.message") => message_count += 1,
                 Some("tool.execution_start") => {
-                    if let Some(name) =
-                        row.get("data").and_then(|d| d.get("toolName")).and_then(|v| v.as_str())
+                    if let Some(name) = row
+                        .get("data")
+                        .and_then(|d| d.get("toolName"))
+                        .and_then(|v| v.as_str())
                     {
                         last_tool = Some(name.to_string());
                     }
@@ -682,13 +807,19 @@ pub fn load_copilot_session_detail(session_dir: &Path) -> Option<SessionDetail> 
         if line.is_empty() {
             continue;
         }
-        let Ok(row) = serde_json::from_str::<Value>(line) else { continue };
-        let Some(data) = row.get("data") else { continue };
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(data) = row.get("data") else {
+            continue;
+        };
         match row.get("type").and_then(|v| v.as_str()) {
             Some("user.message") => {
                 // `content` 是用户原始打字；`transformedContent` 是 CLI 拼进 IDE 选区
                 // 之类上下文之后的版本，混进去展示会很乱，只取干净的那份。
-                let Some(text) = data.get("content").and_then(|v| v.as_str()) else { continue };
+                let Some(text) = data.get("content").and_then(|v| v.as_str()) else {
+                    continue;
+                };
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -700,8 +831,11 @@ pub fn load_copilot_session_detail(session_dir: &Path) -> Option<SessionDetail> 
                 });
             }
             Some("assistant.message") => {
-                let text =
-                    data.get("content").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let text = data
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let tools: Vec<String> = data
                     .get("toolRequests")
                     .and_then(|v| v.as_array())
@@ -715,7 +849,12 @@ pub fn load_copilot_session_detail(session_dir: &Path) -> Option<SessionDetail> 
                 if text.trim().is_empty() && tools.is_empty() {
                     continue;
                 }
-                turns.push(Turn { is_user: false, timestamp: None, text, tools });
+                turns.push(Turn {
+                    is_user: false,
+                    timestamp: None,
+                    text,
+                    tools,
+                });
             }
             _ => {} // tool.execution_*/hook.*/session.*/system.*：跳过，工具名已从 toolRequests 拿到
         }
@@ -739,7 +878,7 @@ use std::time::Instant;
 
 use crate::claude_memory::MemoryEntry;
 use crate::usage_stats::format_count;
-use crate::{placeholder_view, Workspace};
+use crate::{Workspace, placeholder_view};
 
 /// 历史会话「时间」文案：有明显跨度（>1 分钟）就顺带标一下这个会话跑了多久，
 /// 纯单条消息的会话就只显示时间点，不必画蛇添足展示"0 分钟"。
@@ -750,7 +889,10 @@ fn session_when(s: &SessionSummary) -> String {
             last.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
             (last - start).num_minutes()
         ),
-        (_, Some(last)) => last.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string(),
+        (_, Some(last)) => last
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -791,7 +933,13 @@ pub fn history_view(
 ) -> Div {
     let (muted, fg, c_border, accent, secondary) = {
         let t = cx.theme();
-        (t.muted_foreground, t.foreground, t.border, t.primary, t.secondary)
+        (
+            t.muted_foreground,
+            t.foreground,
+            t.border,
+            t.primary,
+            t.secondary,
+        )
     };
 
     // 「会话 / 记忆」切换：两块数据是同一个项目的两种视角，共用下面的左右布局，
@@ -805,15 +953,39 @@ pub fn history_view(
         .py_2()
         .border_b_1()
         .border_color(c_border)
-        .child(pane_button("会话", HistoryPane::Sessions, pane, accent, fg, muted, cx))
-        .child(pane_button("记忆", HistoryPane::Memories, pane, accent, fg, muted, cx));
+        .child(pane_button(
+            "会话",
+            HistoryPane::Sessions,
+            pane,
+            accent,
+            fg,
+            muted,
+            cx,
+        ))
+        .child(pane_button(
+            "记忆",
+            HistoryPane::Memories,
+            pane,
+            accent,
+            fg,
+            muted,
+            cx,
+        ));
 
     if pane == HistoryPane::Memories {
         return v_flex()
             .flex_1()
             .min_h_0()
             .child(switcher)
-            .child(memory_body(memories, memory_selected, muted, fg, c_border, accent, cx));
+            .child(memory_body(
+                memories,
+                memory_selected,
+                muted,
+                fg,
+                c_border,
+                accent,
+                cx,
+            ));
     }
 
     // 会话来源分 tab：四家 agent 各自的本地存储格式完全不同（见文件头注释），
@@ -845,8 +1017,13 @@ pub fn history_view(
         (HistoryListState::Ready(_), Some(list)) => {
             // 只列标题：时间/消息数/tokens 这些细节挪到右边详情页顶部固定展示，
             // 左边专心做"挑一条看"，不用再挤一整张表格。
-            let mut col =
-                v_flex().id("session-list").flex_1().min_h_0().overflow_y_scroll().p_2().gap_1();
+            let mut col = v_flex()
+                .id("session-list")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p_2()
+                .gap_1();
             // 右键「继续」的回调是个独立触发的普通闭包，不是 cx.listener——不能直接
             // 拿闭包外那个 &mut Context<Workspace> 改状态，得先攥一份 Entity handle，
             // 触发时再 .update() 回去，跟别处「异步回来再 update」是同一个道理。
@@ -892,7 +1069,12 @@ pub fn history_view(
                                     let resume_path = resume_path.clone();
                                     ws.update(cx, |this, cx| {
                                         this.resume_acp_session(
-                                            agent, cwd, resume_id, resume_path, window, cx,
+                                            agent,
+                                            cwd,
+                                            resume_id,
+                                            resume_path,
+                                            window,
+                                            cx,
                                         );
                                     });
                                 },
@@ -907,45 +1089,56 @@ pub fn history_view(
 
     // 详情头部：选中会话的时间/消息数/tokens，固定在对话内容上方——之前这些
     // 信息只在左边表格的列里能看到，挪掉表格之后得有地方接住。
-    let detail_header = selected_path.as_ref().and_then(|p| {
-        sessions.as_ref().and_then(|list| list.iter().find(|s| &s.path == p))
-    }).map(|s| {
-        h_flex()
-            .flex_none()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(c_border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(fg)
-                    .truncate()
-                    .child(s.title.clone()),
-            )
-            .child(div().flex_none().text_xs().text_color(muted).child(session_when(s)))
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!("{} 条消息", s.message_count)),
-            )
-            .when(s.total_tokens > 0, |d| {
-                d.child(
+    let detail_header = selected_path
+        .as_ref()
+        .and_then(|p| {
+            sessions
+                .as_ref()
+                .and_then(|list| list.iter().find(|s| &s.path == p))
+        })
+        .map(|s| {
+            h_flex()
+                .flex_none()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(c_border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(fg)
+                        .truncate()
+                        .child(s.title.clone()),
+                )
+                .child(
                     div()
                         .flex_none()
                         .text_xs()
                         .text_color(muted)
-                        .child(format_count(s.total_tokens)),
+                        .child(session_when(s)),
                 )
-            })
-    });
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{} 条消息", s.message_count)),
+                )
+                .when(s.total_tokens > 0, |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format_count(s.total_tokens)),
+                    )
+                })
+        });
 
     let turns_body: AnyElement = match detail {
         None => placeholder_view("← 选择一个历史会话查看内容", muted).into_any_element(),
@@ -964,23 +1157,34 @@ pub fn history_view(
             .children(d.turns.iter().enumerate().map(|(i, t)| {
                 let role = if t.is_user { "用户" } else { "Claude" };
                 let role_color = if t.is_user { accent } else { fg };
-                let bubble_bg = if t.is_user { accent.opacity(0.12) } else { secondary };
+                let bubble_bg = if t.is_user {
+                    accent.opacity(0.12)
+                } else {
+                    secondary
+                };
                 // 工具名按出现顺序去重计数，多次调用同一工具合并成一行摘要
                 // （比如连续 3 次 Bash 就显示"Bash ×3"），不然长会话里全是重复胶囊。
                 let tool_summary = (!t.tools.is_empty()).then(|| {
                     let mut order: Vec<&String> = Vec::new();
                     let mut counts: HashMap<&String, usize> = HashMap::new();
                     for tool in &t.tools {
-                        counts.entry(tool).and_modify(|c| *c += 1).or_insert_with(|| {
-                            order.push(tool);
-                            1
-                        });
+                        counts
+                            .entry(tool)
+                            .and_modify(|c| *c += 1)
+                            .or_insert_with(|| {
+                                order.push(tool);
+                                1
+                            });
                     }
                     order
                         .into_iter()
                         .map(|name| {
                             let c = counts[name];
-                            if c > 1 { format!("{name} ×{c}") } else { name.clone() }
+                            if c > 1 {
+                                format!("{name} ×{c}")
+                            } else {
+                                name.clone()
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join(" · ")
@@ -996,50 +1200,64 @@ pub fn history_view(
                         h_flex()
                             .gap_2()
                             .items_baseline()
-                            .child(div().font_semibold().text_sm().text_color(role_color).child(role))
-                            .children(t.timestamp.map(|ts| {
+                            .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(ts.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+                                    .font_semibold()
+                                    .text_sm()
+                                    .text_color(role_color)
+                                    .child(role),
+                            )
+                            .children(t.timestamp.map(|ts| {
+                                div().text_xs().text_color(muted).child(
+                                    ts.with_timezone(&chrono::Local)
+                                        .format("%m-%d %H:%M")
+                                        .to_string(),
+                                )
                             })),
                     )
                     // 必须逐气泡给唯一 id：便捷函数 text::markdown() 拿调用处代码位置
                     // 当 id，循环里所有气泡会共享同一份 TextView 状态（文本互踩、高度
                     // 测量错乱，气泡整个叠在一起）。
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(fg)
-                            .child(crate::markdown_mermaid::markdown_view(("turn-md", i), t.text.clone())),
+                    .child(div().text_sm().text_color(fg).child(
+                        crate::markdown_mermaid::markdown_view(("turn-md", i), t.text.clone()),
+                    ))
+                    .children(
+                        tool_summary
+                            .map(|s| div().text_xs().text_color(muted).child(format!("🔧 {s}"))),
                     )
-                    .children(tool_summary.map(|s| {
-                        div().text_xs().text_color(muted).child(format!("🔧 {s}"))
-                    }))
                     .into_any_element()
             }))
             .into_any_element(),
     };
 
-    let detail_body = v_flex().flex_1().min_h_0().children(detail_header).child(turns_body);
+    let detail_body = v_flex()
+        .flex_1()
+        .min_h_0()
+        .children(detail_header)
+        .child(turns_body);
 
-    v_flex().flex_1().min_h_0().child(switcher).child(agent_switcher).child(
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .child(
-                div()
-                    .w(px(280.))
-                    .flex()
-                    .flex_col()
-                    .min_h_0()
-                    .border_r_1()
-                    .border_color(c_border)
-                    .child(list_body),
-            )
-            .child(detail_body),
-    )
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .child(switcher)
+        .child(agent_switcher)
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .child(
+                    div()
+                        .w(px(280.))
+                        .flex()
+                        .flex_col()
+                        .min_h_0()
+                        .border_r_1()
+                        .border_color(c_border)
+                        .child(list_body),
+                )
+                .child(detail_body),
+        )
 }
 
 /// 会话来源 tab 上的一个按钮，选中态用 accent 底色标出来（跟 `pane_button` 同款
@@ -1133,7 +1351,13 @@ fn memory_body(
         )
         .into_any_element(),
         Some(list) => {
-            let mut col = v_flex().id("memory-list").flex_1().min_h_0().overflow_y_scroll().p_2().gap_1();
+            let mut col = v_flex()
+                .id("memory-list")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p_2()
+                .gap_1();
             for (ix, m) in list.iter().enumerate() {
                 let is_sel = selected == Some(ix);
                 col = col.child(
@@ -1167,7 +1391,10 @@ fn memory_body(
         }
     };
 
-    let detail_body: AnyElement = match memories.as_ref().and_then(|l| selected.and_then(|ix| l.get(ix))) {
+    let detail_body: AnyElement = match memories
+        .as_ref()
+        .and_then(|l| selected.and_then(|ix| l.get(ix)))
+    {
         None => placeholder_view("← 选择一条记忆查看内容", muted).into_any_element(),
         Some(m) => v_flex()
             .id("memory-detail")
@@ -1182,7 +1409,10 @@ fn memory_body(
             .gap_2()
             .child(div().text_lg().text_color(fg).child(m.name.clone()))
             .children((!m.description.is_empty()).then(|| {
-                div().text_sm().text_color(muted).child(m.description.clone())
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(m.description.clone())
             }))
             // markdown 得给唯一 id，否则跟别处的 TextView 共享状态互踩（同 turn 气泡的坑）。
             // 外面这层 w_full + min_w_0 是给正文定死一个「可用宽度」，长行才会在这个宽度
@@ -1191,7 +1421,10 @@ fn memory_body(
                 div()
                     .w_full()
                     .min_w_0()
-                    .child(crate::markdown_mermaid::markdown_view("memory-md", m.body.clone())),
+                    .child(crate::markdown_mermaid::markdown_view(
+                        "memory-md",
+                        m.body.clone(),
+                    )),
             )
             .into_any_element(),
     };
@@ -1243,7 +1476,12 @@ impl Workspace {
     /// 历史会话页：确保当前 agent + 项目的会话列表缓存新鲜（>10s 或缺失就后台
     /// 重新扫描）。总览卡片那边固定传 `AcpAgentKind::Claude`，跟历史页的 tab
     /// 切换共用同一份缓存/同一套读写路径。
-    pub fn ensure_session_list(&mut self, agent: AcpAgentKind, cwd: String, cx: &mut Context<Self>) {
+    pub fn ensure_session_list(
+        &mut self,
+        agent: AcpAgentKind,
+        cwd: String,
+        cx: &mut Context<Self>,
+    ) {
         let key = session_list_key(agent, &cwd);
         let fresh = self
             .session_list
@@ -1261,7 +1499,8 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.session_list_inflight.remove(&key);
-                this.session_list.insert(key, (Instant::now(), Rc::new(sessions)));
+                this.session_list
+                    .insert(key, (Instant::now(), Rc::new(sessions)));
                 cx.notify();
             });
         })
@@ -1299,7 +1538,6 @@ impl Workspace {
         })
         .detach();
     }
-
 }
 
 #[cfg(test)]
@@ -1342,14 +1580,20 @@ mod tests {
 
     #[test]
     fn project_dir_replaces_slashes_and_dots() {
-        assert_eq!(project_dir("/Users/c.chen/dev/smelt"), "-Users-c-chen-dev-smelt");
+        assert_eq!(
+            project_dir("/Users/c.chen/dev/smelt"),
+            "-Users-c-chen-dev-smelt"
+        );
     }
 
     #[test]
     fn list_sessions_summarizes_title_and_counts_and_sorts_by_recency() {
         let tmp = std::env::temp_dir().join("smelt-session-history-test-list");
         let _ = std::fs::remove_dir_all(&tmp);
-        let proj_root = tmp.join(".claude").join("projects").join(project_dir("/x/y"));
+        let proj_root = tmp
+            .join(".claude")
+            .join("projects")
+            .join(project_dir("/x/y"));
         std::fs::create_dir_all(&proj_root).unwrap();
 
         write(
@@ -1363,7 +1607,9 @@ mod tests {
         write(
             &proj_root,
             "newer.jsonl",
-            &[r#"{"type":"user","timestamp":"2026-07-05T00:00:00Z","message":{"content":"second session"}}"#],
+            &[
+                r#"{"type":"user","timestamp":"2026-07-05T00:00:00Z","message":{"content":"second session"}}"#,
+            ],
         );
 
         let sessions = with_home(&tmp, || list_sessions("/x/y"));
@@ -1411,7 +1657,12 @@ mod tests {
     fn codex_reader_filters_by_cwd_skips_synthetic_context_and_groups_tool_calls() {
         let tmp = std::env::temp_dir().join("smelt-session-history-test-codex");
         let _ = std::fs::remove_dir_all(&tmp);
-        let day_dir = tmp.join(".codex").join("sessions").join("2026").join("07").join("01");
+        let day_dir = tmp
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("01");
         std::fs::create_dir_all(&day_dir).unwrap();
         write(
             &day_dir,
@@ -1429,7 +1680,9 @@ mod tests {
         write(
             &day_dir,
             "rollout-other.jsonl",
-            &[r#"{"timestamp":"2026-07-01T00:00:00Z","type":"session_meta","payload":{"id":"cx-2","cwd":"/other"}}"#],
+            &[
+                r#"{"timestamp":"2026-07-01T00:00:00Z","type":"session_meta","payload":{"id":"cx-2","cwd":"/other"}}"#,
+            ],
         );
 
         let sessions = with_home(&tmp, || list_codex_sessions("/proj"));

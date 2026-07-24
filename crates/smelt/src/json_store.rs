@@ -1,8 +1,8 @@
 //! 通用 JSON 配置文件读写：把 appearance/launch_config/llm_config/pet_config 各自手写一遍的
 //! 「path → 读（缺失/损坏回退默认）→ 写（失败静默忽略）」样板收口成两个泛型函数。
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 
 /// 读取 JSON 配置；文件缺失、内容损坏都回退默认值，不 panic 不报错。

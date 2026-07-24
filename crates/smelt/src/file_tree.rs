@@ -9,9 +9,9 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
-use gpui::*;
-use gpui::prelude::FluentBuilder;
 use gpui::InteractiveElement;
+use gpui::prelude::FluentBuilder;
+use gpui::*;
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
@@ -19,7 +19,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 
 use crate::git_panel::GitStatusData;
-use crate::{placeholder_view, SendSelectionToTerminal, Workspace};
+use crate::{SendSelectionToTerminal, Workspace, placeholder_view};
 
 // ===================== 类型 =====================
 
@@ -110,8 +110,10 @@ fn search_project(root: &str, query: &str) -> (Vec<SearchHit>, bool) {
         for e in entries {
             let name = e.file_name().to_string_lossy().to_string();
             // 排除规则与 ensure_dir_listing 对齐，另跳过所有隐藏文件/目录。
-            if matches!(name.as_str(), ".git" | "node_modules" | "target" | ".DS_Store")
-                || name.starts_with('.')
+            if matches!(
+                name.as_str(),
+                ".git" | "node_modules" | "target" | ".DS_Store"
+            ) || name.starts_with('.')
             {
                 continue;
             }
@@ -129,7 +131,11 @@ fn search_project(root: &str, query: &str) -> (Vec<SearchHit>, bool) {
             let abs = path.to_string_lossy().to_string();
             // 文件名命中：直接记一条（不再看内容），命中行留空。
             if name.to_lowercase().contains(&needle) {
-                name_hits.push(SearchHit { path: abs, rel, line: None });
+                name_hits.push(SearchHit {
+                    path: abs,
+                    rel,
+                    line: None,
+                });
                 if name_hits.len() + content_hits.len() >= SEARCH_HIT_LIMIT {
                     truncated = true;
                     break 'outer;
@@ -140,7 +146,9 @@ fn search_project(root: &str, query: &str) -> (Vec<SearchHit>, bool) {
             if e.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > SEARCH_MAX_FILE_BYTES {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             // 含 NUL 视为二进制，不逐行扫。
             if text.as_bytes().contains(&0) {
                 continue;
@@ -296,7 +304,9 @@ fn walk_dir_cached(
     depth: usize,
     out: &mut Vec<(usize, String, bool, String, bool)>,
 ) {
-    let Some((_, entries)) = dir_cache.get(dir) else { return };
+    let Some((_, entries)) = dir_cache.get(dir) else {
+        return;
+    };
     for (name, is_dir) in entries.iter() {
         let path = Path::new(dir).join(name).to_string_lossy().to_string();
         let is_expanded = expanded.contains(&path);
@@ -356,7 +366,13 @@ pub fn file_tree(
 ) -> AnyElement {
     let (muted, fg, hover, active_bg, accent) = {
         let t = cx.theme();
-        (t.muted_foreground, t.foreground, t.accent, t.border, t.primary)
+        (
+            t.muted_foreground,
+            t.foreground,
+            t.accent,
+            t.border,
+            t.primary,
+        )
     };
     if roots.is_empty() {
         return placeholder_view("无项目目录", muted).into_any_element();
@@ -473,33 +489,31 @@ pub fn file_tree(
                 let p_finder = p_menu.clone();
                 let this_del = this_menu.clone();
                 let p_del = p_menu.clone();
-                menu
-                    .item(
-                        PopupMenuItem::new("发送到终端").on_click(move |_ev, _window, cx| {
-                            this_term.update(cx, |ws, cx| ws.send_path_to_terminal(p_term.clone(), cx));
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new("复制文件路径").on_click(move |_ev, _window, cx| {
-                            this_copy.update(cx, |ws, cx| ws.copy_file_path_to_clipboard(p_copy.clone(), cx));
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new("在 Finder 中显示").on_click(move |_ev, _window, cx| {
-                            this_finder.update(cx, |ws, cx| {
-                                ws.reveal_path_in_finder(p_finder.clone(), cx);
-                            });
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new("删除文件").on_click(
-                            move |_ev, _window, cx| {
-                                this_del.update(cx, |ws, cx| {
-                                    ws.start_delete_file(p_del.clone(), is_dir, cx)
-                                });
-                            },
-                        ),
-                    )
+                menu.item(
+                    PopupMenuItem::new("发送到终端").on_click(move |_ev, _window, cx| {
+                        this_term.update(cx, |ws, cx| ws.send_path_to_terminal(p_term.clone(), cx));
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("复制文件路径").on_click(move |_ev, _window, cx| {
+                        this_copy.update(cx, |ws, cx| {
+                            ws.copy_file_path_to_clipboard(p_copy.clone(), cx)
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("在 Finder 中显示").on_click(move |_ev, _window, cx| {
+                        this_finder.update(cx, |ws, cx| {
+                            ws.reveal_path_in_finder(p_finder.clone(), cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("删除文件").on_click(move |_ev, _window, cx| {
+                        this_del
+                            .update(cx, |ws, cx| ws.start_delete_file(p_del.clone(), is_dir, cx));
+                    }),
+                )
             })
             .child(arrow)
             .child(type_icon)
@@ -532,7 +546,11 @@ pub fn file_tree(
     // 根标题行（仅多根时渲染）：可折叠，点击切换 collapsed_roots。样式比子项醒目
     // 一档（加粗 + 常驻文件夹图标），一眼分出「这是一个项目根」。
     let render_root_header = |i: usize, root: &str, root_open: bool| -> AnyElement {
-        let name = root.rsplit('/').find(|s| !s.is_empty()).unwrap_or(root).to_string();
+        let name = root
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or(root)
+            .to_string();
         let this = this.clone();
         let rp = root.to_string();
         div()
@@ -597,7 +615,16 @@ pub fn file_tree(
         let mut flat: Vec<(usize, String, bool, String, bool)> = Vec::new();
         walk_dir_cached(root, dir_cache, expanded, base_depth, &mut flat);
         for (depth, name, is_dir, path, is_expanded) in flat {
-            rows.push(render_entry(i, depth, name, is_dir, path, is_expanded, root, changed));
+            rows.push(render_entry(
+                i,
+                depth,
+                name,
+                is_dir,
+                path,
+                is_expanded,
+                root,
+                changed,
+            ));
             i += 1;
         }
     }
@@ -626,7 +653,11 @@ fn editor_language_for_path(path: &str) -> String {
     let p = Path::new(path);
     match p.extension().and_then(|e| e.to_str()) {
         Some(ext) => ext.to_lowercase(),
-        None => p.file_name().and_then(|n| n.to_str()).unwrap_or("text").to_lowercase(),
+        None => p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("text")
+            .to_lowercase(),
     }
 }
 
@@ -635,12 +666,23 @@ fn editor_language_for_path(path: &str) -> String {
 pub fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspace>) -> Div {
     let (muted, fg, border, warning, accent) = {
         let t = cx.theme();
-        (t.muted_foreground, t.foreground, t.border, t.warning, t.accent)
+        (
+            t.muted_foreground,
+            t.foreground,
+            t.border,
+            t.warning,
+            t.accent,
+        )
     };
     match open_file {
         None => placeholder_view("← 从左侧选择文件查看内容", muted),
         Some(of) => {
-            let name = of.path.rsplit('/').next().unwrap_or(of.path.as_str()).to_string();
+            let name = of
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(of.path.as_str())
+                .to_string();
             let dirty = of.editor.read(cx).value().to_string() != *of.saved_content;
             // 只有 markdown 才给「编辑 / 预览」切换，其它文件类型没有预览这一说。
             let is_md = editor_language_for_path(&of.path) == "md";
@@ -663,9 +705,11 @@ pub fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspac
                             el.child(div().size(px(6.)).rounded_full().bg(warning))
                         })
                         // 保存失败 / 不支持保存的提示。
-                        .children(of.save_error.clone().map(|msg| {
-                            div().text_xs().text_color(warning).child(msg)
-                        })),
+                        .children(
+                            of.save_error
+                                .clone()
+                                .map(|msg| div().text_xs().text_color(warning).child(msg)),
+                        ),
                 )
                 .when(is_md, |el| {
                     let seg = |label: &'static str, active: bool, target: bool| {
@@ -700,12 +744,12 @@ pub fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspac
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_3()
-                    .child(
-                        div().text_sm().text_color(fg).child(crate::markdown_mermaid::markdown_view(
+                    .child(div().text_sm().text_color(fg).child(
+                        crate::markdown_mermaid::markdown_view(
                             "md-preview-body",
                             of.editor.read(cx).value().to_string(),
-                        )),
-                    )
+                        ),
+                    ))
                     .into_any_element()
             } else {
                 div()
@@ -718,20 +762,22 @@ pub fn file_content_pane(open_file: &Option<OpenFile>, cx: &mut Context<Workspac
                         // 崩整个 App）。剪切/复制/发送都在真正执行时（Cut/Copy 的默认实现、
                         // send_open_file_selection）各自判空早退，这里不需要提前查询选中状态
                         // 来控制 disabled，牺牲一点「没选中时置灰」的观感换取不崩。
-                        Input::new(&of.editor).h_full().context_menu(move |menu, _window, cx| {
-                            let has_paste = cx.read_from_clipboard().is_some();
-                            menu.menu("剪切", Box::new(gpui_component::input::Cut))
-                                .menu("复制", Box::new(gpui_component::input::Copy))
-                                .menu_with_disabled(
-                                    "粘贴",
-                                    !has_paste,
-                                    Box::new(gpui_component::input::Paste),
-                                )
-                                .separator()
-                                .menu("全选", Box::new(gpui_component::input::SelectAll))
-                                .separator()
-                                .menu("发送选中内容到终端", Box::new(SendSelectionToTerminal))
-                        }),
+                        Input::new(&of.editor)
+                            .h_full()
+                            .context_menu(move |menu, _window, cx| {
+                                let has_paste = cx.read_from_clipboard().is_some();
+                                menu.menu("剪切", Box::new(gpui_component::input::Cut))
+                                    .menu("复制", Box::new(gpui_component::input::Copy))
+                                    .menu_with_disabled(
+                                        "粘贴",
+                                        !has_paste,
+                                        Box::new(gpui_component::input::Paste),
+                                    )
+                                    .separator()
+                                    .menu("全选", Box::new(gpui_component::input::SelectAll))
+                                    .separator()
+                                    .menu("发送选中内容到终端", Box::new(SendSelectionToTerminal))
+                            }),
                     )
                     .into_any_element()
             };
@@ -983,7 +1029,10 @@ impl Workspace {
     pub fn reveal_path_in_finder(&mut self, path: String, _cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         {
-            let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+            let _ = std::process::Command::new("open")
+                .arg("-R")
+                .arg(&path)
+                .spawn();
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1069,13 +1118,18 @@ impl Workspace {
 
         cx.spawn(async move |this, cx| {
             let p = path.clone();
-            let read = cx.background_executor().spawn(async move { std::fs::read_to_string(&p) }).await;
+            let read = cx
+                .background_executor()
+                .spawn(async move { std::fs::read_to_string(&p) })
+                .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 // 只有当前仍是这次打开的文件才写入，避免旧任务覆盖新文件。
                 if this.file_gen != r#gen {
                     return;
                 }
-                let Some(of) = this.open_file.as_mut() else { return };
+                let Some(of) = this.open_file.as_mut() else {
+                    return;
+                };
                 match read {
                     Ok(content) => {
                         editor.update(cx, |state, cx| {
@@ -1091,11 +1145,7 @@ impl Workspace {
                     }
                     Err(_) => {
                         editor.update(cx, |state, cx| {
-                            state.set_value(
-                                "（无法以文本方式读取：可能是二进制文件）",
-                                window,
-                                cx,
-                            );
+                            state.set_value("（无法以文本方式读取：可能是二进制文件）", window, cx);
                         });
                         of.readable = false;
                     }
@@ -1154,7 +1204,9 @@ impl Workspace {
                     return; // 写盘期间又切了别的文件，这次结果不再相关
                 }
                 let switch_target = this.pending_switch_after_save.take();
-                let Some(of) = this.open_file.as_mut() else { return };
+                let Some(of) = this.open_file.as_mut() else {
+                    return;
+                };
                 match outcome {
                     SaveOutcome::Saved => {
                         of.saved_content = Rc::new(content);
@@ -1166,8 +1218,9 @@ impl Workspace {
                     }
                     SaveOutcome::Conflict => {
                         of.conflict_pending = true;
-                        of.save_error =
-                            Some("文件已被外部修改；再按一次 Cmd+S 会强制覆盖磁盘上的改动".to_string());
+                        of.save_error = Some(
+                            "文件已被外部修改；再按一次 Cmd+S 会强制覆盖磁盘上的改动".to_string(),
+                        );
                     }
                     SaveOutcome::Error(e) => of.save_error = Some(format!("保存失败：{e}")),
                 }
@@ -1182,7 +1235,11 @@ impl Workspace {
     /// query 未变（已有对应结果或正在跑同一 query）就跳过，避免每帧重扫。
     pub fn ensure_search(&mut self, root: String, query: String, cx: &mut Context<Self>) {
         // 已有本 query 的结果、或正有一次针对本 query 的遍历在跑，就不重复触发。
-        if self.search_results.as_ref().is_some_and(|s| s.query == query) {
+        if self
+            .search_results
+            .as_ref()
+            .is_some_and(|s| s.query == query)
+        {
             return;
         }
         self.search_gen = self.search_gen.wrapping_add(1);
@@ -1249,8 +1306,10 @@ impl Workspace {
                         .into_iter()
                         .filter_map(|e| {
                             let name = e.file_name().to_string_lossy().to_string();
-                            if matches!(name.as_str(), ".git" | "node_modules" | "target" | ".DS_Store")
-                            {
+                            if matches!(
+                                name.as_str(),
+                                ".git" | "node_modules" | "target" | ".DS_Store"
+                            ) {
                                 return None;
                             }
                             Some((name, e.path().is_dir()))
@@ -1260,7 +1319,8 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.dir_inflight.remove(&dir);
-                this.dir_cache.insert(dir, (Instant::now(), Rc::new(entries)));
+                this.dir_cache
+                    .insert(dir, (Instant::now(), Rc::new(entries)));
                 cx.notify();
             });
         })
@@ -1279,13 +1339,19 @@ impl Workspace {
             .and_then(|n| n.to_str())
             .unwrap_or(&path)
             .to_string();
-        self.delete_file_target = Some(DeleteFileTarget { path, is_dir, label });
+        self.delete_file_target = Some(DeleteFileTarget {
+            path,
+            is_dir,
+            label,
+        });
         cx.notify();
     }
 
     /// 确认删除文件/文件夹。
     pub fn confirm_delete_file(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self.delete_file_target.take() else { return };
+        let Some(target) = self.delete_file_target.take() else {
+            return;
+        };
         cx.notify();
         self.perform_delete_file(target.path, target.is_dir, cx);
     }
@@ -1300,7 +1366,9 @@ impl Workspace {
     pub fn render_delete_file_confirm(&self, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
         let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(true);
-        let Some(target) = self.delete_file_target.as_ref() else { return div() };
+        let Some(target) = self.delete_file_target.as_ref() else {
+            return div();
+        };
         let fg = cx.theme().foreground;
 
         let (title, body) = if target.is_dir {
@@ -1396,7 +1464,10 @@ impl Workspace {
         let root = self.cur().and_then(|s| s.cwd(cx));
         let rel = root
             .and_then(|root| {
-                Path::new(&path).strip_prefix(&root).ok().map(|p| p.to_string_lossy().to_string())
+                Path::new(&path)
+                    .strip_prefix(&root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
             })
             .unwrap_or_else(|| path.clone());
         let msg = format!("@{rel} ");
@@ -1416,7 +1487,10 @@ impl Workspace {
         let root = self.cur().and_then(|s| s.cwd(cx));
         let rel = root
             .and_then(|root| {
-                Path::new(&of.path).strip_prefix(&root).ok().map(|p| p.to_string_lossy().to_string())
+                Path::new(&of.path)
+                    .strip_prefix(&root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
             })
             .unwrap_or_else(|| of.path.clone());
         let msg = format!("{rel} 里选中的这段：\n```\n{selected}\n```\n");

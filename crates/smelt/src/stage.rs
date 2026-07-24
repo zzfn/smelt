@@ -8,7 +8,7 @@ use gpui::*;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::*;
 
-use crate::{ui_theme, AgentStatus, MainView, RenameTarget, SessionKind, Workspace};
+use crate::{AgentStatus, MainView, RenameTarget, SessionKind, Workspace, ui_theme};
 
 /// 状态胶囊文案（与会话列表副标题同一套口径）。
 fn phase_text(status: AgentStatus) -> &'static str {
@@ -60,7 +60,10 @@ impl Workspace {
                     .text_sm()
                     .text_color(rgb(ui_theme::text_mid()))
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(ui_theme::bg_hover())).text_color(rgb(ui_theme::text_bright())))
+                    .hover(|d| {
+                        d.bg(rgb(ui_theme::bg_hover()))
+                            .text_color(rgb(ui_theme::text_bright()))
+                    })
                     .child(back)
                     .on_click(move |_ev, window, cx| {
                         this.update(cx, |ws, cx| ws.set_stage_override(None, window, cx));
@@ -115,13 +118,23 @@ impl Workspace {
 
         // 类型点：agent 紫圆 / 终端绿方（与会话列表一致）。
         let type_dot: AnyElement = if is_term {
-            div().size(px(9.)).rounded_xs().bg(rgb(ui_theme::green())).into_any_element()
+            div()
+                .size(px(9.))
+                .rounded_xs()
+                .bg(rgb(ui_theme::green()))
+                .into_any_element()
         } else {
-            div().size(px(9.)).rounded_full().bg(rgb(ui_theme::purple())).into_any_element()
+            div()
+                .size(px(9.))
+                .rounded_full()
+                .bg(rgb(ui_theme::purple()))
+                .into_any_element()
         };
 
         let e_split = this.clone();
         let e_menu = this.clone();
+        // 分屏会话里「关闭会话」= 连所有分屏一起关，文案要点明（关单个 pane 用 ⌘W）。
+        let multi_pane = sess.pane_count() > 1;
         Some(
             div()
                 .h(px(44.))
@@ -170,7 +183,12 @@ impl Workspace {
                         .border_color(rgb(ui_theme::border_mid()))
                         .text_xs()
                         .text_color(rgb(ui_theme::text_mid()))
-                        .child(div().size(px(6.)).rounded_full().bg(rgb(ui_theme::purple())))
+                        .child(
+                            div()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(rgb(ui_theme::purple())),
+                        )
                         .child(m)
                 }))
                 .child(
@@ -215,14 +233,21 @@ impl Workspace {
                                     });
                                 },
                             ))
-                            .item(PopupMenuItem::new("关闭会话").on_click(
-                                move |_ev, _window, cx| {
-                                    e_close.update(cx, |ws, cx| {
-                                        let ix = ws.active_session;
-                                        ws.close_session(ix, cx);
-                                    });
-                                },
-                            ))
+                            .item(
+                                PopupMenuItem::new(if multi_pane {
+                                    "关闭整个会话（含全部分屏）"
+                                } else {
+                                    "关闭会话"
+                                })
+                                .on_click(
+                                    move |_ev, _window, cx| {
+                                        e_close.update(cx, |ws, cx| {
+                                            let ix = ws.active_session;
+                                            ws.close_session(ix, cx);
+                                        });
+                                    },
+                                ),
+                            )
                         }),
                 ),
         )
@@ -231,7 +256,9 @@ impl Workspace {
     /// 26px 终端底条：launch 名 · 相位 · 右侧快捷键提示。仅 Term 会话显示。
     pub(crate) fn render_terminal_status_bar(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         let sess = self.sessions.get(self.active_session)?;
-        let SessionKind::Term { active, .. } = &sess.kind else { return None };
+        let SessionKind::Term { active, .. } = &sess.kind else {
+            return None;
+        };
         let status = sess.status(cx);
         let launch = match active.read(cx).launch_kind() {
             crate::terminal_view::LaunchKind::Claude => "claude",

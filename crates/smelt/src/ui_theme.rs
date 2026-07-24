@@ -21,7 +21,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui::{rgb, rgba, Rgba};
+use gpui::{Rgba, rgb, rgba};
 
 use crate::AgentStatus;
 
@@ -40,6 +40,10 @@ pub struct Palette {
     pub bg_card: u32,
     /// hover / toast / 输入胶囊底。
     pub bg_hover: u32,
+    /// **列表行**专用 hover 底：必须明显弱于 `bg_selected`，否则「鼠标划过的行」
+    /// 和「当前选中的行」同时是两块灰，一眼分不出哪个才是当前。
+    /// 不能直接复用 `bg_hover`——那个还给按钮 / 输入胶囊用，压淡了控件就没手感。
+    pub bg_row_hover: u32,
     /// 选中行底（会话行选中、文件行选中）。
     pub bg_selected: u32,
     /// 状态栏 / 终端底条。
@@ -126,6 +130,8 @@ pub const DARK: Palette = Palette {
     bg_bar: 0x2b2d31,
     bg_card: 0x3a3c42,
     bg_hover: 0x35373c,
+    // 只比 bg_elev(0x232428) 高一档：划过是「浮起一点」，选中才是「亮起来」。
+    bg_row_hover: 0x2b2d31,
     bg_selected: 0x45474f,
     bg_status: 0x191a1d,
 
@@ -190,6 +196,8 @@ pub const LIGHT: Palette = Palette {
     bg_bar: 0xf6f7f9,
     bg_card: 0xf2f3f5,
     bg_hover: 0xe6e9ee,
+    // 浅色下同理：划过只比 bg_elev(0xeff1f4) 压深一点，选中才明显。
+    bg_row_hover: 0xe8eaee,
     bg_selected: 0xdadee6,
     bg_status: 0xdcdfe4,
 
@@ -319,11 +327,7 @@ fn shade(color: u32, factor: f32) -> u32 {
 
 /// 当前色板。
 pub fn palette() -> &'static Palette {
-    if is_light() {
-        &LIGHT
-    } else {
-        &DARK
-    }
+    if is_light() { &LIGHT } else { &DARK }
 }
 
 /// 给每个语义位生成一个取当前色板的读取函数——调用点写 `ui_theme::bg_rail()`。
@@ -345,6 +349,7 @@ slots!(
     bg_bar,
     bg_card,
     bg_hover,
+    bg_row_hover,
     bg_selected,
     bg_status,
     border_dim,

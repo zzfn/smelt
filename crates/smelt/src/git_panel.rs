@@ -9,20 +9,20 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
-use gpui::*;
-use gpui::prelude::FluentBuilder;
 use gpui::InteractiveElement;
+use gpui::prelude::FluentBuilder;
+use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
-use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
+use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::tag::Tag;
 use gpui_component::*;
 use notify::{RecursiveMode, Watcher};
 
-use crate::{agent, placeholder_view, terminal_view, Workspace};
+use crate::{Workspace, agent, placeholder_view, terminal_view};
 
 // ===================== 类型 =====================
 
@@ -349,7 +349,11 @@ fn hunk_context(line: &str) -> &str {
 /// 统一视图有旧/新两列，写死 44px 就是白占 88px——大多数文件行号只有两三位，
 /// 代码被硬生生推到右边去。等宽字体下一个数字约 7.5px，左右各留 4px 内边距。
 pub(crate) fn gutter_width(lines: &[DiffLine]) -> f32 {
-    let max = lines.iter().filter_map(|l| l.new_ln.max(l.old_ln)).max().unwrap_or(0);
+    let max = lines
+        .iter()
+        .filter_map(|l| l.new_ln.max(l.old_ln))
+        .max()
+        .unwrap_or(0);
     // 至少留两位，免得开头几行的窄 gutter 和后面宽的对不齐（宽度是整份 diff 统一的，
     // 这里只是给极短文件一个下限）。
     let digits = max.to_string().len().max(2);
@@ -405,7 +409,11 @@ fn hunk_patch(header: &str, hunk: &DiffHunk) -> String {
 /// fallback 兜底，不让用户看见空字符串报错。
 fn git_err(out: &std::process::Output, fallback: &str) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if stderr.is_empty() { fallback.to_string() } else { stderr }
+    if stderr.is_empty() {
+        fallback.to_string()
+    } else {
+        stderr
+    }
 }
 
 /// Git 视图「AI 生成」commit message 的数据来源：优先 `git diff --staged`（已 add
@@ -424,7 +432,12 @@ fn collect_commit_diff(root: &str) -> Option<String> {
     let diff = diff.or_else(|| run(&["diff"]).filter(|d| !d.trim().is_empty()))?;
     const MAX_LEN: usize = 8000;
     if diff.len() > MAX_LEN {
-        let cut = diff.char_indices().map(|(i, _)| i).take_while(|&i| i <= MAX_LEN).last().unwrap_or(0);
+        let cut = diff
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= MAX_LEN)
+            .last()
+            .unwrap_or(0);
         Some(format!("{}\n…（diff 过长，已截断）", &diff[..cut]))
     } else {
         Some(diff)
@@ -452,7 +465,12 @@ fn remove_worktree(main_root: &str, path: &str, force: bool) -> Result<(), Strin
 /// 没配上游分支时（新分支第一次推最常见）plain push 会失败，退到显式
 /// `push -u origin <branch>`——跟 create_worktree／checkout_branch 判断分支存不存在
 /// 同一个"先试常规操作、不行再退到兜底方案"的路子。
-fn commit_and_maybe_push(root: &str, message: &str, push: bool, branch: &str) -> Result<(), String> {
+fn commit_and_maybe_push(
+    root: &str,
+    message: &str,
+    push: bool,
+    branch: &str,
+) -> Result<(), String> {
     let commit = run_git(root, &["commit", "-m", message]).map_err(|e| e.to_string())?;
     if !commit.status.success() {
         let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
@@ -569,40 +587,52 @@ fn git_ops_menu_items(
 ) -> gpui_component::menu::PopupMenu {
     {
         let ws = ws.clone();
-        menu = menu.item(PopupMenuItem::new("获取").on_click(move |_ev, _window, cx| {
-            ws.update(cx, |w, cx| w.git_fetch(cx));
-        }));
+        menu = menu.item(
+            PopupMenuItem::new("获取").on_click(move |_ev, _window, cx| {
+                ws.update(cx, |w, cx| w.git_fetch(cx));
+            }),
+        );
     }
     {
         let ws = ws.clone();
-        let label = if behind > 0 { format!("拉取 ↓{behind}") } else { "拉取".to_string() };
+        let label = if behind > 0 {
+            format!("拉取 ↓{behind}")
+        } else {
+            "拉取".to_string()
+        };
         menu = menu.item(PopupMenuItem::new(label).on_click(move |_ev, _window, cx| {
             ws.update(cx, |w, cx| w.git_pull(cx));
         }));
     }
     if has_changes {
         let ws = ws.clone();
-        menu = menu.separator().item(PopupMenuItem::new("暂存改动").on_click(
-            move |_ev, _window, cx| {
-                ws.update(cx, |w, cx| w.git_stash_push(cx));
-            },
-        ));
+        menu = menu
+            .separator()
+            .item(
+                PopupMenuItem::new("暂存改动").on_click(move |_ev, _window, cx| {
+                    ws.update(cx, |w, cx| w.git_stash_push(cx));
+                }),
+            );
     }
     if stash_n > 0 {
         let ws = ws.clone();
-        menu = menu.item(PopupMenuItem::new(format!("恢复暂存 ({stash_n})")).on_click(
-            move |_ev, _window, cx| {
-                ws.update(cx, |w, cx| w.git_stash_pop(cx));
-            },
-        ));
+        menu = menu.item(
+            PopupMenuItem::new(format!("恢复暂存 ({stash_n})")).on_click(
+                move |_ev, _window, cx| {
+                    ws.update(cx, |w, cx| w.git_stash_pop(cx));
+                },
+            ),
+        );
     }
     if has_changes {
         let ws = ws.clone();
-        menu = menu.separator().item(PopupMenuItem::new("丢弃全部改动").on_click(
-            move |_ev, _window, cx| {
-                ws.update(cx, |w, cx| w.start_discard_all(root.clone(), cx));
-            },
-        ));
+        menu = menu
+            .separator()
+            .item(
+                PopupMenuItem::new("丢弃全部改动").on_click(move |_ev, _window, cx| {
+                    ws.update(cx, |w, cx| w.start_discard_all(root.clone(), cx));
+                }),
+            );
     }
     menu
 }
@@ -612,15 +642,20 @@ fn stash_count(root: &str) -> u32 {
     run_git(root, &["stash", "list"])
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| !l.is_empty()).count() as u32)
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count() as u32
+        })
         .unwrap_or(0)
 }
 
 /// 丢弃工作区**全部**改动：已跟踪的还原成 HEAD（暂存 + 工作区一起），未跟踪的删掉。
 /// 危险且不进 reflog，调用方必须先弹确认。
 fn discard_all(root: &str) -> Result<(), String> {
-    let restore = run_git(root, &["restore", "--staged", "--worktree", "."])
-        .map_err(|e| e.to_string())?;
+    let restore =
+        run_git(root, &["restore", "--staged", "--worktree", "."]).map_err(|e| e.to_string())?;
     if !restore.status.success() {
         return Err(git_err(&restore, "git restore 失败"));
     }
@@ -661,7 +696,11 @@ fn parse_branch_status_line(b: &str) -> (String, Option<String>, u32, u32) {
 /// common-dir（形如 `/path/to/repo/.git`）反推主仓库目录名，纯展示用（worktree 分组
 /// 标签「仓库名 · 分支名」的前半截）。
 pub fn repo_label_from_common_dir(common_dir: &str) -> Option<String> {
-    Path::new(common_dir).parent()?.file_name()?.to_str().map(String::from)
+    Path::new(common_dir)
+        .parent()?
+        .file_name()?
+        .to_str()
+        .map(String::from)
 }
 
 /// common-dir 反推主仓库根目录的完整路径——`git worktree remove` 不能从待删的
@@ -771,7 +810,11 @@ pub(crate) fn parse_diff(text: &str) -> ParsedDiff {
         }
     }
     mark_inline(&mut out);
-    ParsedDiff { lines: out, header, hunks }
+    ParsedDiff {
+        lines: out,
+        header,
+        hunks,
+    }
 }
 
 /// 后处理：对每组「连续删行紧跟连续增行」按顺序逐行配对，做字符级 inline diff，
@@ -841,9 +884,17 @@ fn parse_hunk(line: &str) -> (u32, u32) {
     let (mut old, mut new) = (0u32, 0u32);
     for tok in line.split_whitespace() {
         if let Some(s) = tok.strip_prefix('-') {
-            old = s.split(',').next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            old = s
+                .split(',')
+                .next()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(0);
         } else if let Some(s) = tok.strip_prefix('+') {
-            new = s.split(',').next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            new = s
+                .split(',')
+                .next()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(0);
         }
     }
     (old, new)
@@ -870,7 +921,12 @@ pub(crate) fn diff_colors(kind: DiffKind) -> (Rgba, Option<Rgba>, Option<Rgba>, 
             rgb(t::diff_del_hl()),
         ),
         DiffKind::Context => (rgb(t::diff_ctx_fg()), None, None, rgb(0)),
-        DiffKind::Hunk => (rgb(t::diff_hunk_fg()), Some(rgb(t::diff_hunk_bg())), None, rgb(0)),
+        DiffKind::Hunk => (
+            rgb(t::diff_hunk_fg()),
+            Some(rgb(t::diff_hunk_bg())),
+            None,
+            rgb(0),
+        ),
         DiffKind::Meta => (rgb(t::diff_meta_fg()), None, None, rgb(0)),
     }
 }
@@ -878,21 +934,28 @@ pub(crate) fn diff_colors(kind: DiffKind) -> (Rgba, Option<Rgba>, Option<Rgba>, 
 /// 文本区（flex_1）：有 segments 就拆成多段（变化段上深底），否则整行一段。
 pub(crate) fn diff_text_area(l: &DiffLine, fg: Rgba, hl: Rgba) -> Div {
     match &l.segments {
-        Some(segs) => div().flex_1().px_2().text_color(fg).flex().children(segs.iter().map(
-            |(s, changed)| {
+        Some(segs) => div()
+            .flex_1()
+            .px_2()
+            .text_color(fg)
+            .flex()
+            .children(segs.iter().map(|(s, changed)| {
                 let span = div().child(s.clone());
                 if *changed {
                     span.bg(hl).rounded_sm()
                 } else {
                     span
                 }
-            },
-        )),
+            })),
         None => div()
             .flex_1()
             .px_2()
             .text_color(fg)
-            .child(if l.text.is_empty() { "\u{00a0}".to_string() } else { l.text.clone() }),
+            .child(if l.text.is_empty() {
+                "\u{00a0}".to_string()
+            } else {
+                l.text.clone()
+            }),
     }
 }
 
@@ -961,12 +1024,14 @@ fn hunk_buttons(idx: usize, ctx: &HunkCtx, ws: &Entity<Workspace>) -> Div {
         }
         HunkOps::Unstage => {
             let (ws_un, root_un) = (ws.clone(), ctx.root.clone());
-            bar.child(btn("取消暂存块", "hunk-unstage", 0x7dcfff, 0xa9dcff).on_click(
-                move |_ev, _w, cx| {
-                    let root = root_un.clone();
-                    ws_un.update(cx, |this, cx| this.unstage_hunk(root, idx, cx));
-                },
-            ))
+            bar.child(
+                btn("取消暂存块", "hunk-unstage", 0x7dcfff, 0xa9dcff).on_click(
+                    move |_ev, _w, cx| {
+                        let root = root_un.clone();
+                        ws_un.update(cx, |this, cx| this.unstage_hunk(root, idx, cx));
+                    },
+                ),
+            )
         }
     }
 }
@@ -1016,7 +1081,9 @@ fn render_diff_line(
     let hunk_idx = hunks.idx_at(i);
     // F7 停在这块就描一道边，跳完才看得出落点。
     if hunk_idx.is_some() && hunk_idx == hunks.active {
-        row = row.border_1().border_color(rgb(crate::ui_theme::diff_hunk_fg()));
+        row = row
+            .border_1()
+            .border_color(rgb(crate::ui_theme::diff_hunk_fg()));
     }
     // hunk 头行才需要 hover 分组（按钮藏在里面）。
     if hunk_idx.is_some() {
@@ -1053,7 +1120,11 @@ pub(crate) fn render_readonly_diff_line(l: &DiffLine, gw: f32) -> Div {
             .text_color(rgb(crate::ui_theme::text_faint()))
             .child(n.map(|v| v.to_string()).unwrap_or_default())
     };
-    let mut row = div().flex().items_center().h(px(FILE_LINE_H)).whitespace_nowrap();
+    let mut row = div()
+        .flex()
+        .items_center()
+        .h(px(FILE_LINE_H))
+        .whitespace_nowrap();
     if let Some(b) = bg {
         row = row.bg(b);
     }
@@ -1198,7 +1269,9 @@ fn render_split_row(
             // hunk 头在并排视图里也是整行，同样挂按钮；文本占满剩余宽度把按钮推到右边。
             let hunk_idx = hunks.idx_at(*i);
             if hunk_idx.is_some() && hunk_idx == hunks.active {
-                d = d.border_1().border_color(rgb(crate::ui_theme::diff_hunk_fg()));
+                d = d
+                    .border_1()
+                    .border_color(rgb(crate::ui_theme::diff_hunk_fg()));
             }
             if hunk_idx.is_some() {
                 d = d.group(HUNK_ROW_GROUP);
@@ -1218,7 +1291,12 @@ fn render_split_row(
             .w_full()
             .whitespace_nowrap()
             .child(render_half(ri, *l, true, lines, selected, ws, gw))
-            .child(div().w(px(1.)).h_full().bg(rgb(crate::ui_theme::diff_gutter()))) // 中缝分隔
+            .child(
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .bg(rgb(crate::ui_theme::diff_gutter())),
+            ) // 中缝分隔
             .child(render_half(ri, *r, false, lines, selected, ws, gw)),
     }
 }
@@ -1244,7 +1322,12 @@ fn git_diff_pane(
     match git_diff {
         None => placeholder_view("← 选择改动文件查看 diff", muted),
         Some(d) => {
-            let name = d.path.rsplit('/').next().unwrap_or(d.path.as_str()).to_string();
+            let name = d
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(d.path.as_str())
+                .to_string();
             let lines = d.lines.clone();
             let ws = cx.entity();
             // 行号列宽按整份 diff 的最大行号算一次，所有行共用同一个值才对得齐。
@@ -1253,7 +1336,11 @@ fn git_diff_pane(
                 root: root.to_string(),
                 ops: d.hunk_ops(),
                 starts: Rc::new(
-                    d.hunks.iter().enumerate().map(|(n, h)| (h.range.start, n)).collect(),
+                    d.hunks
+                        .iter()
+                        .enumerate()
+                        .map(|(n, h)| (h.range.start, n))
+                        .collect(),
                 ),
                 active: active_hunk,
             };
@@ -1297,7 +1384,9 @@ fn git_diff_pane(
                 let hc = hunk_ctx.clone();
                 uniform_list("git-diff", count, move |range, _w, _cx| {
                     range
-                        .map(|i| render_diff_line(i, &lines[i], sel2.contains(&i), &ws2, &hc, gutter_w))
+                        .map(|i| {
+                            render_diff_line(i, &lines[i], sel2.contains(&i), &ws2, &hc, gutter_w)
+                        })
                         .collect::<Vec<_>>()
                 })
             }
@@ -1330,25 +1419,27 @@ fn git_diff_pane(
             // 给什么按钮。分开看才谈得上「取消暂存这一块」——混着看时索引和工作区
             // 的差异叠在一起，按块操作对不上号。
             let scope_switch = h_flex().gap_1().children(
-                [DiffScope::All, DiffScope::Staged, DiffScope::Unstaged].into_iter().map(|s| {
-                    let on = s == scope;
-                    div()
-                        .id(match s {
-                            DiffScope::All => "diff-scope-all",
-                            DiffScope::Staged => "diff-scope-staged",
-                            DiffScope::Unstaged => "diff-scope-unstaged",
-                        })
-                        .px_2()
-                        .py(px(1.0))
-                        .text_xs()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_color(if on { fg } else { muted })
-                        .when(on, |d| d.bg(accent))
-                        .hover(|d| d.opacity(0.8))
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_diff_scope(s, cx)))
-                        .child(s.label())
-                }),
+                [DiffScope::All, DiffScope::Staged, DiffScope::Unstaged]
+                    .into_iter()
+                    .map(|s| {
+                        let on = s == scope;
+                        div()
+                            .id(match s {
+                                DiffScope::All => "diff-scope-all",
+                                DiffScope::Staged => "diff-scope-staged",
+                                DiffScope::Unstaged => "diff-scope-unstaged",
+                            })
+                            .px_2()
+                            .py(px(1.0))
+                            .text_xs()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(if on { fg } else { muted })
+                            .when(on, |d| d.bg(accent))
+                            .hover(|d| d.opacity(0.8))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_diff_scope(s, cx)))
+                            .child(s.label())
+                    }),
             );
 
             div()
@@ -1402,8 +1493,11 @@ fn diff_comment_bar(
     };
     let n = selected.len();
     let can_send = n > 0;
-    let hint =
-        if n == 0 { "点选中改动行（+/-），可选写评论，发给当前终端".to_string() } else { format!("已选 {n} 行") };
+    let hint = if n == 0 {
+        "点选中改动行（+/-），可选写评论，发给当前终端".to_string()
+    } else {
+        format!("已选 {n} 行")
+    };
     let ws = cx.entity();
 
     div()
@@ -1467,7 +1561,11 @@ fn commit_message_bar(
                     .cursor_pointer()
                     .text_color(muted)
                     .hover(|s| s.text_color(fg))
-                    .child(if generating { "生成中…" } else { "✨ AI 生成" })
+                    .child(if generating {
+                        "生成中…"
+                    } else {
+                        "✨ AI 生成"
+                    })
                     .on_click(move |_ev, window, cx| {
                         ws_gen.update(cx, |this, cx| this.generate_commit_message(window, cx));
                     }),
@@ -1577,156 +1675,185 @@ pub fn git_view(
             .flex()
             .flex_col()
             .p_1()
-            .children(build_git_tree(&files, tree_collapsed).into_iter().enumerate().map(|(i, row)| {
-                // 每层缩进 14px，与文件树页同一套视觉节奏。
-                let indent = px(4.0 + row.depth as f32 * 14.0);
-                let path = row.path;
-                // 目录行：只负责折叠，没有状态码也没有勾选框。
-                let Some(st) = row.status else {
-                    let collapsed = tree_collapsed.contains(&path);
-                    let p_toggle = path.clone();
-                    return div()
-                        .id(("git-dir", i))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .pl(indent)
-                        .pr_2()
-                        .py(px(1.0))
-                        .text_sm()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(accent))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.git_tree_collapsed.remove(&p_toggle) {
-                                this.git_tree_collapsed.insert(p_toggle.clone());
-                            }
-                            cx.notify();
-                        }))
-                        .child(
-                            Icon::new(if collapsed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .size_4()
-                            .text_color(muted),
-                        )
-                        .child(div().min_w_0().text_color(muted).child(row.name))
-                        // 目录行和文件行（挂了 context_menu，类型不同）要统一成
-                        // AnyElement 才能进同一个 children 迭代器。
-                        .into_any_element();
-                };
-                let st_trim = st.trim();
-                // 状态标记用 Tag 彩色胶囊：新增=绿 删除=红 修改=黄 未跟踪=灰 其余=蓝。
-                let label = if st_trim.is_empty() {
-                    "•".to_string()
-                } else {
-                    st_trim.to_string()
-                };
-                let status_tag = if st_trim.contains('?') {
-                    Tag::secondary()
-                } else if st_trim.contains('A') {
-                    Tag::success()
-                } else if st_trim.contains('D') {
-                    Tag::danger()
-                } else if st_trim.contains('M') {
-                    Tag::warning()
-                } else {
-                    Tag::info()
-                }
-                .small()
-                .child(label);
-                let untracked = st.contains('?');
-                let is_sel = selected.as_deref() == Some(path.as_str());
-                let (r, p) = (root.clone(), path.clone());
-                let name = row.name;
-                // 暂存勾选框：索引状态（porcelain 第一位）不是空格/`?` 就算已暂存
-                // （`??` 是 untracked，两位都不算暂存；`MM` 这种"暂存过又改"第一位
-                // 仍是暂存态，勾着）。纯本地索引操作，直接执行不用发终端确认。
-                let staged = st.as_bytes().first().is_some_and(|&b| b != b' ' && b != b'?');
-                let ws_stage = cx.entity();
-                let (r_stage, p_stage) = (root.clone(), path.clone());
-                let stage_checkbox = Checkbox::new(("git-stage", i))
-                    .checked(staged)
-                    .on_click(move |checked, _window, cx| {
-                        cx.stop_propagation();
-                        let checked = *checked;
-                        let root = r_stage.clone();
-                        let path = p_stage.clone();
-                        ws_stage.update(cx, |wsx, cx| {
-                            if checked {
-                                wsx.stage_file(root, path, cx);
-                            } else {
-                                wsx.unstage_file(root, path, cx);
-                            }
-                        });
-                    });
-                let row = div()
-                    .id(("git", i))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pl(indent)
-                    .pr_2()
-                    .py(px(1.0))
-                    .text_sm()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(accent))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_diff(r.clone(), p.clone(), untracked, cx)
-                    }))
-                    .child(stage_checkbox)
-                    .child(status_tag)
-                    // 只显示文件名——路径已经由树的层级表达了。整条路径挂 tooltip，
-                    // 免得同名文件（一堆 mod.rs）分不清。tooltip 需要元素带 id。
-                    .child(
-                        div()
-                            .id(("git-name", i))
-                            .min_w_0()
-                            .truncate()
-                            .text_color(fg)
-                            .child(name)
-                            .tooltip({
-                                let full = path.clone();
-                                move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(full.clone())
-                                        .build(window, cx)
-                                }
-                            }),
-                    );
-                // 右键菜单：丢弃改动 / 复制路径 / 在 Finder 中显示。此前 git 页完全
-                // 没有右键入口，「丢弃这个文件的改动」这种最常用的操作根本没地方点。
-                let ws_menu = cx.entity();
-                let full_path = Path::new(&root).join(&path).to_string_lossy().to_string();
-                let (root_menu, path_menu) = (root.clone(), path.clone());
-                // 选中高亮要在挂菜单之前上色：context_menu 会把元素包一层，之后
-                // 就不能再改样式了。
-                let row = if is_sel { row.bg(accent) } else { row };
-                row.context_menu(move |menu, _window, _cx| {
-                    let (ws_d, r_d, p_d) = (ws_menu.clone(), root_menu.clone(), path_menu.clone());
-                    let (ws_c, p_c) = (ws_menu.clone(), full_path.clone());
-                    let (ws_f, p_f) = (ws_menu.clone(), full_path.clone());
-                    menu.item(
-                        PopupMenuItem::new(if untracked { "删除文件" } else { "丢弃改动" }).on_click(
-                            move |_ev, _window, cx| {
-                                ws_d.update(cx, |ws, cx| {
-                                    ws.start_discard_file(r_d.clone(), p_d.clone(), untracked, cx)
+            .children(
+                build_git_tree(&files, tree_collapsed)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        // 每层缩进 14px，与文件树页同一套视觉节奏。
+                        let indent = px(4.0 + row.depth as f32 * 14.0);
+                        let path = row.path;
+                        // 目录行：只负责折叠，没有状态码也没有勾选框。
+                        let Some(st) = row.status else {
+                            let collapsed = tree_collapsed.contains(&path);
+                            let p_toggle = path.clone();
+                            return div()
+                                .id(("git-dir", i))
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .pl(indent)
+                                .pr_2()
+                                .py(px(1.0))
+                                .text_sm()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(accent))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.git_tree_collapsed.remove(&p_toggle) {
+                                        this.git_tree_collapsed.insert(p_toggle.clone());
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(
+                                    Icon::new(if collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .size_4()
+                                    .text_color(muted),
+                                )
+                                .child(div().min_w_0().text_color(muted).child(row.name))
+                                // 目录行和文件行（挂了 context_menu，类型不同）要统一成
+                                // AnyElement 才能进同一个 children 迭代器。
+                                .into_any_element();
+                        };
+                        let st_trim = st.trim();
+                        // 状态标记用 Tag 彩色胶囊：新增=绿 删除=红 修改=黄 未跟踪=灰 其余=蓝。
+                        let label = if st_trim.is_empty() {
+                            "•".to_string()
+                        } else {
+                            st_trim.to_string()
+                        };
+                        let status_tag = if st_trim.contains('?') {
+                            Tag::secondary()
+                        } else if st_trim.contains('A') {
+                            Tag::success()
+                        } else if st_trim.contains('D') {
+                            Tag::danger()
+                        } else if st_trim.contains('M') {
+                            Tag::warning()
+                        } else {
+                            Tag::info()
+                        }
+                        .small()
+                        .child(label);
+                        let untracked = st.contains('?');
+                        let is_sel = selected.as_deref() == Some(path.as_str());
+                        let (r, p) = (root.clone(), path.clone());
+                        let name = row.name;
+                        // 暂存勾选框：索引状态（porcelain 第一位）不是空格/`?` 就算已暂存
+                        // （`??` 是 untracked，两位都不算暂存；`MM` 这种"暂存过又改"第一位
+                        // 仍是暂存态，勾着）。纯本地索引操作，直接执行不用发终端确认。
+                        let staged = st
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|&b| b != b' ' && b != b'?');
+                        let ws_stage = cx.entity();
+                        let (r_stage, p_stage) = (root.clone(), path.clone());
+                        let stage_checkbox = Checkbox::new(("git-stage", i))
+                            .checked(staged)
+                            .on_click(move |checked, _window, cx| {
+                                cx.stop_propagation();
+                                let checked = *checked;
+                                let root = r_stage.clone();
+                                let path = p_stage.clone();
+                                ws_stage.update(cx, |wsx, cx| {
+                                    if checked {
+                                        wsx.stage_file(root, path, cx);
+                                    } else {
+                                        wsx.unstage_file(root, path, cx);
+                                    }
                                 });
-                            },
-                        ),
-                    )
-                    .separator()
-                    .item(PopupMenuItem::new("复制文件路径").on_click(move |_ev, _window, cx| {
-                        ws_c.update(cx, |ws, cx| ws.copy_file_path_to_clipboard(p_c.clone(), cx));
-                    }))
-                    .item(PopupMenuItem::new("在 Finder 中显示").on_click(move |_ev, _window, cx| {
-                        ws_f.update(cx, |ws, cx| ws.reveal_path_in_finder(p_f.clone(), cx));
-                    }))
-                })
-                .into_any_element()
-            }))
+                            });
+                        let row = div()
+                            .id(("git", i))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .pl(indent)
+                            .pr_2()
+                            .py(px(1.0))
+                            .text_sm()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(accent))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_diff(r.clone(), p.clone(), untracked, cx)
+                            }))
+                            .child(stage_checkbox)
+                            .child(status_tag)
+                            // 只显示文件名——路径已经由树的层级表达了。整条路径挂 tooltip，
+                            // 免得同名文件（一堆 mod.rs）分不清。tooltip 需要元素带 id。
+                            .child(
+                                div()
+                                    .id(("git-name", i))
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(fg)
+                                    .child(name)
+                                    .tooltip({
+                                        let full = path.clone();
+                                        move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(full.clone())
+                                                .build(window, cx)
+                                        }
+                                    }),
+                            );
+                        // 右键菜单：丢弃改动 / 复制路径 / 在 Finder 中显示。此前 git 页完全
+                        // 没有右键入口，「丢弃这个文件的改动」这种最常用的操作根本没地方点。
+                        let ws_menu = cx.entity();
+                        let full_path = Path::new(&root).join(&path).to_string_lossy().to_string();
+                        let (root_menu, path_menu) = (root.clone(), path.clone());
+                        // 选中高亮要在挂菜单之前上色：context_menu 会把元素包一层，之后
+                        // 就不能再改样式了。
+                        let row = if is_sel { row.bg(accent) } else { row };
+                        row.context_menu(move |menu, _window, _cx| {
+                            let (ws_d, r_d, p_d) =
+                                (ws_menu.clone(), root_menu.clone(), path_menu.clone());
+                            let (ws_c, p_c) = (ws_menu.clone(), full_path.clone());
+                            let (ws_f, p_f) = (ws_menu.clone(), full_path.clone());
+                            menu.item(
+                                PopupMenuItem::new(if untracked {
+                                    "删除文件"
+                                } else {
+                                    "丢弃改动"
+                                })
+                                .on_click(
+                                    move |_ev, _window, cx| {
+                                        ws_d.update(cx, |ws, cx| {
+                                            ws.start_discard_file(
+                                                r_d.clone(),
+                                                p_d.clone(),
+                                                untracked,
+                                                cx,
+                                            )
+                                        });
+                                    },
+                                ),
+                            )
+                            .separator()
+                            .item(PopupMenuItem::new("复制文件路径").on_click(
+                                move |_ev, _window, cx| {
+                                    ws_c.update(cx, |ws, cx| {
+                                        ws.copy_file_path_to_clipboard(p_c.clone(), cx)
+                                    });
+                                },
+                            ))
+                            .item(
+                                PopupMenuItem::new("在 Finder 中显示").on_click(
+                                    move |_ev, _window, cx| {
+                                        ws_f.update(cx, |ws, cx| {
+                                            ws.reveal_path_in_finder(p_f.clone(), cx)
+                                        });
+                                    },
+                                ),
+                            )
+                        })
+                        .into_any_element()
+                    }),
+            )
             .into_any_element()
     };
 
@@ -1746,68 +1873,65 @@ pub fn git_view(
         let behind = data.behind;
         let stash_n = data.stash_count;
         let has_changes = !data.files.is_empty();
-        div()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(border)
-            .child(
-                Button::new("branch-switch")
-                    .ghost()
-                    .small()
-                    .label(format!("⎇ {branch}{ahead_behind}"))
-                    .dropdown_menu(move |menu, _window, _cx| {
-                        // ---- 远端同步 + 本地救场（分支列表之前）----
-                        let mut menu = git_ops_menu_items(
-                            menu,
-                            ws.clone(),
-                            root_for_menu.clone(),
-                            behind,
-                            stash_n,
-                            has_changes,
-                        )
-                        .separator();
-                        // ---- 分支切换 ----
-                        if local.is_empty() && remote.is_empty() {
-                            menu = menu.item(PopupMenuItem::new("（没有其他分支）"));
-                        }
-                        for name in &local {
-                            let item = PopupMenuItem::new(name.clone());
-                            menu = menu.item(if *name == current {
-                                item.icon(IconName::Check)
-                            } else {
-                                let ws = ws.clone();
-                                let root = root_for_menu.clone();
-                                let target = name.clone();
-                                item.on_click(move |_ev, _window, cx| {
+        div().px_3().py_2().border_b_1().border_color(border).child(
+            Button::new("branch-switch")
+                .ghost()
+                .small()
+                .label(format!("⎇ {branch}{ahead_behind}"))
+                .dropdown_menu(move |menu, _window, _cx| {
+                    // ---- 远端同步 + 本地救场（分支列表之前）----
+                    let mut menu = git_ops_menu_items(
+                        menu,
+                        ws.clone(),
+                        root_for_menu.clone(),
+                        behind,
+                        stash_n,
+                        has_changes,
+                    )
+                    .separator();
+                    // ---- 分支切换 ----
+                    if local.is_empty() && remote.is_empty() {
+                        menu = menu.item(PopupMenuItem::new("（没有其他分支）"));
+                    }
+                    for name in &local {
+                        let item = PopupMenuItem::new(name.clone());
+                        menu = menu.item(if *name == current {
+                            item.icon(IconName::Check)
+                        } else {
+                            let ws = ws.clone();
+                            let root = root_for_menu.clone();
+                            let target = name.clone();
+                            item.on_click(move |_ev, _window, cx| {
+                                ws.update(cx, |wsx, cx| {
+                                    wsx.checkout_branch(root.clone(), target.clone(), cx)
+                                });
+                            })
+                        });
+                    }
+                    if !remote.is_empty() {
+                        menu = menu.separator();
+                        for name in &remote {
+                            let ws = ws.clone();
+                            let root = root_for_menu.clone();
+                            // 远程分支切换用短名（去掉 `<remote>/` 前缀），走 git 内建
+                            // DWIM 自动建好跟踪分支——直接传 `origin/xxx` 全名会变成
+                            // detached HEAD，不是我们想要的（同 create_worktree 的判断）。
+                            let short = name
+                                .split_once('/')
+                                .map(|(_, s)| s.to_string())
+                                .unwrap_or_else(|| name.clone());
+                            menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
+                                move |_ev, _window, cx| {
                                     ws.update(cx, |wsx, cx| {
-                                        wsx.checkout_branch(root.clone(), target.clone(), cx)
+                                        wsx.checkout_branch(root.clone(), short.clone(), cx)
                                     });
-                                })
-                            });
+                                },
+                            ));
                         }
-                        if !remote.is_empty() {
-                            menu = menu.separator();
-                            for name in &remote {
-                                let ws = ws.clone();
-                                let root = root_for_menu.clone();
-                                // 远程分支切换用短名（去掉 `<remote>/` 前缀），走 git 内建
-                                // DWIM 自动建好跟踪分支——直接传 `origin/xxx` 全名会变成
-                                // detached HEAD，不是我们想要的（同 create_worktree 的判断）。
-                                let short =
-                                    name.split_once('/').map(|(_, s)| s.to_string()).unwrap_or_else(|| name.clone());
-                                menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
-                                    move |_ev, _window, cx| {
-                                        ws.update(cx, |wsx, cx| {
-                                            wsx.checkout_branch(root.clone(), short.clone(), cx)
-                                        });
-                                    },
-                                ));
-                            }
-                        }
-                        menu
-                    }),
-            )
+                    }
+                    menu
+                }),
+        )
     };
 
     let left = div()
@@ -1819,37 +1943,43 @@ pub fn git_view(
         .border_color(border)
         .child(branch_header)
         .child(file_list)
-        .child(commit_message_bar(commit_msg_input, commit_msg_generating, data.ahead, pushing, cx));
+        .child(commit_message_bar(
+            commit_msg_input,
+            commit_msg_generating,
+            data.ahead,
+            pushing,
+            cx,
+        ));
 
     // 拖拽不生效时的诊断口子：`SMELT_DEBUG_RESIZE=1 /Applications/Smelt.app/Contents/MacOS/smelt`
     // 从终端起，每帧打一行当前 panel 尺寸。尺寸不随拖动变化 = 事件没进来；变化了
     // 但画面不动 = 布局把它盖掉了。两种病因完全不同，别靠肉眼猜。
     if std::env::var_os("SMELT_DEBUG_RESIZE").is_some() {
-        eprintln!("[resize] git-left sizes={:?}", git_left_resize.read(cx).sizes());
+        eprintln!(
+            "[resize] git-left sizes={:?}",
+            git_left_resize.read(cx).sizes()
+        );
     }
 
     // 左栏宽度可拖拽（同文件树那套，拖完落盘）。以前写死 300px，路径一长就只能
     // 看见结尾几个字符。
-    div()
-        .flex_1()
-        .min_h_0()
-        .flex()
-        .child(
-            h_resizable("git-left-split")
-                .with_state(git_left_resize)
-                .child(
-                    resizable_panel()
-                        .size(px(git_left_w))
-                        .size_range(px(200.)..px(560.))
-                        .child(left),
-                )
-                // 包一层 size_full 再放内容：diff 面板根节点带 flex_1，而 flex_1
-                // 展开含 `flex-basis: 0%`，直接当 panel 的 child 会盖掉 panel 由
-                // ResizableState 管理的 flex_basis——组件文档专门把 flex_basis 列为
-                // 「调用方不许碰」的保留样式。包一层就把 flex_1 挡在里面了。
-                // 这层必须是 .flex()：GPUI 的 div 默认 display: Block，flex_1 的
-                // 子节点在 Block 里高度塌成 auto（列表 0 高，整个 diff 不可见）。
-                .child(resizable_panel().child(div().size_full().flex().child(git_diff_pane(
+    div().flex_1().min_h_0().flex().child(
+        h_resizable("git-left-split")
+            .with_state(git_left_resize)
+            .child(
+                resizable_panel()
+                    .size(px(git_left_w))
+                    .size_range(px(200.)..px(560.))
+                    .child(left),
+            )
+            // 包一层 size_full 再放内容：diff 面板根节点带 flex_1，而 flex_1
+            // 展开含 `flex-basis: 0%`，直接当 panel 的 child 会盖掉 panel 由
+            // ResizableState 管理的 flex_basis——组件文档专门把 flex_basis 列为
+            // 「调用方不许碰」的保留样式。包一层就把 flex_1 挡在里面了。
+            // 这层必须是 .flex()：GPUI 的 div 默认 display: Block，flex_1 的
+            // 子节点在 Block 里高度塌成 auto（列表 0 高，整个 diff 不可见）。
+            .child(
+                resizable_panel().child(div().size_full().flex().child(git_diff_pane(
                     &root,
                     git_diff,
                     split,
@@ -1859,8 +1989,9 @@ pub fn git_view(
                     active_hunk,
                     scope,
                     cx,
-                )))),
-        )
+                ))),
+            ),
+    )
 }
 
 // ===================== Workspace 方法 =====================
@@ -1877,8 +2008,12 @@ impl Workspace {
         branch: String,
         cx: &mut Context<Self>,
     ) {
-        self.delete_worktree_target =
-            Some(DeleteWorktreeTarget { path: path.clone(), main_root, branch, dirty: None });
+        self.delete_worktree_target = Some(DeleteWorktreeTarget {
+            path: path.clone(),
+            main_root,
+            branch,
+            dirty: None,
+        });
         cx.notify();
         cx.spawn(async move |this, cx| {
             let p = path.clone();
@@ -1892,7 +2027,11 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // 弹窗期间用户可能已经取消/又点了别的 worktree，只在还是同一个目标时写回。
-                if this.delete_worktree_target.as_ref().is_some_and(|t| t.path == path) {
+                if this
+                    .delete_worktree_target
+                    .as_ref()
+                    .is_some_and(|t| t.path == path)
+                {
                     if let Some(t) = this.delete_worktree_target.as_mut() {
                         t.dirty = Some(dirty);
                     }
@@ -1907,7 +2046,9 @@ impl Workspace {
     /// （探测出有未提交改动就带 --force——用户已经在弹窗里看到红色警告并主动点了
     /// 确定）。失败写 background_error，交给 render 顶部弹通知。
     pub fn confirm_delete_worktree(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self.delete_worktree_target.take() else { return };
+        let Some(target) = self.delete_worktree_target.take() else {
+            return;
+        };
         cx.notify();
         self.close_sessions_under(&target.path, cx);
         let force = target.dirty.unwrap_or(false);
@@ -1940,7 +2081,9 @@ impl Workspace {
     pub fn render_delete_worktree_confirm(&self, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
         let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(true);
-        let Some(target) = self.delete_worktree_target.as_ref() else { return div() };
+        let Some(target) = self.delete_worktree_target.as_ref() else {
+            return div();
+        };
 
         let (body_text, warn) = match target.dirty {
             None => ("正在检查有没有未提交的改动…".to_string(), false),
@@ -1952,7 +2095,10 @@ impl Workspace {
                 true,
             ),
             Some(false) => (
-                format!("删除分支「{}」的这个 worktree，其下所有终端会话都会被关闭。", target.branch),
+                format!(
+                    "删除分支「{}」的这个 worktree，其下所有终端会话都会被关闭。",
+                    target.branch
+                ),
                 false,
             ),
         };
@@ -1960,7 +2106,13 @@ impl Workspace {
         let fg = cx.theme().foreground;
 
         let content = v_flex()
-            .child(div().font_bold().text_color(fg).text_lg().child("确定删除这个 Worktree 吗？"))
+            .child(
+                div()
+                    .font_bold()
+                    .text_color(fg)
+                    .text_lg()
+                    .child("确定删除这个 Worktree 吗？"),
+            )
             .child(
                 div()
                     .text_sm()
@@ -1983,16 +2135,20 @@ impl Workspace {
                     .child(
                         Self::modal_button_base(
                             "confirm-delete-worktree",
-                            if ready { "确定删除" } else { "检查中…" },
+                            if ready {
+                                "确定删除"
+                            } else {
+                                "检查中…"
+                            },
                             tint,
                             accent_text,
                         )
                         .when(ready, |el| {
-                            el.cursor_pointer().hover(move |s| s.bg(hover)).on_click(cx.listener(
-                                |this, _, _, cx| {
+                            el.cursor_pointer()
+                                .hover(move |s| s.bg(hover))
+                                .on_click(cx.listener(|this, _, _, cx| {
                                     this.confirm_delete_worktree(cx);
-                                },
-                            ))
+                                }))
                         }),
                     ),
             );
@@ -2022,7 +2178,9 @@ impl Workspace {
     /// 已跟踪走 `git restore --staged --worktree`（暂存区和工作区一起还原，省得
     /// 用户为「已 add 过」的文件再点一次）；未跟踪的 git 管不着，直接删盘。
     pub fn confirm_discard_file(&mut self, cx: &mut Context<Self>) {
-        let Some((root, path, untracked)) = self.discard_file_target.take() else { return };
+        let Some((root, path, untracked)) = self.discard_file_target.take() else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let (r, p) = (root.clone(), path.clone());
             let result = cx
@@ -2067,18 +2225,31 @@ impl Workspace {
             (t.foreground, t.muted_foreground)
         };
         let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(true);
-        let Some((_, path, untracked)) = self.discard_file_target.as_ref() else { return div() };
+        let Some((_, path, untracked)) = self.discard_file_target.as_ref() else {
+            return div();
+        };
         let untracked = *untracked;
         let (title, body) = if untracked {
-            ("确定删除这个新文件吗？", format!("{path} 从未被 git 跟踪过，删了就是彻底删除。"))
+            (
+                "确定删除这个新文件吗？",
+                format!("{path} 从未被 git 跟踪过，删了就是彻底删除。"),
+            )
         } else {
-            ("确定丢弃这个文件的改动吗？", format!("{path} 会被还原成 HEAD 的样子，已暂存的部分一并还原。"))
+            (
+                "确定丢弃这个文件的改动吗？",
+                format!("{path} 会被还原成 HEAD 的样子，已暂存的部分一并还原。"),
+            )
         };
 
         let content = v_flex()
             .child(div().font_bold().text_color(fg).text_lg().child(title))
             .child(div().text_sm().text_color(muted).child(body))
-            .child(div().text_sm().text_color(accent_text).child("不进 reflog，找不回来。"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(accent_text)
+                    .child("不进 reflog，找不回来。"),
+            )
             .child(
                 h_flex()
                     .justify_end()
@@ -2094,7 +2265,11 @@ impl Workspace {
                     ))
                     .child(Self::modal_button(
                         "confirm-discard-file",
-                        if untracked { "删除文件" } else { "丢弃改动" },
+                        if untracked {
+                            "删除文件"
+                        } else {
+                            "丢弃改动"
+                        },
                         tint,
                         hover,
                         accent_text,
@@ -2109,7 +2284,9 @@ impl Workspace {
     ///
     /// 首次按跳第一块；到头就停在两端，不回绕——回绕会让人以为还有更多改动。
     pub fn jump_hunk(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(d) = self.git_diff.as_ref() else { return };
+        let Some(d) = self.git_diff.as_ref() else {
+            return;
+        };
         let n = d.hunks.len();
         if n == 0 {
             return;
@@ -2131,7 +2308,8 @@ impl Workspace {
             line
         };
         self.active_hunk = Some(next);
-        self.diff_scroll.scroll_to_item(item, gpui::ScrollStrategy::Top);
+        self.diff_scroll
+            .scroll_to_item(item, gpui::ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -2143,7 +2321,9 @@ impl Workspace {
 
     /// 确认丢弃：关弹窗并真正执行 reverse apply。
     pub fn confirm_discard_hunk(&mut self, cx: &mut Context<Self>) {
-        let Some((root, idx)) = self.discard_hunk_target.take() else { return };
+        let Some((root, idx)) = self.discard_hunk_target.take() else {
+            return;
+        };
         self.discard_hunk(root, idx, cx);
     }
 
@@ -2161,11 +2341,23 @@ impl Workspace {
             (t.foreground, t.muted_foreground)
         };
         let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(true);
-        let Some((_, idx)) = self.discard_hunk_target.as_ref() else { return div() };
-        let file = self.git_diff.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+        let Some((_, idx)) = self.discard_hunk_target.as_ref() else {
+            return div();
+        };
+        let file = self
+            .git_diff
+            .as_ref()
+            .map(|d| d.path.clone())
+            .unwrap_or_default();
 
         let content = v_flex()
-            .child(div().font_bold().text_color(fg).text_lg().child("确定丢弃这一块改动吗？"))
+            .child(
+                div()
+                    .font_bold()
+                    .text_color(fg)
+                    .text_lg()
+                    .child("确定丢弃这一块改动吗？"),
+            )
             .child(div().text_sm().text_color(muted).child(format!(
                 "{file} 的第 {} 块改动会被还原成改动前的样子。",
                 idx + 1
@@ -2225,7 +2417,10 @@ impl Workspace {
             }
         });
         let Ok(mut watcher) = watcher else { return };
-        if watcher.watch(Path::new(&root), RecursiveMode::Recursive).is_err() {
+        if watcher
+            .watch(Path::new(&root), RecursiveMode::Recursive)
+            .is_err()
+        {
             return;
         }
         self.git_watchers.insert(root.clone(), watcher);
@@ -2234,22 +2429,24 @@ impl Workspace {
         self.ensure_git_status(root.clone(), cx);
 
         let dirty = self.git_dirty.clone();
-        cx.spawn(async move |this, cx| loop {
-            smol::Timer::after(std::time::Duration::from_millis(250)).await;
-            let hit = dirty.lock().is_ok_and(|mut set| set.remove(&root));
-            if !hit {
-                continue;
-            }
-            // 文件变了：标脏并主动重拉 git_status，角标 / Git 页在任何页面都即时刷新，
-            // 不再依赖「当前正停在 Files/Git 页、render 每帧才调 ensure_git_status」。
-            // ensure_git_status 内部有 inflight 去重，重复唤醒不会叠并发。
-            let r = this.update(cx, |this, cx| {
-                this.invalidate_git_status(&root);
-                this.ensure_git_status(root.clone(), cx);
-                cx.notify();
-            });
-            if r.is_err() {
-                break; // Workspace 已销毁
+        cx.spawn(async move |this, cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_millis(250)).await;
+                let hit = dirty.lock().is_ok_and(|mut set| set.remove(&root));
+                if !hit {
+                    continue;
+                }
+                // 文件变了：标脏并主动重拉 git_status，角标 / Git 页在任何页面都即时刷新，
+                // 不再依赖「当前正停在 Files/Git 页、render 每帧才调 ensure_git_status」。
+                // ensure_git_status 内部有 inflight 去重，重复唤醒不会叠并发。
+                let r = this.update(cx, |this, cx| {
+                    this.invalidate_git_status(&root);
+                    this.ensure_git_status(root.clone(), cx);
+                    cx.notify();
+                });
+                if r.is_err() {
+                    break; // Workspace 已销毁
+                }
             }
         })
         .detach();
@@ -2298,7 +2495,11 @@ impl Workspace {
                     let git_dir = lines.next()?.to_string();
                     let common_dir = lines.next()?.to_string();
                     let branch = lines.next().unwrap_or("HEAD").to_string();
-                    Some(RepoInfo { git_dir, common_dir, branch })
+                    Some(RepoInfo {
+                        git_dir,
+                        common_dir,
+                        branch,
+                    })
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -2319,7 +2520,10 @@ impl Workspace {
         match self.repo_info.get(cwd).and_then(|(_, info)| info.as_ref()) {
             Some(info) if info.is_worktree() => {
                 let repo_label = repo_label_from_common_dir(&info.common_dir).unwrap_or(base_name);
-                (format!("{repo_label} · {}", info.branch), Some(info.common_dir.clone()))
+                (
+                    format!("{repo_label} · {}", info.branch),
+                    Some(info.common_dir.clone()),
+                )
             }
             Some(info) => (base_name, Some(info.common_dir.clone())),
             None => (base_name, None),
@@ -2369,7 +2573,8 @@ impl Workspace {
                             let text = String::from_utf8_lossy(&o.stdout);
                             for line in text.lines() {
                                 if let Some(b) = line.strip_prefix("## ") {
-                                    let (branch, upstream, ahead, behind) = parse_branch_status_line(b);
+                                    let (branch, upstream, ahead, behind) =
+                                        parse_branch_status_line(b);
                                     d.branch = branch;
                                     d.upstream = upstream;
                                     d.ahead = ahead;
@@ -2411,7 +2616,12 @@ impl Workspace {
                 .spawn(async move {
                     let out = run_git(
                         &r,
-                        &["for-each-ref", "refs/heads", "refs/remotes", "--format=%(refname)"],
+                        &[
+                            "for-each-ref",
+                            "refs/heads",
+                            "refs/remotes",
+                            "--format=%(refname)",
+                        ],
                     );
                     let mut list = BranchList::default();
                     if let Ok(o) = out {
@@ -2497,7 +2707,9 @@ impl Workspace {
     /// 而是把 git 的原话报出来让人自己决定——分支删了没有 reflog 之外的退路。
     /// 远端分支走 `push origin --delete`。
     pub fn confirm_delete_branch(&mut self, cx: &mut Context<Self>) {
-        let Some((root, branch, remote)) = self.delete_branch_target.take() else { return };
+        let Some((root, branch, remote)) = self.delete_branch_target.take() else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let (r, b) = (root.clone(), branch.clone());
             let result = cx
@@ -2545,7 +2757,9 @@ impl Workspace {
             (t.foreground, t.muted_foreground)
         };
         let (neutral_bg, neutral_hover, tint, hover, accent_text) = Self::modal_accent_colors(true);
-        let Some((_, branch, remote)) = self.delete_branch_target.as_ref() else { return div() };
+        let Some((_, branch, remote)) = self.delete_branch_target.as_ref() else {
+            return div();
+        };
         let remote = *remote;
 
         let content = v_flex()
@@ -2727,7 +2941,9 @@ impl Workspace {
         args: &'static [&'static str],
         cx: &mut Context<Self>,
     ) {
-        let Some(d) = self.git_diff.as_ref() else { return };
+        let Some(d) = self.git_diff.as_ref() else {
+            return;
+        };
         if !d.patchable {
             self.background_error =
                 Some("这个 diff 不支持按块操作（子模块 / 未跟踪文件），请用整文件的勾选框".into());
@@ -2774,7 +2990,13 @@ impl Workspace {
     }
 
     /// 跑 git + 着色放后台，用 file_gen 丢弃过期结果。
-    pub fn open_diff(&mut self, root: String, path: String, untracked: bool, cx: &mut Context<Self>) {
+    pub fn open_diff(
+        &mut self,
+        root: String,
+        path: String,
+        untracked: bool,
+        cx: &mut Context<Self>,
+    ) {
         let scope = self.diff_scope;
         self.diff_gen = self.diff_gen.wrapping_add(1);
         let r#gen = self.diff_gen;
@@ -2881,7 +3103,11 @@ impl Workspace {
         let mut msg = format!("对 {} 的这几行有反馈：\n", diff.path);
         for i in selected {
             if let Some(l) = diff.lines.get(i) {
-                let ln = l.new_ln.or(l.old_ln).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+                let ln = l
+                    .new_ln
+                    .or(l.old_ln)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into());
                 let marker = match l.kind {
                     DiffKind::Add => "+",
                     DiffKind::Del => "-",
@@ -2912,11 +3138,16 @@ impl Workspace {
         if self.commit_msg_generating {
             return;
         }
-        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else { return };
-        let Some(cfg) = cx.try_global::<agent::LlmConfig>().cloned() else { return };
+        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else {
+            return;
+        };
+        let Some(cfg) = cx.try_global::<agent::LlmConfig>().cloned() else {
+            return;
+        };
         if !agent::has_credentials(&cfg) {
-            self.background_error =
-                Some("还没配置 LLM API key（设置 → 宠物大脑），没法生成 commit message".to_string());
+            self.background_error = Some(
+                "还没配置 LLM API key（设置 → 宠物大脑），没法生成 commit message".to_string(),
+            );
             cx.notify();
             return;
         }
@@ -2958,7 +3189,9 @@ impl Workspace {
                             input.update(cx, |s, cx| s.set_value(msg, window, cx));
                         }
                     }
-                    Err(err) => this.background_error = Some(format!("生成 commit message 失败：{err}")),
+                    Err(err) => {
+                        this.background_error = Some(format!("生成 commit message 失败：{err}"))
+                    }
                 }
                 cx.notify();
             });
@@ -2975,8 +3208,14 @@ impl Workspace {
     /// 而它要求先写 commit message，于是「没有新改动、只想把已有提交推上去」这条
     /// 最常见的路径反而没有入口。
     pub fn push_only(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else { return };
-        let branch = self.git_status.get(&root).map(|(_, d)| d.branch.clone()).unwrap_or_default();
+        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else {
+            return;
+        };
+        let branch = self
+            .git_status
+            .get(&root)
+            .map(|(_, d)| d.branch.clone())
+            .unwrap_or_default();
         self.pushing = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -3002,15 +3241,23 @@ impl Workspace {
     /// 线程里执行，返回 `Result<(),String>`；`reload_log` = 操作会改历史（pull）
     /// 时顺带重拉 log；`silent` = 失败不弹顶部错误通知（自动 fetch 用，避免离线/
     /// 无凭据时反复刷屏）。
-    fn run_git_op<F>(&mut self, name: &'static str, reload_log: bool, silent: bool, op: F, cx: &mut Context<Self>)
-    where
+    fn run_git_op<F>(
+        &mut self,
+        name: &'static str,
+        reload_log: bool,
+        silent: bool,
+        op: F,
+        cx: &mut Context<Self>,
+    ) where
         F: FnOnce(&str) -> Result<(), String> + Send + 'static,
     {
         // 一次只跑一个：避免连点 fetch/pull 起一堆并发 git 抢 index.lock。
         if self.git_op.is_some() {
             return;
         }
-        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else { return };
+        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else {
+            return;
+        };
         self.git_op = Some(name);
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -3078,10 +3325,15 @@ impl Workspace {
 
     /// 确认丢弃工作区全部改动（restore + clean）。
     pub fn confirm_discard_all(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.discard_all_target.take() else { return };
+        let Some(root) = self.discard_all_target.take() else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let r = root.clone();
-            let result = cx.background_executor().spawn(async move { discard_all(&r) }).await;
+            let result = cx
+                .background_executor()
+                .spawn(async move { discard_all(&r) })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
@@ -3110,11 +3362,25 @@ impl Workspace {
             return div();
         }
         let content = v_flex()
-            .child(div().font_bold().text_color(fg).text_lg().child("丢弃工作区全部改动？"))
-            .child(div().text_sm().text_color(muted).child(
-                "已跟踪文件还原成 HEAD，未暂存 / 未跟踪的新文件会被删除。",
-            ))
-            .child(div().text_sm().text_color(accent_text).child("不进 reflog，找不回来。"))
+            .child(
+                div()
+                    .font_bold()
+                    .text_color(fg)
+                    .text_lg()
+                    .child("丢弃工作区全部改动？"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("已跟踪文件还原成 HEAD，未暂存 / 未跟踪的新文件会被删除。"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(accent_text)
+                    .child("不进 reflog，找不回来。"),
+            )
             .child(
                 h_flex()
                     .justify_end()
@@ -3142,15 +3408,24 @@ impl Workspace {
     }
 
     fn commit(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else { return };
-        let Some(message) = self.commit_msg_input.as_ref().map(|s| s.read(cx).value().trim().to_string())
+        let Some(root) = self.cur().and_then(|s| s.cwd(cx)) else {
+            return;
+        };
+        let Some(message) = self
+            .commit_msg_input
+            .as_ref()
+            .map(|s| s.read(cx).value().trim().to_string())
         else {
             return;
         };
         if message.is_empty() {
             return;
         }
-        let branch = self.git_status.get(&root).map(|(_, d)| d.branch.clone()).unwrap_or_default();
+        let branch = self
+            .git_status
+            .get(&root)
+            .map(|(_, d)| d.branch.clone())
+            .unwrap_or_default();
         cx.spawn_in(window, async move |this, cx| {
             let r = root.clone();
             let msg = message.clone();
@@ -3246,7 +3521,10 @@ impl Workspace {
 
         // ---- 列表 ----
         let status = self.git_status.get(&root).map(|(_, d)| d.clone());
-        let (ahead, behind) = status.as_ref().map(|d| (d.ahead, d.behind)).unwrap_or((0, 0));
+        let (ahead, behind) = status
+            .as_ref()
+            .map(|d| (d.ahead, d.behind))
+            .unwrap_or((0, 0));
         let stash_n = status.as_ref().map(|d| d.stash_count).unwrap_or(0);
         let has_changes = status.as_ref().is_some_and(|d| !d.files.is_empty());
         let ws_ops = cx.entity();
@@ -3267,24 +3545,26 @@ impl Workspace {
         } else {
             rgb(ui_theme::text_faint())
         };
-        let header = self.inspector_header("SOURCE CONTROL", InspectorTab::Git, cx).child(
-            Button::new("git-sync-menu")
-                .ghost()
-                .xsmall()
-                .label(sync_label)
-                .font_family("monospace")
-                .text_color(sync_color)
-                .dropdown_menu(move |menu, _window, _cx| {
-                    git_ops_menu_items(
-                        menu,
-                        ws_ops.clone(),
-                        root_ops.clone(),
-                        behind,
-                        stash_n,
-                        has_changes,
-                    )
-                }),
-        );
+        let header = self
+            .inspector_header("SOURCE CONTROL", InspectorTab::Git, cx)
+            .child(
+                Button::new("git-sync-menu")
+                    .ghost()
+                    .xsmall()
+                    .label(sync_label)
+                    .font_family("monospace")
+                    .text_color(sync_color)
+                    .dropdown_menu(move |menu, _window, _cx| {
+                        git_ops_menu_items(
+                            menu,
+                            ws_ops.clone(),
+                            root_ops.clone(),
+                            behind,
+                            stash_n,
+                            has_changes,
+                        )
+                    }),
+            );
 
         // commit message 输入框懒创建（跟全屏 Git 页同一个实体，两处共享草稿）。
         if self.commit_msg_input.is_none() {
@@ -3398,12 +3678,14 @@ impl Workspace {
                         // 勾选 = 已暂存：索引位（porcelain 第一位）不是空格/`?`
                         // 就算暂存（判定与全屏页一致）。STAGED 分组里的行天然是勾上的。
                         let staged = is_staged_group
-                            || code.as_bytes().first().is_some_and(|&b| b != b' ' && b != b'?');
+                            || code
+                                .as_bytes()
+                                .first()
+                                .is_some_and(|&b| b != b' ' && b != b'?');
                         let ws_stage = ws.clone();
                         let (r_stage, p_stage) = (root.clone(), row.path.clone());
-                        let stage_checkbox = Checkbox::new((key, rix))
-                            .checked(staged)
-                            .on_click(move |checked, _window, cx| {
+                        let stage_checkbox = Checkbox::new((key, rix)).checked(staged).on_click(
+                            move |checked, _window, cx| {
                                 // 别冒泡成「打开这份 diff」——勾选是纯索引操作。
                                 cx.stop_propagation();
                                 let checked = *checked;
@@ -3416,7 +3698,8 @@ impl Workspace {
                                         wsx.unstage_file(root, path, cx);
                                     }
                                 });
-                            });
+                            },
+                        );
                         let ws = ws.clone();
                         let root = root.clone();
                         let open_path = row.path.clone();
@@ -3519,7 +3802,8 @@ impl Workspace {
                     rgb(ui_theme::text_faint())
                 })
                 .when(enabled, |d| {
-                    d.cursor_pointer().hover(|d| d.text_color(rgb(ui_theme::text_bright())))
+                    d.cursor_pointer()
+                        .hover(|d| d.text_color(rgb(ui_theme::text_bright())))
                 })
                 .child(label)
         };
@@ -3552,10 +3836,15 @@ impl Workspace {
                                 .cursor_pointer()
                                 .hover(|d| d.opacity(0.9))
                         } else {
-                            d.bg(rgb(ui_theme::bg_card())).text_color(rgb(ui_theme::text_faint()))
+                            d.bg(rgb(ui_theme::bg_card()))
+                                .text_color(rgb(ui_theme::text_faint()))
                         }
                     })
-                    .child(if pushing { "推送中…" } else { "提交并推送" })
+                    .child(if pushing {
+                        "推送中…"
+                    } else {
+                        "提交并推送"
+                    })
                     .on_click(move |_ev, window, cx| {
                         e_commit_push.update(cx, |ws, cx| {
                             if !ws.pushing {
@@ -3572,7 +3861,11 @@ impl Workspace {
                     .child(
                         text_btn(
                             "narrow-ai-gen",
-                            if generating { "✨ 生成中…".to_string() } else { "✨ AI 生成".to_string() },
+                            if generating {
+                                "✨ 生成中…".to_string()
+                            } else {
+                                "✨ AI 生成".to_string()
+                            },
                             !generating,
                         )
                         .on_click(move |_ev, window, cx| {
@@ -3580,11 +3873,13 @@ impl Workspace {
                         }),
                     )
                     .child(div().flex_1())
-                    .child(text_btn("narrow-commit-only", "仅提交".to_string(), has_text).on_click(
-                        move |_ev, window, cx| {
-                            e_commit.update(cx, |ws, cx| ws.commit(false, window, cx));
-                        },
-                    ))
+                    .child(
+                        text_btn("narrow-commit-only", "仅提交".to_string(), has_text).on_click(
+                            move |_ev, window, cx| {
+                                e_commit.update(cx, |ws, cx| ws.commit(false, window, cx));
+                            },
+                        ),
+                    )
                     .child(
                         text_btn(
                             "narrow-push-only",
@@ -3616,10 +3911,13 @@ mod tests {
     // 不用 `use super::*;`：本文件顶部有 gpui/gpui_component 的 glob 导入，带进测试
     // 模块会让 trait 解析图爆炸，`cargo test` 编译期能把 rustc 撑崩（hotspot.rs 的
     // 测试模块踩过，那边留了同样的注释）。只导入真正用到的名字。
-    use super::{build_git_tree, hunk_patch, parse_diff, run_git, run_git_stdin, DiffKind};
+    use super::{DiffKind, build_git_tree, hunk_patch, parse_diff, run_git, run_git_stdin};
 
     fn files(paths: &[&str]) -> Vec<(String, String)> {
-        paths.iter().map(|p| (" M".to_string(), p.to_string())).collect()
+        paths
+            .iter()
+            .map(|p| (" M".to_string(), p.to_string()))
+            .collect()
     }
 
     /// 只有一个孩子的目录链要压成一行，否则深路径全是空缩进。
@@ -3651,7 +3949,11 @@ mod tests {
     fn tree_lists_dirs_before_files() {
         let rows = build_git_tree(&files(&["zz.txt", "aa/b.rs"]), &Default::default());
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["aa", "b.rs", "zz.txt"], "目录应排在文件前，实际 {names:?}");
+        assert_eq!(
+            names,
+            vec!["aa", "b.rs", "zz.txt"],
+            "目录应排在文件前，实际 {names:?}"
+        );
     }
 
     /// 折叠的目录不展开其子树，但目录行自己还在。
@@ -3661,13 +3963,18 @@ mod tests {
         collapsed.insert("a".to_string());
         let rows = build_git_tree(&files(&["a/b/x.rs", "a/c/y.rs", "top.rs"]), &collapsed);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "top.rs"], "折叠后不该露出子树，实际 {names:?}");
+        assert_eq!(
+            names,
+            vec!["a", "top.rs"],
+            "折叠后不该露出子树，实际 {names:?}"
+        );
     }
 
     /// 在临时目录里造一个仓库：写 `content`、提交，再覆写成 `modified`（不提交）。
     /// 返回仓库根路径。用 pid + 标签避免并行测试互相踩。
     fn repo_with_change(tag: &str, content: &str, modified: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("smelt-git-test-{}-{tag}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("smelt-git-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let r = root.to_str().unwrap();
@@ -3741,10 +4048,17 @@ mod tests {
             "第一块该只剩上下文，第二块没有上下文就留空"
         );
         // 坐标仍在 raw 里
-        assert!(parsed.hunks[0].raw.starts_with("@@ -49,7 +49,7 @@"), "raw 丢了坐标");
+        assert!(
+            parsed.hunks[0].raw.starts_with("@@ -49,7 +49,7 @@"),
+            "raw 丢了坐标"
+        );
         assert!(parsed.hunks[1].raw.starts_with("@@ -100,3 +100,3 @@"));
         // 行号解析不受影响：第一块的上下文行应从 49 起
-        let first_ctx = parsed.lines.iter().find(|l| l.kind == DiffKind::Del).unwrap();
+        let first_ctx = parsed
+            .lines
+            .iter()
+            .find(|l| l.kind == DiffKind::Del)
+            .unwrap();
         assert_eq!(first_ctx.old_ln, Some(49), "hunk 起始行号解析被带偏了");
     }
 
@@ -3769,12 +4083,10 @@ mod tests {
     #[test]
     fn gutter_width_tracks_the_largest_line_number() {
         use super::gutter_width;
-        let parsed_small = parse_diff(
-            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+b\n c\n",
-        );
-        let parsed_big = parse_diff(
-            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1200,2 +1200,2 @@\n-a\n+b\n c\n",
-        );
+        let parsed_small =
+            parse_diff("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+b\n c\n");
+        let parsed_big =
+            parse_diff("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1200,2 +1200,2 @@\n-a\n+b\n c\n");
         let small = gutter_width(&parsed_small.lines);
         let big = gutter_width(&parsed_big.lines);
         assert!(small < big, "四位数行号该比个位数宽：{small} vs {big}");
@@ -3801,13 +4113,19 @@ mod tests {
             assert!(h.range.end != usize::MAX, "range.end 占位值没回填");
             assert!(h.range.start < h.range.end, "range 为空: {:?}", h.range);
         }
-        assert!(parsed.hunks[0].range.end <= parsed.hunks[1].range.start, "两段 range 重叠");
+        assert!(
+            parsed.hunks[0].range.end <= parsed.hunks[1].range.start,
+            "两段 range 重叠"
+        );
         // 每段原文里只该有自己那处改动
         assert!(parsed.hunks[0].raw.contains("CHANGED-TOP"));
         assert!(!parsed.hunks[0].raw.contains("CHANGED-BOTTOM"));
         assert!(parsed.hunks[1].raw.contains("CHANGED-BOTTOM"));
         assert!(!parsed.hunks[1].raw.contains("CHANGED-TOP"));
-        assert!(parsed.header.starts_with("diff --git"), "header 应从 diff --git 起头");
+        assert!(
+            parsed.header.starts_with("diff --git"),
+            "header 应从 diff --git 起头"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3852,7 +4170,10 @@ mod tests {
         let parsed = parse_diff(&String::from_utf8_lossy(&out.stdout));
 
         let patch = hunk_patch(&parsed.header, &parsed.hunks[0]);
-        assert!(patch.contains("\\ No newline at end of file"), "patch 丢了无换行标记:\n{patch}");
+        assert!(
+            patch.contains("\\ No newline at end of file"),
+            "patch 丢了无换行标记:\n{patch}"
+        );
         let applied = run_git_stdin(r, &["apply", "--cached", "-"], &patch).unwrap();
         assert!(
             applied.status.success(),
@@ -3885,7 +4206,10 @@ mod tests {
 
         // 索引已回到 HEAD，但工作区仍是改过的内容
         let staged = run_git(r, &["diff", "--staged"]).unwrap();
-        assert!(String::from_utf8_lossy(&staged.stdout).trim().is_empty(), "索引没退干净");
+        assert!(
+            String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+            "索引没退干净"
+        );
         let text = std::fs::read_to_string(root.join("f.txt")).unwrap();
         assert_eq!(text, "alpha\nCHANGED\n", "取消暂存不该动工作区文件");
         let _ = std::fs::remove_dir_all(&root);
