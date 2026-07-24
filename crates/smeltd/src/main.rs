@@ -3232,6 +3232,7 @@ fn acp_spawn(
     cmd: String,
     agent_needs_transcript_check: bool,
     resume_id: Option<String>,
+    acp_sessions: &AcpSessions,
     subscribers: &Subscribers,
 ) -> Arc<AcpSession> {
     let sess = Arc::new(AcpSession {
@@ -3255,6 +3256,9 @@ fn acp_spawn(
         out: Mutex::new(AcpOut { client: None, watchers: Vec::new() }),
     });
     acp_relaunch(&sess, id, cmd, resume_id, subscribers);
+    // 必须登记进共享表：不然 watch/list/kill 都找不到这条会话，升级时的 fd
+    // 收集循环（handle_upgrade）也看不到它，会话会在下一次无缝升级时静默丢失。
+    acp_sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&sess));
     sess
 }
 
@@ -3352,7 +3356,7 @@ fn handle_acp_open(
             }
             s
         }
-        None => acp_spawn(&id, cwd, cmd, needs_check, req_resume_id, &subscribers),
+        None => acp_spawn(&id, cwd, cmd, needs_check, req_resume_id, &acp_sessions, &subscribers),
     };
 
     let attached_fd = {
@@ -4990,6 +4994,70 @@ mod acp_tests {
         let mut resp = String::new();
         BufReader::new(client).read_line(&mut resp).unwrap();
         assert_eq!(serde_json::from_str::<serde_json::Value>(&resp).unwrap()["ok"], true);
+    }
+
+    /// 帮手：走一遍 `handle_acp_open` 的完整流程（跟真实客户端一样连接→读首行
+    /// 快照→断开），cmd 用一个必然不存在的路径——`spawn_acp` 保证不阻塞调用方
+    /// （见文件头职责边界），子进程起不来只会异步产出 `AcpEvent::Fatal`，不
+    /// 影响这里要测的「登记进表」这件事。
+    fn open_acp_session_once(id: &str, acp_sessions: &AcpSessions, subscribers: &Subscribers) {
+        let (server, client) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(server.try_clone().unwrap());
+        let acp_sessions2 = Arc::clone(acp_sessions);
+        let subscribers2 = Arc::clone(subscribers);
+        let id_owned = id.to_string();
+        let h = thread::spawn(move || {
+            handle_acp_open(
+                server,
+                reader,
+                &serde_json::json!({"id": id_owned, "cmd": "/definitely/not/a/real/binary-xyz"}),
+                acp_sessions2,
+                subscribers2,
+            );
+        });
+        let mut br = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        br.read_line(&mut line).unwrap(); // 读到首行快照，说明 acp_spawn 已经跑完
+        drop(br);
+        drop(client); // 两份 clone 都要丢，读循环那头才会真正见到 EOF 退出
+        h.join().unwrap();
+    }
+
+    /// 回归 code review 发现的高严重度 bug：`acp_spawn` 建了新会话却从没插进
+    /// `acp_sessions` 表，导致 watch/list/kill 都找不到它，`handle_upgrade`
+    /// 收集 fd 时也会漏掉它——无缝升级直接把这条会话弄丢。
+    #[test]
+    fn open_new_session_registers_it_in_acp_sessions_table() {
+        let acp_sessions: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+
+        open_acp_session_once("acp-new", &acp_sessions, &subscribers);
+
+        assert!(
+            acp_sessions.lock().unwrap().contains_key("acp-new"),
+            "新建会话必须登记进 acp_sessions，不然 watch/list/kill 和无缝升级的 fd 收集都找不到它"
+        );
+    }
+
+    /// 同一个 bug 的另一面：表里没有它，`handle_acp_open` 的「已存在就复用」
+    /// 分支永远命中不了 —— 同一个 id 重开一次就会再走一遍 `acp_spawn`，多起
+    /// 一个 agent 子进程，旧的那个泄漏在后台再也够不着。
+    #[test]
+    fn reopening_same_id_reuses_existing_session_instead_of_spawning_a_duplicate() {
+        let acp_sessions: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+
+        open_acp_session_once("acp-dup", &acp_sessions, &subscribers);
+        let first = acp_sessions.lock().unwrap().get("acp-dup").cloned().expect("首次打开该已登记");
+
+        open_acp_session_once("acp-dup", &acp_sessions, &subscribers);
+        let second = acp_sessions.lock().unwrap().get("acp-dup").cloned().expect("重开该还在表里");
+
+        assert_eq!(acp_sessions.lock().unwrap().len(), 1, "同一个 id 重开不该在表里多出一条");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "重开应该复用已登记的会话，不能是 acp_spawn 又建了一个新对象（否则旧 agent 进程/线程直接泄漏）"
+        );
     }
 
     #[test]
