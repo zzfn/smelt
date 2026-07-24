@@ -278,6 +278,28 @@ fn daemon_state_for(view: &Entity<TerminalView>, cx: &App) -> Option<terminal::D
         .cloned()
 }
 
+/// 守护状态刚进入「等你批准 / 等你输入」时，是否需要入队一条应用内通知。
+fn awaiting_notification_for_transition(
+    previous_phase: Option<terminal::DaemonPhase>,
+    state: &terminal::DaemonSessionState,
+) -> Option<(String, String, bool)> {
+    let entered_awaiting = matches!(
+        state.phase,
+        terminal::DaemonPhase::AwaitingApproval | terminal::DaemonPhase::WaitingForUser
+    ) && previous_phase != Some(state.phase);
+    if !entered_awaiting {
+        return None;
+    }
+
+    let title = state.phase_label().to_string();
+    let message = state
+        .detail_line()
+        .or_else(|| state.title.clone())
+        .unwrap_or_else(|| format!("会话 {}", &state.id[..8.min(state.id.len())]));
+    let is_approval = state.phase == terminal::DaemonPhase::AwaitingApproval;
+    Some((title, message, is_approval))
+}
+
 /// 主区终端分屏布局树：叶子是一个终端，内部 Split 把区域按某轴切成多块。
 /// 每个 Split 各持一个 ResizableState 记住拖动比例；递归即可任意嵌套分屏。
 enum Pane {
@@ -6271,6 +6293,20 @@ fn main() {
                         let mut map = states.lock().unwrap();
                         match event {
                             terminal::DaemonStateEvent::Snapshot(list) => {
+                                if notify_on {
+                                    if let Some(q) = &pending {
+                                        for s in &list {
+                                            if let Some(entry) =
+                                                awaiting_notification_for_transition(
+                                                    map.get(&s.id).map(|p| p.phase),
+                                                    s,
+                                                )
+                                            {
+                                                q.lock().unwrap().push(entry);
+                                            }
+                                        }
+                                    }
+                                }
                                 // 只清守护侧条目：`acp-` 前缀是 GUI 内 ACP 会话自己
                                 // 维护的状态，smeltd 重连发快照时不能把它们抹掉。
                                 map.retain(|k, _| k.starts_with("acp-"));
@@ -6279,24 +6315,14 @@ fn main() {
                                 }
                             }
                             terminal::DaemonStateEvent::Update(s) => {
-                                let prev = map.get(&s.id).map(|p| p.phase);
-                                let entered_await = matches!(
-                                    s.phase,
-                                    terminal::DaemonPhase::AwaitingApproval
-                                        | terminal::DaemonPhase::WaitingForUser
-                                ) && prev != Some(s.phase);
-                                if notify_on && entered_await {
-                                    if let Some(q) = pending {
-                                        let title = s.phase_label().to_string();
-                                        let msg = s
-                                            .detail_line()
-                                            .or_else(|| s.title.clone())
-                                            .unwrap_or_else(|| {
-                                                format!("会话 {}", &s.id[..8.min(s.id.len())])
-                                            });
-                                        let is_appr =
-                                            s.phase == terminal::DaemonPhase::AwaitingApproval;
-                                        q.lock().unwrap().push((title, msg, is_appr));
+                                if notify_on {
+                                    if let Some(q) = &pending {
+                                        if let Some(entry) = awaiting_notification_for_transition(
+                                            map.get(&s.id).map(|p| p.phase),
+                                            &s,
+                                        ) {
+                                            q.lock().unwrap().push(entry);
+                                        }
                                     }
                                 }
                                 map.insert(s.id.clone(), s);
@@ -6544,6 +6570,57 @@ fn main() {
         })
         .detach();
     });
+}
+
+#[cfg(test)]
+mod daemon_state_notification_tests {
+    use super::awaiting_notification_for_transition;
+    use crate::terminal::{DaemonPhase, DaemonSessionState};
+
+    fn daemon_state(id: &str, phase: DaemonPhase) -> DaemonSessionState {
+        DaemonSessionState {
+            id: id.into(),
+            phase,
+            pending_question: None,
+            title: None,
+            launch: None,
+            cwd: None,
+            phase_since: 0,
+        }
+    }
+
+    #[test]
+    fn daemon_awaiting_notification_running_to_waiting_produces_one_choice_notification() {
+        let mut state = daemon_state("session-12345678", DaemonPhase::WaitingForUser);
+        state.pending_question = Some("Pick one".into());
+
+        let notif = awaiting_notification_for_transition(Some(DaemonPhase::Thinking), &state);
+
+        assert_eq!(
+            notif,
+            Some(("等你输入".into(), "💬 Pick one".into(), false))
+        );
+    }
+
+    #[test]
+    fn daemon_awaiting_notification_waiting_to_same_waiting_produces_none() {
+        let mut state = daemon_state("session-12345678", DaemonPhase::WaitingForUser);
+        state.pending_question = Some("Still waiting".into());
+
+        let notif = awaiting_notification_for_transition(Some(DaemonPhase::WaitingForUser), &state);
+
+        assert_eq!(notif, None);
+    }
+
+    #[test]
+    fn daemon_awaiting_notification_approval_uses_title_fallback_and_marks_approval() {
+        let mut state = daemon_state("session-12345678", DaemonPhase::AwaitingApproval);
+        state.title = Some("Need review".into());
+
+        let notif = awaiting_notification_for_transition(Some(DaemonPhase::ExecutingTool), &state);
+
+        assert_eq!(notif, Some(("等你批准".into(), "Need review".into(), true)));
+    }
 }
 
 #[cfg(test)]

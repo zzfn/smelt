@@ -5,9 +5,8 @@
 //! 都在那边——responder 绑在连接线程上没法跨进程传，这里没有资格直接持有
 //! 它们）。这层只做两件事：把 `smelt_core::acp_client` 收到的 `AcpSnapshot`
 //! 摊平进本地字段渲染出来，把用户操作打包成 `AcpUserAction` 发回去。四档
-//! 着色 / Dock 角标现在由 smeltd 直接广播（跟终端会话共用 subscribe 通道），
-//! 这层不用再手动同步——「应用内通知」这一项例外，是纯 GPUI 展示偏好，
-//! smeltd 不该知道，见 `apply_snapshot` 里前后相位对比的那段。
+//! 着色 / Dock 角标 / 应用内待处理通知现在都由 smeltd 的集中状态订阅驱动
+//! （跟终端会话共用 subscribe 通道），这层只镜像视图态，不再自己判相位跳变。
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -693,49 +692,11 @@ impl AcpView {
     }
 
     /// 快照应用：整份状态从 smeltd 镜像过来。归约（entries 合并/phase 机/
-    /// 回声去重）已经在服务端做完了，这里只做三件事：
-    /// 1. 应用内通知——纯 GPUI 展示偏好，smeltd 不该替我们决定，靠前后两次
-    ///    快照的相位差判断「是不是刚进入待处理」（服务端归约当下就知道，但
-    ///    那个时刻的信息没必要走一遍 wire 专门为这个特化）；
-    /// 2. 摊平快照字段进本地同名字段，渲染代码不用碰；
-    /// 3. 四色状态 / Dock 角标现在由 smeltd 直接广播（跟终端会话共用
-    ///    subscribe 通道），这里不用再手动同步。
+    /// 回声去重）已经在服务端做完了，这里只做两件事：
+    /// 1. 摊平快照字段进本地同名字段，渲染代码不用碰；
+    /// 2. 持久化 / 重绘时机跟着快照走。四色状态、Dock 角标、待处理通知都由
+    ///    外面的集中状态订阅维护，这里不再自己判相位跳变。
     fn apply_snapshot(&mut self, snap: AcpSnapshot, cx: &mut Context<Self>) {
-        let was_awaiting = matches!(
-            self.phase,
-            AcpPhase::AwaitingApproval | AcpPhase::AwaitingChoice
-        );
-        let now_awaiting = matches!(
-            snap.phase,
-            AcpPhase::AwaitingApproval | AcpPhase::AwaitingChoice
-        );
-        if !was_awaiting && now_awaiting {
-            let notify_on = cx
-                .try_global::<smelt_ui::agent_ui_config::AgentUiConfig>()
-                .map(|c| c.notify_awaiting)
-                .unwrap_or(true);
-            if notify_on {
-                if let Some(p) =
-                    cx.try_global::<smelt_ui::daemon_states_global::PendingAgentNotifs>()
-                {
-                    let entry = match snap.phase {
-                        AcpPhase::AwaitingApproval => snap
-                            .pending_permission
-                            .as_ref()
-                            .map(|c| ("等你批准".to_string(), c.question.clone(), true)),
-                        AcpPhase::AwaitingChoice => snap
-                            .pending_elicitation
-                            .as_ref()
-                            .map(|c| ("等你选择".to_string(), c.message.clone(), false)),
-                        _ => None,
-                    };
-                    if let Some(entry) = entry {
-                        p.0.lock().unwrap().push(entry);
-                    }
-                }
-            }
-        }
-
         let should_persist = snap.should_persist;
         self.entries = snap.entries;
         self.phase = snap.phase;
