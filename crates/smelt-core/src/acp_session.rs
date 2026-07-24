@@ -184,6 +184,9 @@ pub struct LivePermission {
     pub tool_call_id: String,
     pub options: Vec<PermissionOptionView>,
     pub responder: Option<PermissionResponder>,
+    /// 这张卡对应请求的原始 JSON-RPC 行，smeltd 无缝升级时用来重放（见
+    /// `AcpEvent::Permission` 同名字段）。
+    pub raw_request_line: Option<String>,
 }
 
 /// 选择题卡片：字段原始形态保留在 `raw_fields`（翻译回
@@ -193,6 +196,8 @@ pub struct LiveElicitation {
     pub raw_fields: Vec<ElicitField>,
     pub chosen: BTreeMap<usize, Vec<usize>>,
     pub responder: Option<ElicitationResponder>,
+    /// 同 `LivePermission::raw_request_line`。
+    pub raw_request_line: Option<String>,
 }
 
 /// smeltd 侧一份 ACP 会话的完整活体状态。`apply_event`/`apply_user_action` 是
@@ -241,6 +246,18 @@ impl AcpSessionState {
     /// 连接。跟旧版 `AcpView::placeholder` 的字段初始化一一对应。
     pub fn placeholder(entries: Vec<AcpEntry>, resume_session_id: Option<String>, reason: String) -> Self {
         Self { entries, phase: AcpPhase::Ended(reason), acp_session_id: resume_session_id, ..Self::default() }
+    }
+
+    /// 当前有没有一张卡（权限/选择题）正等着人处理，有就带上它原始请求那行
+    /// ——smeltd 无缝升级时用来判断"这条会话要不要在交接文件里多带一行"
+    /// 以及 resume 时重放这行，见 `resume_acp_from_fds`。同一时刻协议上只会
+    /// 有一张卡挂起（agent 等到上一个请求有回应才会发下一个），不用管两者
+    /// 都有值的情况。
+    pub fn pending_raw_request_line(&self) -> Option<&str> {
+        self.permission
+            .as_ref()
+            .and_then(|p| p.raw_request_line.as_deref())
+            .or_else(|| self.elicitation.as_ref().and_then(|e| e.raw_request_line.as_deref()))
     }
 
     /// `should_persist` 不是从 `self` 能算出来的——它是"这次变化是怎么发生的"
@@ -402,7 +419,7 @@ pub fn apply_event(state: &mut AcpSessionState, ev: AcpEvent) -> ApplyOutcome {
             state.plan = Some(plan_view_from_acp(&p));
             state.phase = AcpPhase::Running;
         }
-        AcpEvent::Permission { question, tool_call_id, pub_options, responder } => {
+        AcpEvent::Permission { question, tool_call_id, pub_options, responder, raw_request_line } => {
             let options: Vec<PermissionOptionView> = pub_options
                 .iter()
                 .map(|o| PermissionOptionView {
@@ -416,16 +433,18 @@ pub fn apply_event(state: &mut AcpSessionState, ev: AcpEvent) -> ApplyOutcome {
                 tool_call_id: tool_call_id.to_string(),
                 options,
                 responder: Some(responder),
+                raw_request_line,
             });
             state.phase = AcpPhase::AwaitingApproval;
             outcome.notify = Some(("等你批准".to_string(), question, true));
         }
-        AcpEvent::Elicitation { message, fields, responder } => {
+        AcpEvent::Elicitation { message, fields, responder, raw_request_line } => {
             state.elicitation = Some(LiveElicitation {
                 message: message.clone(),
                 raw_fields: fields,
                 chosen: Default::default(),
                 responder: Some(responder),
+                raw_request_line,
             });
             state.phase = AcpPhase::AwaitingChoice;
             outcome.notify = Some(("等你选择".to_string(), message, false));
@@ -698,6 +717,7 @@ mod tests {
             }],
             chosen: Default::default(),
             responder: None,
+            raw_request_line: None,
         });
         let auto_submit = choose_elicitation(&mut s, 0, 1);
         assert!(auto_submit);
@@ -720,6 +740,7 @@ mod tests {
             }],
             chosen: Default::default(),
             responder: None,
+            raw_request_line: None,
         });
         let auto_submit = choose_elicitation(&mut s, 0, 0);
         assert!(!auto_submit); // multi-select 从不自动提交

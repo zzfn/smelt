@@ -115,6 +115,12 @@ pub enum AcpEvent {
         tool_call_id: ToolCallId,
         pub_options: Vec<PermissionOption>,
         responder: PermissionResponder,
+        /// 这条请求的原始 JSON-RPC 行文本（`with_debug` 的 `Stdout` 方向捕获的
+        /// 最近一行）。smeltd 无缝升级时若这条会话正卡着这张审批卡，会把这行
+        /// 原文一起交接过去——新进程接手继承来的 fd 后，先把这行「回放」一遍
+        /// 让 SDK 重新解析出等价的 responder（绑定同一个原始请求 id），再继续
+        /// 读实时字节，见 `resume_acp_from_fds`。GUI 直连路径不用这个字段。
+        raw_request_line: Option<String>,
     },
     /// 用户消息的回显：`session/load` 重放历史时，agent 会把旧的用户提问也
     /// 当一条更新发回来（这是 entries 里 User 记录在 replay 场景下唯一的来源，
@@ -132,6 +138,8 @@ pub enum AcpEvent {
         message: String,
         fields: Vec<ElicitField>,
         responder: ElicitationResponder,
+        /// 同 `Permission::raw_request_line`。
+        raw_request_line: Option<String>,
     },
     /// 一轮 prompt 结束（含被取消）。
     TurnEnded(StopReason),
@@ -393,7 +401,8 @@ async fn run_connection(
     event_tx: smol::channel::Sender<AcpEvent>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
 ) -> Result<(), agent_client_protocol::Error> {
-    let agent = build_agent(&launch.cmd, stderr_tail)?;
+    let last_stdout_line: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let agent = build_agent(&launch.cmd, stderr_tail, Arc::clone(&last_stdout_line))?;
     let cwd = launch
         .cwd
         .clone()
@@ -402,6 +411,8 @@ async fn run_connection(
 
     let perm_tx = event_tx.clone();
     let elicit_tx = event_tx.clone();
+    let perm_last_line = Arc::clone(&last_stdout_line);
+    let elicit_last_line = Arc::clone(&last_stdout_line);
     Client
         .builder()
         .name("smelt")
@@ -410,6 +421,7 @@ async fn run_connection(
         .on_receive_request(
             move |request: RequestPermissionRequest, responder, _connection| {
                 let perm_tx = perm_tx.clone();
+                let raw_request_line = perm_last_line.lock().unwrap().clone();
                 async move {
                     let question = permission_question(&request);
                     let _ = perm_tx.try_send(AcpEvent::Permission {
@@ -417,6 +429,7 @@ async fn run_connection(
                         tool_call_id: request.tool_call.tool_call_id.clone(),
                         pub_options: request.options,
                         responder: PermissionResponder(Some(responder)),
+                        raw_request_line,
                     });
                     Ok(())
                 }
@@ -428,6 +441,7 @@ async fn run_connection(
         .on_receive_request(
             move |request: CreateElicitationRequest, responder, _connection| {
                 let elicit_tx = elicit_tx.clone();
+                let raw_request_line = elicit_last_line.lock().unwrap().clone();
                 async move {
                     let fields = match &request.mode {
                         ElicitationMode::Form(form) => parse_elicit_fields(&form.requested_schema),
@@ -439,6 +453,7 @@ async fn run_connection(
                                 message: request.message,
                                 fields,
                                 responder: ElicitationResponder(Some(responder)),
+                                raw_request_line,
                             });
                             Ok(())
                         }
@@ -754,6 +769,7 @@ async fn translate_update(
 fn build_agent(
     cmd: &str,
     stderr_tail: Arc<Mutex<Vec<String>>>,
+    last_stdout_line: Arc<Mutex<Option<String>>>,
 ) -> Result<AcpAgent, agent_client_protocol::Error> {
     // 查找命令用 login PATH + 一批常见 CLI 安装目录兜底。为什么要兜底：
     // login_shell_path 走的是 `zsh -lc`（非交互 login），只读 ~/.zprofile；很多
@@ -810,12 +826,24 @@ fn build_agent(
         .chain(user_env.iter().map(String::as_str))
         .chain(resolved.iter().map(String::as_str));
     let agent = AcpAgent::from_args(args)?.with_debug(move |line, direction| {
-        if matches!(direction, LineDirection::Stderr) {
-            let mut tail = stderr_tail.lock().unwrap();
-            if tail.len() >= 30 {
-                tail.remove(0);
+        match direction {
+            LineDirection::Stderr => {
+                let mut tail = stderr_tail.lock().unwrap();
+                if tail.len() >= 30 {
+                    tail.remove(0);
+                }
+                tail.push(line.to_string());
             }
-            tail.push(line.to_string());
+            // 只需要"最近一行"：agent 主动发来的请求（权限/选择题）到达时，
+            // 这一行必然就是那个请求本身——JSON-RPC 一行一条消息，请求内容
+            // 解析出来、分发进 on_receive_request 回调之前，这里已经先记下了
+            // 原文（`with_debug` 的回调在 SDK 内部按行 `.inspect()` 派生，早于
+            // 下游把这行反序列化成具体类型），见 `resume_acp_from_fds`
+            // 无缝升级重放要用它。
+            LineDirection::Stdout => {
+                *last_stdout_line.lock().unwrap() = Some(line.to_string());
+            }
+            LineDirection::Stdin => {}
         }
     });
     Ok(agent)
