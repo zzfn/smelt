@@ -1381,6 +1381,139 @@ fn handoff_path() -> std::path::PathBuf {
     sock_path().with_file_name("handoff.json")
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct OwnedAcpHandoff {
+    pid: i32,
+    stdin_fd: RawFd,
+    stdout_fd: RawFd,
+}
+
+#[derive(Debug)]
+struct ValidatedAcpHandoff {
+    id: String,
+    owned: OwnedAcpHandoff,
+    snapshot: smelt_core::acp_session::AcpSnapshot,
+    acp_session_id: String,
+    cwd: Option<String>,
+    cmd: String,
+    agent_needs_transcript_check: bool,
+    pending_raw_line: Option<String>,
+}
+
+enum AcpHandoffItemValidation {
+    SkipUnowned,
+    CloseDescriptors { stdin_fd: RawFd, stdout_fd: RawFd },
+    CleanupRequired(OwnedAcpHandoff),
+    Restore(ValidatedAcpHandoff),
+}
+
+fn validate_acp_handoff_item(
+    item: &serde_json::Value,
+    fd_is_valid: impl Fn(RawFd) -> bool,
+) -> AcpHandoffItemValidation {
+    let Some(stdin_fd) = item["stdin_fd"]
+        .as_i64()
+        .and_then(|fd| RawFd::try_from(fd).ok())
+        .filter(|fd| *fd >= 0)
+    else {
+        return AcpHandoffItemValidation::SkipUnowned;
+    };
+    let Some(stdout_fd) = item["stdout_fd"]
+        .as_i64()
+        .and_then(|fd| RawFd::try_from(fd).ok())
+        .filter(|fd| *fd >= 0)
+    else {
+        return AcpHandoffItemValidation::SkipUnowned;
+    };
+    if !fd_is_valid(stdin_fd) || !fd_is_valid(stdout_fd) {
+        return AcpHandoffItemValidation::SkipUnowned;
+    }
+
+    let Some(pid) = item["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return AcpHandoffItemValidation::CloseDescriptors {
+            stdin_fd,
+            stdout_fd,
+        };
+    };
+    let owned = OwnedAcpHandoff {
+        pid,
+        stdin_fd,
+        stdout_fd,
+    };
+
+    let Some(id) = item["id"].as_str() else {
+        return AcpHandoffItemValidation::CleanupRequired(owned);
+    };
+    let Some(snapshot_v) = item.get("snapshot") else {
+        return AcpHandoffItemValidation::CleanupRequired(owned);
+    };
+    let Ok(snapshot) =
+        serde_json::from_value::<smelt_core::acp_session::AcpSnapshot>(snapshot_v.clone())
+    else {
+        return AcpHandoffItemValidation::CleanupRequired(owned);
+    };
+    let Some(acp_session_id) = snapshot.acp_session_id.clone() else {
+        return AcpHandoffItemValidation::CleanupRequired(owned);
+    };
+
+    AcpHandoffItemValidation::Restore(ValidatedAcpHandoff {
+        id: id.to_string(),
+        owned,
+        snapshot,
+        acp_session_id,
+        cwd: item["cwd"].as_str().map(String::from),
+        cmd: item["cmd"].as_str().unwrap_or_default().to_string(),
+        agent_needs_transcript_check: item["agent_needs_transcript_check"]
+            .as_bool()
+            .unwrap_or(false),
+        pending_raw_line: item["pending_raw_line"].as_str().map(String::from),
+    })
+}
+
+fn waitpid_retry(pid: i32, options: i32) -> i32 {
+    loop {
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), options) };
+        if waited >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return waited;
+        }
+    }
+}
+
+fn cleanup_rejected_acp_handoff(owned: OwnedAcpHandoff) {
+    unsafe {
+        libc::close(owned.stdin_fd);
+        libc::close(owned.stdout_fd);
+    }
+
+    let group_kill = unsafe { libc::kill(-owned.pid, libc::SIGKILL) };
+    if group_kill < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        unsafe {
+            libc::kill(owned.pid, libc::SIGKILL);
+        }
+    }
+
+    let initial_wait = waitpid_retry(owned.pid, libc::WNOHANG);
+    if initial_wait != 0 {
+        return;
+    }
+
+    let (reaped_tx, reaped_rx) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let waited = waitpid_retry(owned.pid, 0);
+        let _ = reaped_tx.send(waited);
+    });
+    if reaped_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+        dlog(&format!(
+            "handoff: ACP pid={} 未在 1 秒内退出，后台继续 waitpid 收尸",
+            owned.pid
+        ));
+    }
+}
+
 /// 从交接文件恢复：认领监听 socket 和各会话的 PTY master fd，重建会话表 + 泵线程。
 /// 任何全局性错误（文件读不到/解析失败/监听 fd 无效）返回 None 走全新启动——会话
 /// 保不住但守护必须活着；单个会话的 fd 坏了只跳过那一个。
@@ -1522,66 +1655,46 @@ fn resume_handoff(
         .map(|a| a.as_slice())
         .unwrap_or_default()
     {
-        let Some(id) = item["id"].as_str() else {
-            continue;
-        };
-        let stdin_fd = item["stdin_fd"].as_i64().unwrap_or(-1) as RawFd;
-        let stdout_fd = item["stdout_fd"].as_i64().unwrap_or(-1) as RawFd;
-        let pid = item["pid"].as_i64().unwrap_or(0) as i32;
-        if stdin_fd < 0
-            || stdout_fd < 0
-            || unsafe { libc::fcntl(stdin_fd, libc::F_GETFD) } < 0
-            || unsafe { libc::fcntl(stdout_fd, libc::F_GETFD) } < 0
-        {
-            continue; // fd 缺失/已失效，没有可恢复的东西
-        }
-        if pid <= 0 {
-            // pid 坏了没法在需要时 kill 这个孤儿 agent；关掉两个 fd（agent 读到
-            // stdin EOF 大概率自己退出，同终端那边同款兜底思路）。
-            unsafe {
-                libc::close(stdin_fd);
-                libc::close(stdout_fd);
+        let validated = match validate_acp_handoff_item(item, |fd| unsafe {
+            libc::fcntl(fd, libc::F_GETFD) >= 0
+        }) {
+            AcpHandoffItemValidation::SkipUnowned => continue,
+            AcpHandoffItemValidation::CloseDescriptors {
+                stdin_fd,
+                stdout_fd,
+            } => {
+                unsafe {
+                    libc::close(stdin_fd);
+                    libc::close(stdout_fd);
+                }
+                continue;
             }
-            continue;
-        }
-        let Some(snapshot_v) = item.get("snapshot") else {
-            continue;
-        };
-        let Ok(snapshot) =
-            serde_json::from_value::<smelt_core::acp_session::AcpSnapshot>(snapshot_v.clone())
-        else {
-            continue;
-        };
-        let Some(acp_session_id) = snapshot.acp_session_id.clone() else {
-            // 没有 agent 侧 session id 就没法直接 attach_session——理论上不该
-            // 发生（能撑到升级这一刻的会话早就握手成功过一次）。防御性地跟
-            // pid 坏了同样处理：关 fd + 杀子进程，不留孤儿。
-            unsafe {
-                libc::close(stdin_fd);
-                libc::close(stdout_fd);
-                libc::kill(pid, libc::SIGKILL);
+            AcpHandoffItemValidation::CleanupRequired(owned) => {
+                cleanup_rejected_acp_handoff(owned);
+                continue;
             }
-            continue;
+            AcpHandoffItemValidation::Restore(validated) => validated,
         };
-        set_cloexec(stdin_fd, true);
-        set_cloexec(stdout_fd, true);
-
-        let cwd = item["cwd"].as_str().map(String::from);
-        let cmd = item["cmd"].as_str().unwrap_or_default().to_string();
-        let agent_needs_transcript_check = item["agent_needs_transcript_check"]
-            .as_bool()
-            .unwrap_or(false);
-        let pending_raw_line = item["pending_raw_line"].as_str().map(String::from);
+        let ValidatedAcpHandoff {
+            id,
+            owned,
+            snapshot,
+            acp_session_id,
+            cwd,
+            cmd,
+            agent_needs_transcript_check,
+            pending_raw_line,
+        } = validated;
         let supports_image = snapshot.supports_image;
         let reduced = smelt_core::acp_session::AcpSessionState::from_snapshot(snapshot);
 
         let state = Arc::new(Mutex::new(SessionState {
-            id: id.to_string(),
+            id: id.clone(),
             cwd: cwd.clone(),
             launch: Some(cmd),
             ..Default::default()
         }));
-        let (slot, created) = acp_sessions.reserve_with(id, || AcpSession {
+        let (slot, created) = acp_sessions.reserve_with(&id, || AcpSession {
             reduced: Mutex::new(reduced),
             handle: Mutex::new(None),
             cwd,
@@ -1593,13 +1706,21 @@ fn resume_handoff(
             }),
         });
         if !created {
+            cleanup_rejected_acp_handoff(owned);
             continue;
         }
 
+        let OwnedAcpHandoff {
+            pid,
+            stdin_fd,
+            stdout_fd,
+        } = owned;
+        set_cloexec(stdin_fd, true);
+        set_cloexec(stdout_fd, true);
         let event_rx = {
             let _lifecycle = slot.lifecycle.lock().unwrap();
             let handle = smelt_core::acp_conn::resume_acp_from_fds(
-                id.to_string(),
+                id,
                 stdin_fd,
                 stdout_fd,
                 pid,
@@ -1673,13 +1794,30 @@ mod resume_handoff_tests {
         Arc::new(Mutex::new(Vec::new()))
     }
 
+    fn test_artifact_path(name: &str, extension: &str) -> std::path::PathBuf {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/smeltd-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        if extension == "sock" {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            return std::fs::canonicalize(dir).unwrap().join(format!(
+                "s-{}-{:x}.sock",
+                std::process::id(),
+                hasher.finish()
+            ));
+        }
+        dir.join(format!(
+            "smelt-test-{name}-{}.{}",
+            std::process::id(),
+            extension
+        ))
+    }
+
     /// 每个用例一个独立文件名：测试是多线程并行跑的，共用路径会互相踩。
     fn tmp_handoff(name: &str) -> String {
-        std::env::temp_dir()
-            .join(format!(
-                "smelt-test-handoff-{name}-{}.json",
-                std::process::id()
-            ))
+        test_artifact_path(&format!("handoff-{name}"), "json")
             .to_string_lossy()
             .into_owned()
     }
@@ -1749,8 +1887,7 @@ mod resume_handoff_tests {
 
     /// 造一个能被 resume_handoff 认领的监听 fd。
     fn make_listen_fd(name: &str) -> RawFd {
-        let sock =
-            std::env::temp_dir().join(format!("smelt-test-{name}-{}.sock", std::process::id()));
+        let sock = test_artifact_path(name, "sock");
         let _ = std::fs::remove_file(&sock);
         let l = UnixListener::bind(&sock).unwrap();
         let _ = std::fs::remove_file(&sock); // 已 bind，文件可以立刻删
@@ -1961,6 +2098,122 @@ mod resume_handoff_tests {
             String::new(),
         )
         .to_snapshot(false)
+    }
+
+    #[test]
+    fn missing_acp_snapshot_requires_owned_resource_cleanup() {
+        let item = serde_json::json!({
+            "id": "acp-missing-snapshot",
+            "stdin_fd": 10,
+            "stdout_fd": 11,
+            "pid": 42,
+        });
+
+        let AcpHandoffItemValidation::CleanupRequired(owned) =
+            validate_acp_handoff_item(&item, |_| true)
+        else {
+            panic!("missing snapshot must reject with transferred ownership");
+        };
+        assert_eq!(
+            owned,
+            OwnedAcpHandoff {
+                pid: 42,
+                stdin_fd: 10,
+                stdout_fd: 11,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_acp_snapshot_requires_owned_resource_cleanup() {
+        let item = serde_json::json!({
+            "id": "acp-malformed-snapshot",
+            "stdin_fd": 20,
+            "stdout_fd": 21,
+            "pid": 84,
+            "snapshot": {"not": "an ACP snapshot"},
+        });
+
+        let AcpHandoffItemValidation::CleanupRequired(owned) =
+            validate_acp_handoff_item(&item, |_| true)
+        else {
+            panic!("malformed snapshot must reject with transferred ownership");
+        };
+        assert_eq!(
+            owned,
+            OwnedAcpHandoff {
+                pid: 84,
+                stdin_fd: 20,
+                stdout_fd: 21,
+            }
+        );
+    }
+
+    #[test]
+    fn rejected_acp_handoff_closes_owned_fds_and_reaps_agent() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let p = tmp_handoff("acp-rejected-cleanup");
+        let listen_fd = make_listen_fd("acp-rejected-cleanup");
+        let mut stdin_pipe = [0; 2];
+        let mut stdout_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(stdin_pipe.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(stdout_pipe.as_mut_ptr()) }, 0);
+        let stdin_read = unsafe { std::fs::File::from_raw_fd(stdin_pipe[0]) };
+        let stdin_write = unsafe { std::fs::File::from_raw_fd(stdin_pipe[1]) };
+        let stdout_read = unsafe { std::fs::File::from_raw_fd(stdout_pipe[0]) };
+        let stdout_write = unsafe { std::fs::File::from_raw_fd(stdout_pipe[1]) };
+        let inherited_stdin_fd = unsafe { libc::dup(stdin_write.as_raw_fd()) };
+        let inherited_stdout_fd = unsafe { libc::dup(stdout_read.as_raw_fd()) };
+        assert!(inherited_stdin_fd >= 0 && inherited_stdout_fd >= 0);
+
+        let child = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+
+        let handoff = serde_json::json!({
+            "listen_fd": listen_fd,
+            "sessions": [],
+            "acp_sessions": [{
+                "id": "acp-rejected",
+                "stdin_fd": inherited_stdin_fd,
+                "stdout_fd": inherited_stdout_fd,
+                "pid": pid,
+            }],
+        });
+        std::fs::write(&p, handoff.to_string()).unwrap();
+
+        let (_listener, _sessions, acp) =
+            resume_handoff(&p, &no_subs()).expect("handoff should remain globally valid");
+        assert!(acp.get("acp-rejected").is_none());
+        assert_eq!(
+            unsafe { libc::fcntl(inherited_stdin_fd, libc::F_GETFD) },
+            -1,
+            "rejected inherited stdin fd must be closed"
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(inherited_stdout_fd, libc::F_GETFD) },
+            -1,
+            "rejected inherited stdout fd must be closed"
+        );
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1,
+            "cleanup must reap the rejected ACP child"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "waitpid must fail specifically because no unreaped child remains"
+        );
+
+        drop((child, stdin_read, stdin_write, stdout_read, stdout_write));
     }
 
     #[test]
