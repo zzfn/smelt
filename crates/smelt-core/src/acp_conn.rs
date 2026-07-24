@@ -61,7 +61,7 @@ pub struct AcpLaunch {
 ///
 /// 协议要的就是 base64 + mime，所以在进这条通道前就编码好——连接线程不碰
 /// GPUI 的图片类型，`acp.rs 不许引 gpui` 那条底线在这里同样成立。
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PromptImage {
     /// `image/png` 这类 MIME。
     pub mime: String,

@@ -542,12 +542,17 @@ pub fn should_auto_resume(state: &AcpSessionState) -> bool {
     matches!(state.phase, AcpPhase::Ended(_)) && state.acp_session_id.is_some()
 }
 
-/// GUI → smeltd 的用户动作：prompt/取消/切模型三种转发进连接线程原有的
-/// `AcpCommand`；权限/选择题三种直接消费 `AcpSessionState` 自己攥着的
-/// responder，不经过连接线程（那几种压根不是发给 agent 的 JSON-RPC 请求，
-/// 是在回上一条来自 agent 的请求）。`Shutdown` 走 `AcpCommand::Shutdown`
-/// 同款语义——见 `PromptImage` 复用连接层已有的 wire 形状，没有另造一份。
-#[derive(Debug)]
+/// GUI → smeltd 的用户动作，走 `acp_open` 连接的 JSON 行。prompt/取消/切模型
+/// 三种转发进连接线程原有的 `AcpCommand`；权限/选择题四种直接消费
+/// `AcpSessionState` 自己攥着的 responder，不经过连接线程（那几种压根不是发给
+/// agent 的 JSON-RPC 请求，是在回上一条来自 agent 的请求）。`PromptImage`
+/// 复用连接层已有的 wire 形状，没有另造一份。
+///
+/// 没有 `Shutdown`：关闭子进程是会话生命周期层面的事，走独立的 `acp_kill` op
+/// （同终端会话的 `kill`），不是"在一条打开的连接里发的一个动作"——GUI 断开
+/// `acp_open` 连接（切标签/关标签/退出 App）只是摘掉这条连接，会话照样在
+/// smeltd 里活着，这正是这一整层要解决的问题。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AcpUserAction {
     Prompt { text: String, images: Vec<PromptImage> },
     Cancel,
@@ -556,7 +561,6 @@ pub enum AcpUserAction {
     ElicitationChoose { field_ix: usize, opt_ix: usize },
     ElicitationSubmit,
     ElicitationDismiss,
-    Shutdown,
 }
 
 #[cfg(test)]

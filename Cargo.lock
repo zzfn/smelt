@@ -7345,6 +7345,7 @@ dependencies = [
 name = "smeltd"
 version = "0.6.3"
 dependencies = [
+ "agent-client-protocol",
  "alacritty_terminal",
  "anyhow",
  "axum",
@@ -7355,6 +7356,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smelt-core",
+ "smol",
  "tokio",
  "uuid",
 ]

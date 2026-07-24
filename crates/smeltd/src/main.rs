@@ -1223,6 +1223,9 @@ fn main() {
     // 见 RemoteGateway / Tunnel 定义处注释。
     let remote_state: RemoteState = Arc::new(Mutex::new(None));
     let tunnel_state: TunnelState = Arc::new(Mutex::new(None));
+    // ACP 会话托管表：同样不参与无缝升级交接（见「ACP 会话托管」一节文件头
+    // 注释），每次进程启动都是全新的空表。
+    let acp_sessions: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
     // 菜单栏 quit / 任何路径 cleanup 都要够得着这两份状态。
     register_lifecycle(Arc::clone(&remote_state), Arc::clone(&tunnel_state));
 
@@ -1232,6 +1235,7 @@ fn main() {
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
             let sessions = Arc::clone(&sessions);
+            let acp_sessions = Arc::clone(&acp_sessions);
             let remote_state = Arc::clone(&remote_state);
             let tunnel_state = Arc::clone(&tunnel_state);
             let subscribers = Arc::clone(&subscribers);
@@ -1239,6 +1243,7 @@ fn main() {
                 handle_conn(
                     conn,
                     sessions,
+                    acp_sessions,
                     exe_mtime,
                     listen_fd,
                     remote_state,
@@ -2031,7 +2036,7 @@ mod action_integration_tests {
         let mut client = client;
         writeln!(client, "{}", serde_json::json!({ "op": "action", "id": id, "kind": kind }))
             .unwrap();
-        handle_conn(server, Arc::clone(sessions), 0, -1, remote_state, tunnel_state, subscribers);
+        handle_conn(server, Arc::clone(sessions), Arc::new(Mutex::new(HashMap::new())), 0, -1, remote_state, tunnel_state, subscribers);
         let mut resp = String::new();
         BufReader::new(client).read_line(&mut resp).unwrap();
         serde_json::from_str(&resp).unwrap()
@@ -2134,7 +2139,7 @@ mod input_integration_tests {
             serde_json::json!({ "op": "input", "id": id, "data": data })
         )
         .unwrap();
-        handle_conn(server, Arc::clone(sessions), 0, -1, remote_state, tunnel_state, subscribers);
+        handle_conn(server, Arc::clone(sessions), Arc::new(Mutex::new(HashMap::new())), 0, -1, remote_state, tunnel_state, subscribers);
         let mut resp = String::new();
         BufReader::new(client).read_line(&mut resp).unwrap();
         serde_json::from_str(&resp).unwrap()
@@ -2200,6 +2205,7 @@ mod input_integration_tests {
 fn handle_conn(
     conn: UnixStream,
     sessions: Sessions,
+    acp_sessions: AcpSessions,
     exe_mtime: u64,
     listen_fd: RawFd,
     remote_state: RemoteState,
@@ -2218,7 +2224,10 @@ fn handle_conn(
     match v["op"].as_str() {
         Some("open") => handle_open(conn, reader, &v, sessions, Arc::clone(&subscribers)),
         Some("watch") => handle_watch(conn, reader, &v, sessions),
-        Some("subscribe") => handle_subscribe(conn, &sessions, &subscribers),
+        Some("subscribe") => handle_subscribe(conn, &sessions, &acp_sessions, &subscribers),
+        Some("acp_open") => handle_acp_open(conn, reader, &v, acp_sessions, subscribers),
+        Some("acp_watch") => handle_acp_watch(conn, reader, &v, acp_sessions),
+        Some("acp_kill") => handle_acp_kill(conn, &v, &acp_sessions),
         // 扫当前可视区里的权限菜单，解析结果原样回给调用方（网关 → 手机端）。
         // 只读、无副作用，所以不要写权限：看得见菜单 ≠ 能点它，点是走 input/action。
         //
@@ -2237,12 +2246,20 @@ fn handle_conn(
             let _ = writeln!(c, "{}", serde_json::json!({ "ok": true, "menu": menu }));
         }
         Some("list") => {
-            let (ids, states): (Vec<String>, Vec<SessionState>) = sessions
+            let (mut ids, mut states): (Vec<String>, Vec<SessionState>) = sessions
                 .lock()
                 .unwrap()
                 .iter()
                 .map(|(id, s)| (id.clone(), s.state.lock().unwrap().clone()))
                 .unzip();
+            let (acp_ids, acp_states): (Vec<String>, Vec<SessionState>) = acp_sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, s)| (id.clone(), s.state.lock().unwrap().clone()))
+                .unzip();
+            ids.extend(acp_ids);
+            states.extend(acp_states);
             let mut c = conn;
             let _ = writeln!(c, "{}", serde_json::json!({ "sessions": ids, "states": states }));
         }
@@ -2264,7 +2281,7 @@ fn handle_conn(
             let mut c = conn;
             let _ = writeln!(c, "{}", serde_json::json!({ "ok": true }));
         }
-        Some("upgrade") => handle_upgrade(conn, &v, &sessions, listen_fd),
+        Some("upgrade") => handle_upgrade(conn, &v, &sessions, &acp_sessions, listen_fd),
         Some("version") => {
             // pid/started_at/session_count/exe 是后加的：旧 GUI 只读 version/exe_mtime，
             // 多出来的字段它直接忽略，协议向后兼容。
@@ -2728,8 +2745,15 @@ fn handle_watch(
 /// 状态订阅：跟 `watch` 是同一种只读连接模式，但订阅面是**全部会话**，不是单个
 /// session（见 Subscribers 类型定义处注释）。首帧全量快照，之后每次任何会话的
 /// state 变化都会推一行——广播逻辑在 broadcast_state / StateListener::send_event /
-/// `state` op 里，这里只管连接的注册与清理。
-fn handle_subscribe(conn: UnixStream, sessions: &Sessions, subscribers: &Subscribers) {
+/// `state` op 里，这里只管连接的注册与清理。快照汇总终端 + ACP 两张表——四色
+/// 状态两边共用同一个 `SessionState`/`Phase`（见下方「ACP 会话托管」一节），GUI
+/// 那条既有的 subscribe 监听代码完全不用为 ACP 改一行。
+fn handle_subscribe(
+    conn: UnixStream,
+    sessions: &Sessions,
+    acp_sessions: &AcpSessions,
+    subscribers: &Subscribers,
+) {
     let Ok(mut c) = conn.try_clone() else { return };
     let fd = c.as_raw_fd();
     // 与 open/watch 一致：冻结订阅者不能无限期占着 broadcast_state 的 subscribers 锁。
@@ -2740,10 +2764,13 @@ fn handle_subscribe(conn: UnixStream, sessions: &Sessions, subscribers: &Subscri
     // （晚于注册），这次状态变化对这个订阅者来说凭空消失。跟 handle_watch 的
     // snapshot-与-挂载不放锁是同一个道理。
     let mut subs = subscribers.lock().unwrap();
-    let snapshot: Vec<SessionState> = {
+    let mut snapshot: Vec<SessionState> = {
         let sessions = sessions.lock().unwrap();
         sessions.values().map(|s| s.state.lock().unwrap().clone()).collect()
     };
+    snapshot.extend(
+        acp_sessions.lock().unwrap().values().map(|s| s.state.lock().unwrap().clone()),
+    );
     if writeln!(c, "{}", serde_json::json!({ "sessions": snapshot })).is_err() {
         return;
     }
@@ -2756,6 +2783,406 @@ fn handle_subscribe(conn: UnixStream, sessions: &Sessions, subscribers: &Subscri
     let _ = reader.read(&mut scratch);
 
     subscribers.lock().unwrap().retain(|s| s.as_raw_fd() != fd);
+}
+
+// ===================== ACP 会话托管 =====================
+//
+// 跟终端会话是两条平行的托管逻辑：没有 PTY/网格，「画面」就是
+// `smelt_core::acp_session::AcpSnapshot`（entries + phase + 待办卡片），由
+// `smelt_core::acp_session::apply_event` 把子进程 agent 发来的协议事件归约
+// 出来——归约逻辑本身跟 GPUI 无关，谁接手连接谁跑，见该模块文件头注释（核心
+// 原因：`AcpEvent::Permission`/`Elicitation` 带的 responder 绑在连接线程上，
+// 没法跨进程传，只能是 smeltd 亲自跑完整个事件循环）。
+//
+// 四色状态复用终端会话已有的 `SessionState`/`Phase`/`broadcast_state`/
+// `subscribe` 机制：`AcpSession.state` 就是一份跟终端会话同类型的
+// `Arc<Mutex<SessionState>>`，list/subscribe 汇总时两边的 Vec 拼在一起即可。
+// ACP 会话 id 沿用 GUI 现有的 `acp-` 前缀约定，GUI 靠这个前缀判断该走
+// open/watch 还是 acp_open/acp_watch。
+//
+// 协议：
+//   {"op":"acp_open","id":"acp-..","cwd":"..","cmd":"..","agent":"claude",
+//    "resume_id":".."}
+//     → 已存在且还活着（有 handle）就直接接上；已存在但 Ended（没有 handle）
+//       就用请求带的 cmd + 已知的旧 session id（没有才退回请求带的 resume_id）
+//       重新 spawn（「重新开始」）；都不存在就全新建。回一份
+//       `{"snapshot": AcpSnapshot}`，之后每次归约有实质变化再推一份同形状的
+//       行。同 id 只允许一个控制连接，第二次 open 顶掉前一个。
+//   {"op":"acp_watch","id":".."} → 只读镜像，会话必须已存在，可多个并存。
+//   {"op":"acp_kill","id":".."} → 回 {"ok":true}，杀子进程、从表里摘掉、
+//     踢掉所有 client/watcher。
+//
+// acp_open 连接内不是终端那套二进制帧，是纯 JSON 行、双向：
+//   客户端 → 守护：一行 `AcpUserAction` 的 JSON
+//   守护 → 客户端：一行 `{"snapshot": AcpSnapshot}`
+// 断开 acp_open 连接（切标签/关标签/App 退出）只摘连接，不杀会话——这正是
+// 这层要解决的问题（GUI 退出不该带走 ACP 对话）。真要杀走 acp_kill。
+//
+// 已知局限：ACP 会话不参与「无缝升级」的交接（跟 PTY master fd 能裸传不同，
+// agent 子进程另一头是一条已经完成握手的 JSON-RPC 连接，没法把这套协议状态
+// 塞进 exec() 幸存下来），`handle_upgrade` 升级前会主动关掉所有 ACP 会话，
+// 不静默留孤儿子进程。
+
+struct AcpOut {
+    client: Option<UnixStream>,
+    watchers: Vec<UnixStream>,
+}
+
+struct AcpSession {
+    reduced: Mutex<smelt_core::acp_session::AcpSessionState>,
+    handle: Mutex<Option<smelt_core::acp_conn::AcpHandle>>,
+    cwd: Option<String>,
+    /// 只有 Claude 才该为 true，见 `AcpLaunch::resume_needs_transcript_check`。
+    agent_needs_transcript_check: bool,
+    /// 四色状态，跟终端会话共用同一个类型/同一套广播机制。
+    state: Arc<Mutex<SessionState>>,
+    out: Mutex<AcpOut>,
+}
+
+type AcpSessions = Arc<Mutex<HashMap<String, Arc<AcpSession>>>>;
+
+/// ACP 相位 → 四色 Phase。`Running` 还要看 entries 里有没有进行中的工具调用，
+/// 细分成「执行工具」/「思考中」——跟旧版 GUI `sync_daemon_state` 的判断一致。
+fn compute_acp_daemon_phase(reduced: &smelt_core::acp_session::AcpSessionState) -> Phase {
+    use smelt_core::acp_chat::{AcpEntry, ToolCallStatus};
+    use smelt_core::acp_session::AcpPhase;
+    match &reduced.phase {
+        AcpPhase::Starting | AcpPhase::Idle => Phase::Idle,
+        AcpPhase::Running => {
+            let executing = reduced.entries.iter().any(|e| {
+                matches!(
+                    e,
+                    AcpEntry::ToolCall {
+                        status: ToolCallStatus::InProgress | ToolCallStatus::Pending,
+                        ..
+                    }
+                )
+            });
+            if executing { Phase::ExecutingTool } else { Phase::Thinking }
+        }
+        AcpPhase::AwaitingApproval => Phase::AwaitingApproval,
+        AcpPhase::AwaitingChoice => Phase::WaitingForUser,
+        AcpPhase::Ended(_) => Phase::Dead,
+    }
+}
+
+fn acp_pending_question(reduced: &smelt_core::acp_session::AcpSessionState) -> Option<String> {
+    reduced
+        .permission
+        .as_ref()
+        .map(|p| p.question.clone())
+        .or_else(|| reduced.elicitation.as_ref().map(|e| e.message.clone()))
+}
+
+/// 把归约状态里的相位/待办问句同步进四色 `SessionState` 并广播。跟旧版 GUI
+/// `AcpView::sync_daemon_state` 是同一件事，只是现在算在 smeltd 侧。
+fn update_acp_daemon_state(sess: &AcpSession, subscribers: &Subscribers) {
+    let (phase, pending_question) = {
+        let reduced = sess.reduced.lock().unwrap();
+        (compute_acp_daemon_phase(&reduced), acp_pending_question(&reduced))
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let snapshot = {
+        let mut st = sess.state.lock().unwrap();
+        if st.phase != phase {
+            st.phase_since = now;
+        }
+        st.phase = phase;
+        st.pending_question = pending_question;
+        st.updated_at = now;
+        st.clone()
+    };
+    broadcast_state(subscribers, &snapshot);
+}
+
+/// 推一份最新快照给控制连接 + 全部旁观者，写失败的直接摘掉（对齐终端
+/// `out.watchers.retain_mut`/PTY 泵的写失败清理策略）。
+fn push_acp_snapshot(sess: &AcpSession) {
+    let snap = sess.reduced.lock().unwrap().to_snapshot();
+    let payload = serde_json::json!({ "snapshot": snap }).to_string();
+    let mut out = sess.out.lock().unwrap();
+    if let Some(c) = &mut out.client {
+        if writeln!(c, "{payload}").is_err() {
+            out.client = None;
+        }
+    }
+    out.watchers.retain_mut(|w| writeln!(w, "{payload}").is_ok());
+}
+
+/// 事件 drain：整个会话生命周期只有这一条线程在改 `reduced`（`apply_acp_user_action`
+/// 里权限/选择题相关的写也在这条线程外发生，但两边改的是不相交的字段/走
+/// 互斥锁，不会踩踏）。通道关闭（连接线程收尾）就退出；如果退出时相位还不是
+/// `Ended`（没收到 `Fatal` 就断，比如连接线程 panic），兜底补一个 Ended，不让
+/// GUI 永远卡在「运行中」。
+fn start_acp_event_drain(
+    sess: Arc<AcpSession>,
+    event_rx: smol::channel::Receiver<smelt_core::acp_conn::AcpEvent>,
+    subscribers: Subscribers,
+) {
+    thread::spawn(move || {
+        smol::block_on(async {
+            while let Ok(ev) = event_rx.recv().await {
+                {
+                    let mut st = sess.reduced.lock().unwrap();
+                    smelt_core::acp_session::apply_event(&mut st, ev);
+                }
+                push_acp_snapshot(&sess);
+                update_acp_daemon_state(&sess, &subscribers);
+            }
+        });
+        sess.handle.lock().unwrap().take(); // drop：ChildGuard 收尸子进程组
+        let already_ended =
+            matches!(sess.reduced.lock().unwrap().phase, smelt_core::acp_session::AcpPhase::Ended(_));
+        if !already_ended {
+            sess.reduced.lock().unwrap().phase =
+                smelt_core::acp_session::AcpPhase::Ended("连接意外中断".to_string());
+            push_acp_snapshot(&sess);
+        }
+        update_acp_daemon_state(&sess, &subscribers);
+    });
+}
+
+/// spawn 一次连接（首次建会话 / 「重新开始」共用）：先按旧版 GUI `restart()`
+/// 的规则重置回合态字段，再起连接线程、挂事件 drain。
+fn acp_relaunch(
+    sess: &Arc<AcpSession>,
+    id: &str,
+    cmd: String,
+    resume_id: Option<String>,
+    subscribers: &Subscribers,
+) {
+    smelt_core::acp_session::reset_for_restart(&mut sess.reduced.lock().unwrap());
+    let needs_check = sess.agent_needs_transcript_check;
+    let handle = smelt_core::acp_conn::spawn_acp(smelt_core::acp_conn::AcpLaunch {
+        cmd: cmd.clone(),
+        cwd: sess.cwd.clone(),
+        sid: id.to_string(),
+        resume_session_id: resume_id.map(agent_client_protocol::schema::v1::SessionId::new),
+        resume_needs_transcript_check: needs_check,
+    });
+    let event_rx = handle.event_rx.clone();
+    *sess.handle.lock().unwrap() = Some(handle);
+    sess.state.lock().unwrap().launch = Some(cmd);
+    push_acp_snapshot(sess);
+    update_acp_daemon_state(sess, subscribers);
+    start_acp_event_drain(Arc::clone(sess), event_rx, subscribers.clone());
+}
+
+fn acp_spawn(
+    id: &str,
+    cwd: Option<String>,
+    cmd: String,
+    agent_needs_transcript_check: bool,
+    resume_id: Option<String>,
+    subscribers: &Subscribers,
+) -> Arc<AcpSession> {
+    let sess = Arc::new(AcpSession {
+        reduced: Mutex::new(smelt_core::acp_session::AcpSessionState::default()),
+        handle: Mutex::new(None),
+        cwd: cwd.clone(),
+        agent_needs_transcript_check,
+        state: Arc::new(Mutex::new(SessionState {
+            id: id.to_string(),
+            cwd,
+            launch: None,
+            title: None,
+            phase: Phase::Idle,
+            phase_since: 0,
+            pending_question: None,
+            tokens_used: None,
+            branch: None,
+            dirty_files: Vec::new(),
+            updated_at: 0,
+        })),
+        out: Mutex::new(AcpOut { client: None, watchers: Vec::new() }),
+    });
+    acp_relaunch(&sess, id, cmd, resume_id, subscribers);
+    sess
+}
+
+fn apply_acp_user_action(
+    sess: &AcpSession,
+    action: smelt_core::acp_session::AcpUserAction,
+    subscribers: &Subscribers,
+) {
+    use smelt_core::acp_conn::AcpCommand;
+    use smelt_core::acp_session::AcpUserAction;
+    match action {
+        AcpUserAction::Prompt { text, images } => {
+            let cmd_tx = sess.handle.lock().unwrap().as_ref().map(|h| h.cmd_tx.clone());
+            let Some(cmd_tx) = cmd_tx else { return };
+            let img_count = images.len();
+            // 展示文案跟旧版 GUI `send_prompt` 一致：base64 图片体积大，历史里
+            // 只留「带了几张图」的标记。
+            let shown = match (text.is_empty(), img_count) {
+                (_, 0) => text.clone(),
+                (true, n) => format!("[{n} 张图片]"),
+                (false, n) => format!("{text}\n[{n} 张图片]"),
+            };
+            if cmd_tx.try_send(AcpCommand::Prompt { text, images }).is_ok() {
+                smelt_core::acp_session::note_prompt_sent(&mut sess.reduced.lock().unwrap(), shown);
+                push_acp_snapshot(sess);
+                update_acp_daemon_state(sess, subscribers);
+            }
+        }
+        AcpUserAction::Cancel => {
+            if let Some(h) = sess.handle.lock().unwrap().as_ref() {
+                let _ = h.cmd_tx.try_send(AcpCommand::Cancel);
+            }
+        }
+        AcpUserAction::SetModel(model_id) => {
+            if let Some(h) = sess.handle.lock().unwrap().as_ref() {
+                let _ = h.cmd_tx.try_send(AcpCommand::SetModel(model_id));
+            }
+        }
+        AcpUserAction::PermissionSelect { option_id } => {
+            smelt_core::acp_session::select_permission(&mut sess.reduced.lock().unwrap(), &option_id);
+            push_acp_snapshot(sess);
+            update_acp_daemon_state(sess, subscribers);
+        }
+        AcpUserAction::ElicitationChoose { field_ix, opt_ix } => {
+            let auto_submit = smelt_core::acp_session::choose_elicitation(
+                &mut sess.reduced.lock().unwrap(),
+                field_ix,
+                opt_ix,
+            );
+            if auto_submit {
+                smelt_core::acp_session::submit_elicitation(&mut sess.reduced.lock().unwrap());
+            }
+            push_acp_snapshot(sess);
+            update_acp_daemon_state(sess, subscribers);
+        }
+        AcpUserAction::ElicitationSubmit => {
+            smelt_core::acp_session::submit_elicitation(&mut sess.reduced.lock().unwrap());
+            push_acp_snapshot(sess);
+            update_acp_daemon_state(sess, subscribers);
+        }
+        AcpUserAction::ElicitationDismiss => {
+            smelt_core::acp_session::dismiss_elicitation(&mut sess.reduced.lock().unwrap());
+            push_acp_snapshot(sess);
+            update_acp_daemon_state(sess, subscribers);
+        }
+    }
+}
+
+fn handle_acp_open(
+    conn: UnixStream,
+    mut reader: BufReader<UnixStream>,
+    v: &serde_json::Value,
+    acp_sessions: AcpSessions,
+    subscribers: Subscribers,
+) {
+    let id = v["id"].as_str().unwrap_or_default().to_string();
+    if id.is_empty() {
+        return;
+    }
+    let cwd = v["cwd"].as_str().map(String::from);
+    let cmd = v["cmd"].as_str().unwrap_or_default().to_string();
+    let needs_check = v["agent"].as_str().unwrap_or("claude") == "claude";
+    let req_resume_id = v["resume_id"].as_str().map(String::from);
+
+    let existing = acp_sessions.lock().unwrap().get(&id).cloned();
+    let sess = match existing {
+        Some(s) => {
+            let alive = s.handle.lock().unwrap().is_some();
+            if !alive && !cmd.is_empty() {
+                // 已经 Ended（或还没真正连接过）：这次 open 等于「重新开始」。
+                // 优先用已知的旧 agent session id 真续接，没有才退回请求带的
+                // （比如历史会话页第一次点「继续」，本地还没有 acp_session_id）。
+                let known = s.reduced.lock().unwrap().acp_session_id.clone();
+                acp_relaunch(&s, &id, cmd, known.or(req_resume_id), &subscribers);
+            }
+            s
+        }
+        None => acp_spawn(&id, cwd, cmd, needs_check, req_resume_id, &subscribers),
+    };
+
+    let attached_fd = {
+        let Ok(mut c) = conn.try_clone() else { return };
+        let fd = c.as_raw_fd();
+        let _ = c.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
+        let snapshot = sess.reduced.lock().unwrap().to_snapshot();
+        if writeln!(c, "{}", serde_json::json!({ "snapshot": snapshot })).is_err() {
+            return;
+        }
+        let mut out = sess.out.lock().unwrap();
+        if let Some(old) = out.client.take() {
+            let _ = old.shutdown(Shutdown::Both); // 顶掉旧连接（同 id 只允许一个控制连接）
+        }
+        out.client = Some(c);
+        fd
+    };
+
+    // 动作循环：一行一个 AcpUserAction 的 JSON，直到客户端断开。
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let Ok(action) = serde_json::from_str(line.trim()) else {
+            continue; // 认不出的行跳过，别让一条坏数据掐断整条连接
+        };
+        apply_acp_user_action(&sess, action, &subscribers);
+    }
+
+    let mut out = sess.out.lock().unwrap();
+    if out.client.as_ref().map(|c| c.as_raw_fd()) == Some(attached_fd) {
+        out.client = None;
+    }
+}
+
+/// 只读旁观：会话必须已存在（没有 ACP 版本的「不存在就兜底 spawn」——旁观一个
+/// 没人开过的会话没有意义），不参与 client 顶替，可多个并存。
+fn handle_acp_watch(
+    conn: UnixStream,
+    mut reader: BufReader<UnixStream>,
+    v: &serde_json::Value,
+    acp_sessions: AcpSessions,
+) {
+    let id = v["id"].as_str().unwrap_or_default().to_string();
+    if id.is_empty() {
+        return;
+    }
+    let Some(sess) = acp_sessions.lock().unwrap().get(&id).cloned() else { return };
+    let attached_fd = {
+        let Ok(mut c) = conn.try_clone() else { return };
+        let fd = c.as_raw_fd();
+        let _ = c.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
+        let snapshot = sess.reduced.lock().unwrap().to_snapshot();
+        if writeln!(c, "{}", serde_json::json!({ "snapshot": snapshot })).is_err() {
+            return;
+        }
+        sess.out.lock().unwrap().watchers.push(c);
+        fd
+    };
+    let mut scratch = [0u8; 64];
+    let _ = reader.read(&mut scratch);
+    sess.out.lock().unwrap().watchers.retain(|w| w.as_raw_fd() != attached_fd);
+}
+
+/// 杀会话：子进程、连接、旁观者全部收尾，从表里摘掉。跟终端 `kill` 是同一种
+/// 「立即生效、不等收尾」的语气。
+fn handle_acp_kill(conn: UnixStream, v: &serde_json::Value, acp_sessions: &AcpSessions) {
+    let id = v["id"].as_str().unwrap_or_default();
+    if let Some(s) = acp_sessions.lock().unwrap().remove(id) {
+        if let Some(h) = s.handle.lock().unwrap().take() {
+            let _ = h.cmd_tx.try_send(smelt_core::acp_conn::AcpCommand::Shutdown);
+        }
+        let mut out = s.out.lock().unwrap();
+        if let Some(c) = out.client.take() {
+            let _ = c.shutdown(Shutdown::Both);
+        }
+        for w in out.watchers.drain(..) {
+            let _ = w.shutdown(Shutdown::Both);
+        }
+    }
+    let mut c = conn;
+    let _ = writeln!(c, "{}", serde_json::json!({ "ok": true }));
 }
 
 /// 无缝升级：快照会话表 → 写交接文件 → exec 磁盘上的新二进制（流程见文件头注释）。
@@ -2771,6 +3198,7 @@ fn handle_upgrade(
     conn: UnixStream,
     req: &serde_json::Value,
     sessions: &Sessions,
+    acp_sessions: &AcpSessions,
     listen_fd: RawFd,
 ) {
     let mut c = conn;
@@ -2798,6 +3226,19 @@ fn handle_upgrade(
             }
         }
     };
+
+    // ACP 会话没法参与下面这套 fd 裸传的交接（见「ACP 会话托管」一节文件头
+    // 注释：另一头是已经握手完成的 JSON-RPC 连接，没法在 exec() 里幸存），
+    // 升级前主动关掉，不静默留孤儿子进程——退化成跟「重启守护」一样的代价，
+    // 但至少子进程干净收尾，不是被 exec 悄悄丢弃。
+    let acp_ids: Vec<String> = acp_sessions.lock().unwrap().keys().cloned().collect();
+    for id in acp_ids {
+        if let Some(s) = acp_sessions.lock().unwrap().remove(&id) {
+            if let Some(h) = s.handle.lock().unwrap().take() {
+                let _ = h.cmd_tx.try_send(smelt_core::acp_conn::AcpCommand::Shutdown);
+            }
+        }
+    }
 
     let session_list: Vec<(String, Arc<Session>)> =
         sessions.lock().unwrap().iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
@@ -3897,7 +4338,7 @@ mod watch_tests {
     /// 用不上真正的 PTY 写端），`pid` 用一个已退出、还没被 reap 的真实子进程——
     /// 给 `start_pty_pump` 结束时的 `waitpid` 一个安全、真实存在的目标，不借用 -1
     /// 或随便一个不相关的 pid。
-    fn make_dummy_session(rows: u16, cols: u16) -> Arc<Session> {
+    pub(crate) fn make_dummy_session(rows: u16, cols: u16) -> Arc<Session> {
         let master = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
         let child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id() as i32;
@@ -4011,9 +4452,10 @@ mod watch_tests {
 
         let (sub_server, sub_client) = UnixStream::pair().unwrap();
         let sessions_b = Arc::clone(&sessions);
+        let acp_sessions_b: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
         let subscribers_b = Arc::clone(&subscribers);
         thread::spawn(move || {
-            handle_subscribe(sub_server, &sessions_b, &subscribers_b);
+            handle_subscribe(sub_server, &sessions_b, &acp_sessions_b, &subscribers_b);
         });
 
         let mut br = BufReader::new(sub_client.try_clone().unwrap());
@@ -4079,6 +4521,7 @@ mod watch_tests {
                     handle_conn(
                         server,
                         Arc::clone(&sessions),
+                        Arc::new(Mutex::new(HashMap::new())),
                         0,
                         -1,
                         Arc::new(Mutex::new(None)),
@@ -4102,8 +4545,9 @@ mod watch_tests {
                 for _ in 0..ROUNDS {
                     let (server, client) = UnixStream::pair().unwrap();
                     let s = Arc::clone(&sessions);
+                    let acp_s: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
                     let sub = Arc::clone(&subscribers);
-                    let h = thread::spawn(move || handle_subscribe(server, &s, &sub));
+                    let h = thread::spawn(move || handle_subscribe(server, &s, &acp_s, &sub));
                     // 立刻断开：read 拿到 EOF 就收尾退出。要抓的锁序（持 subscribers
                     // → 求 sessions）在注册阶段、早于 read，此时已经跑过了。
                     drop(client);
@@ -4122,5 +4566,201 @@ mod watch_tests {
                 );
             }
         }
+    }
+}
+
+/// ACP 会话托管：不 spawn 真实 agent 子进程（测试环境里也没有已登录的
+/// claude/codex 可用），直接构造 `AcpSession`/`AcpSessionState` 驱动被测函数，
+/// 只测「smeltd 这一层的管子接对了没」——归约本身（entries 合并/phase 机/
+/// 回声去重等）已经在 smelt_core::acp_session 的单测里覆盖过，这里不重复。
+#[cfg(test)]
+mod acp_tests {
+    use super::*;
+    use smelt_core::acp_chat::{AcpEntry, ToolCallStatus, ToolKind};
+    use smelt_core::acp_session::{AcpPhase, AcpSessionState};
+
+    fn make_acp_session(id: &str, reduced: AcpSessionState) -> Arc<AcpSession> {
+        Arc::new(AcpSession {
+            reduced: Mutex::new(reduced),
+            handle: Mutex::new(None),
+            cwd: None,
+            agent_needs_transcript_check: true,
+            state: Arc::new(Mutex::new(SessionState { id: id.to_string(), ..Default::default() })),
+            out: Mutex::new(AcpOut { client: None, watchers: Vec::new() }),
+        })
+    }
+
+    #[test]
+    fn watch_on_unknown_session_just_disconnects() {
+        let acp_sessions: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
+        let (server, client) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(server.try_clone().unwrap());
+        handle_acp_watch(server, reader, &serde_json::json!({"id": "acp-nope"}), acp_sessions);
+        // 没有会话可接：函数直接 return，客户端读到 EOF（不是某行 JSON）。
+        let mut buf = Vec::new();
+        BufReader::new(client).read_to_end(&mut buf).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn watch_delivers_initial_snapshot_matching_to_snapshot() {
+        let mut reduced = AcpSessionState::default();
+        reduced.entries.push(AcpEntry::User("hi".into()));
+        reduced.phase = AcpPhase::Idle;
+        let expected = reduced.to_snapshot();
+
+        let sess = make_acp_session("acp-1", reduced);
+        let acp_sessions: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
+        acp_sessions.lock().unwrap().insert("acp-1".to_string(), Arc::clone(&sess));
+
+        let (server, client) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(server.try_clone().unwrap());
+        let h = thread::spawn(move || {
+            handle_acp_watch(server, reader, &serde_json::json!({"id": "acp-1"}), acp_sessions);
+        });
+
+        let mut br = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        br.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["snapshot"]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            serde_json::to_value(&expected).unwrap()["entries"],
+            v["snapshot"]["entries"]
+        );
+
+        // 全部克隆（`br` 内部那份 + 这个原始 `client`）都要丢，socket 才会真正
+        // 关闭产生 EOF——只 drop 一份，另一份还开着，对端读不到 EOF 会一直卡住
+        // （这个坑踩过一次，见 watch_tests 里同款收尾写法）。
+        drop(br);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn push_snapshot_reaches_control_client_and_watchers_and_drops_dead_ones() {
+        let sess = make_acp_session("acp-2", AcpSessionState::default());
+
+        let (c_server, c_client) = UnixStream::pair().unwrap();
+        let (w_server, w_client) = UnixStream::pair().unwrap();
+        {
+            let mut out = sess.out.lock().unwrap();
+            out.client = Some(c_server);
+            out.watchers.push(w_server);
+        }
+        drop(c_client); // 控制连接对端已经断了：推送应该发现写失败并自己摘掉
+
+        push_acp_snapshot(&sess);
+
+        assert!(sess.out.lock().unwrap().client.is_none(), "写失败的 client 该被摘掉");
+        assert_eq!(sess.out.lock().unwrap().watchers.len(), 1, "还活着的 watcher 不该被牵连摘掉");
+
+        let mut line = String::new();
+        BufReader::new(w_client).read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v.get("snapshot").is_some());
+    }
+
+    #[test]
+    fn kill_removes_session_and_closes_connections() {
+        let sess = make_acp_session("acp-3", AcpSessionState::default());
+        let acp_sessions: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
+        acp_sessions.lock().unwrap().insert("acp-3".to_string(), Arc::clone(&sess));
+
+        let (c_server, c_client) = UnixStream::pair().unwrap();
+        sess.out.lock().unwrap().client = Some(c_server);
+
+        let (server, client) = UnixStream::pair().unwrap();
+        handle_acp_kill(server, &serde_json::json!({"id": "acp-3"}), &acp_sessions);
+
+        let mut resp = String::new();
+        BufReader::new(client).read_line(&mut resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(!acp_sessions.lock().unwrap().contains_key("acp-3"));
+
+        // 控制连接该被强制关掉：对端读到 EOF。
+        let mut buf = Vec::new();
+        BufReader::new(c_client).read_to_end(&mut buf).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    /// kill 一个不存在的 id：跟终端 `kill` 一样静默回 ok，不报错。
+    #[test]
+    fn kill_unknown_session_is_a_harmless_no_op() {
+        let acp_sessions: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
+        let (server, client) = UnixStream::pair().unwrap();
+        handle_acp_kill(server, &serde_json::json!({"id": "acp-ghost"}), &acp_sessions);
+        let mut resp = String::new();
+        BufReader::new(client).read_line(&mut resp).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&resp).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn subscribe_snapshot_merges_terminal_and_acp_sessions() {
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let term_sess = watch_tests::make_dummy_session(24, 80);
+        term_sess.state.lock().unwrap().id = "term-1".to_string();
+        sessions.lock().unwrap().insert("term-1".to_string(), term_sess);
+
+        let acp_sessions: AcpSessions = Arc::new(Mutex::new(HashMap::new()));
+        acp_sessions
+            .lock()
+            .unwrap()
+            .insert("acp-1".to_string(), make_acp_session("acp-1", AcpSessionState::default()));
+
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        let (server, client) = UnixStream::pair().unwrap();
+        let acp_sessions2 = Arc::clone(&acp_sessions);
+        let h = thread::spawn(move || handle_subscribe(server, &sessions, &acp_sessions2, &subscribers));
+
+        let mut line = String::new();
+        BufReader::new(client.try_clone().unwrap()).read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let ids: Vec<&str> = v["sessions"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"term-1"));
+        assert!(ids.contains(&"acp-1"));
+
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_phase_distinguishes_executing_tool_from_thinking() {
+        let mut running_with_tool = AcpSessionState::default();
+        running_with_tool.phase = AcpPhase::Running;
+        running_with_tool.entries.push(AcpEntry::ToolCall {
+            id: "t1".into(),
+            title: "Read".into(),
+            kind: ToolKind::Read,
+            status: ToolCallStatus::InProgress,
+            output: Vec::new(),
+        });
+        assert_eq!(compute_acp_daemon_phase(&running_with_tool), Phase::ExecutingTool);
+
+        let mut running_no_tool = AcpSessionState::default();
+        running_no_tool.phase = AcpPhase::Running;
+        assert_eq!(compute_acp_daemon_phase(&running_no_tool), Phase::Thinking);
+
+        let mut ended = AcpSessionState::default();
+        ended.phase = AcpPhase::Ended("boom".into());
+        assert_eq!(compute_acp_daemon_phase(&ended), Phase::Dead);
+    }
+
+    #[test]
+    fn pending_question_prefers_permission_over_elicitation() {
+        use smelt_core::acp_session::LivePermission;
+
+        let mut s = AcpSessionState::default();
+        assert_eq!(acp_pending_question(&s), None);
+
+        s.permission = Some(LivePermission {
+            question: "要不要覆盖这个文件？".into(),
+            tool_call_id: "t1".into(),
+            options: Vec::new(),
+            responder: None,
+        });
+        assert_eq!(acp_pending_question(&s).as_deref(), Some("要不要覆盖这个文件？"));
     }
 }
