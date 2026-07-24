@@ -4764,6 +4764,7 @@ mod acp_tests {
             tool_call_id: "t1".into(),
             options: Vec::new(),
             responder: None,
+            raw_request_line: None,
         });
         assert_eq!(acp_pending_question(&s).as_deref(), Some("要不要覆盖这个文件？"));
     }

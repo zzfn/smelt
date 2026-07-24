@@ -27,3 +27,8 @@ rust-embed = { version = "8.7", features = ["debug-embed"] }
 agent-client-protocol = { version = "=1.3.0", features = ["unstable_elicitation"] }
 smol = "2"
 chrono = { version = "0.4", features = ["serde"] }
+# ACP 无缝升级续接（resume_acp_from_fds）要手搭 Lines 传输层（agent-client-
+# protocol 的低层原语，见 acp_conn.rs 用法），直接用它的 Stream/Sink trait。
+futures = "0.3"
+async-process = "2"
+libc = "0.2"

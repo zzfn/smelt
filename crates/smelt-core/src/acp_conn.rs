@@ -11,9 +11,12 @@
 //!   通道出来，`spawn_acp` 本身永不阻塞、永不 panic 调用方。
 
 
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 use std::collections::BTreeMap;
+
+use futures::{AsyncBufReadExt, AsyncWriteExt, StreamExt};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
@@ -32,7 +35,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{
-    ActiveSession, AcpAgent, Agent, Client, ConnectionTo, LineDirection, SessionMessage,
+    ActiveSession, AcpAgent, Agent, Client, ConnectionTo, Lines, SessionMessage,
 };
 
 /// 一次 ACP 会话的启动参数。
@@ -327,6 +330,18 @@ fn parse_elicit_fields(schema: &ElicitationSchema) -> Option<Vec<ElicitField>> {
 pub struct AcpHandle {
     pub cmd_tx: smol::channel::Sender<AcpCommand>,
     pub event_rx: smol::channel::Receiver<AcpEvent>,
+    /// 子进程 pid + 原始 stdin/stdout fd，spawn 成功后才会填（Fatal 前的极短
+    /// 窗口是 None）。smeltd 无缝升级要用它把这两个 fd 也裸传过 exec()（跟
+    /// PTY master fd 同一招），见 `resume_acp_from_fds`。GUI 直连路径用不上，
+    /// 多存三个整数不加负担。
+    pub stdio: Arc<Mutex<Option<AcpStdio>>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct AcpStdio {
+    pub pid: i32,
+    pub stdin_fd: std::os::unix::io::RawFd,
+    pub stdout_fd: std::os::unix::io::RawFd,
 }
 
 /// App 退出前等一个已发过 Shutdown 的连接线程真正收尾。`event_rx` 所有
@@ -351,6 +366,8 @@ pub async fn wait_for_shutdown(handle: AcpHandle, timeout: std::time::Duration) 
 pub fn spawn_acp(launch: AcpLaunch) -> AcpHandle {
     let (cmd_tx, cmd_rx) = smol::channel::unbounded::<AcpCommand>();
     let (event_tx, event_rx) = smol::channel::unbounded::<AcpEvent>();
+    let stdio: Arc<Mutex<Option<AcpStdio>>> = Arc::new(Mutex::new(None));
+    let stdio_for_thread = Arc::clone(&stdio);
     let thread_name = format!("smelt-acp-{}", &launch.sid[..launch.sid.len().min(12)]);
     std::thread::Builder::new()
         .name(thread_name)
@@ -377,6 +394,7 @@ pub fn spawn_acp(launch: AcpLaunch) -> AcpHandle {
                 cmd_rx,
                 event_tx.clone(),
                 stderr_tail.clone(),
+                stdio_for_thread,
             ));
             if let Err(e) = result {
                 let tail = stderr_tail.lock().unwrap().join("\n");
@@ -390,7 +408,102 @@ pub fn spawn_acp(launch: AcpLaunch) -> AcpHandle {
             // Ok 结束（Shutdown）不发 Fatal——UI 主动关的，没必要再报。
         })
         .expect("spawn smelt-acp thread");
-    AcpHandle { cmd_tx, event_rx }
+    AcpHandle { cmd_tx, event_rx, stdio }
+}
+
+/// 写一行（带换行）到异步 writer——`agent_client_protocol` 自己的同款 helper
+/// 是 `pub(crate)`，这边够简单，直接写一份。
+async fn write_line<W>(w: &mut W, line: String) -> std::io::Result<()>
+where
+    W: futures::AsyncWrite + Unpin,
+{
+    w.write_all(line.as_bytes()).await?;
+    w.write_all(b"\n").await?;
+    w.flush().await
+}
+
+/// 把一个异步 writer 包成 `Lines` transport 要的 outgoing `Sink<String>`。
+fn make_outgoing_sink<W>(writer: W) -> impl futures::Sink<String, Error = std::io::Error>
+where
+    W: futures::AsyncWrite + Send + Unpin + 'static,
+{
+    futures::sink::unfold(writer, |mut w, line: String| async move {
+        write_line(&mut w, line).await?;
+        Ok::<_, std::io::Error>(w)
+    })
+}
+
+/// 把一个异步 reader 包成 `Lines` transport 要的 incoming `Stream<Item =
+/// io::Result<String>>`，顺带把每一行原文写进 `last_stdout_line`——跟旧版
+/// `AcpAgent::with_debug` 的 `Stdout` 方向是同一件事，只是现在自己接管
+/// spawn 之后，`with_debug` 钩子不会被 SDK 调用了，得自己包一层
+/// （`futures::StreamExt::inspect` 原理跟 SDK 内部一样：逐行 `.lines()` 之后
+/// 挂一个旁路回调，不影响往下游转发的内容）。
+fn make_incoming_lines<R>(
+    reader: R,
+    last_stdout_line: Arc<Mutex<Option<String>>>,
+) -> impl futures::Stream<Item = std::io::Result<String>> + Send
+where
+    R: futures::AsyncRead + Send + Unpin + 'static,
+{
+    futures::io::BufReader::new(reader).lines().inspect(move |res| {
+        if let Ok(line) = res {
+            *last_stdout_line.lock().unwrap() = Some(line.clone());
+        }
+    })
+}
+
+/// 无缝升级续接专用：先「回放」升级前捕获到的那行原始请求（如果有——对应
+/// 一张正卡着的权限/选择题卡片），再无缝接上继承来的 fd 往后实时读。SDK 的
+/// 请求分发器看到的字节序列跟"从来没断过"完全一样，会重新解析出一个等价的
+/// responder（绑定同一个原始 JSON-RPC 请求 id），不会丢这张卡。
+fn make_resume_incoming_lines<R>(
+    reader: R,
+    pending_raw_line: Option<String>,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<String>> + Send>>
+where
+    R: futures::AsyncRead + Send + Unpin + 'static,
+{
+    let live = futures::io::BufReader::new(reader).lines();
+    match pending_raw_line {
+        Some(line) => Box::pin(futures::stream::once(async move { Ok(line) }).chain(live)),
+        None => Box::pin(live),
+    }
+}
+
+/// 子进程 stderr 逐行收进尾巴（原来挂在 `AcpAgent::with_debug` 的
+/// `Stderr` 分支，自己接管 spawn 之后要自己起一条任务做）。
+fn spawn_stderr_drain(
+    stderr: async_process::ChildStderr,
+    stderr_tail: Arc<Mutex<Vec<String>>>,
+) {
+    smol::spawn(async move {
+        let mut lines = futures::io::BufReader::new(stderr).lines();
+        while let Some(Ok(line)) = lines.next().await {
+            let mut tail = stderr_tail.lock().unwrap();
+            if tail.len() >= 30 {
+                tail.remove(0);
+            }
+            tail.push(line);
+        }
+    })
+    .detach();
+}
+
+/// Unix 下 agent 子进程 spawn 时已经 `process_group(0)` 成了自己那组的组长
+/// （见 `AcpAgent::spawn_process` 文档：常见的 `npx …`/`uvx …` 包装启动器要
+/// 连它派生出的真身一起杀，只杀直接子进程会留孤儿）。正常走
+/// `Client::connect_with(agent, ..)` 时 SDK 自己的 `ChildGuard` 负责这个；
+/// 这里改成自己调 `spawn_process()`，没有那份内部 guard，得自己补——
+/// Drop 时对整个进程组发 SIGKILL，跟 smeltd 杀终端会话用的是同一个系统调用。
+struct KillProcessGroupOnDrop(i32);
+
+impl Drop for KillProcessGroupOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
 }
 
 /// 连接主体：spawn agent 子进程 → initialize → newSession → 双源 loop
@@ -400,9 +513,28 @@ async fn run_connection(
     cmd_rx: smol::channel::Receiver<AcpCommand>,
     event_tx: smol::channel::Sender<AcpEvent>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
+    stdio_out: Arc<Mutex<Option<AcpStdio>>>,
 ) -> Result<(), agent_client_protocol::Error> {
+    let agent = build_agent(&launch.cmd)?;
+    let (child_stdin, child_stdout, child_stderr, child) = agent
+        .spawn_process()
+        .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
+    let pid = child.id() as i32;
+    let stdin_fd = child_stdin.as_raw_fd();
+    let stdout_fd = child_stdout.as_raw_fd();
+    *stdio_out.lock().unwrap() = Some(AcpStdio { pid, stdin_fd, stdout_fd });
+    // `child` 本身不能就地 drop：它是子进程唯一的活体句柄（drop async_process
+    // 的 Child 不会杀进程，跟 std 一样），得撑到整个连接结束——用不着它的
+    // 任何方法，只借它的存在期，_guard 才是真正负责杀的那个。
+    let _child_keep_alive = child;
+    let _guard = KillProcessGroupOnDrop(pid);
+    spawn_stderr_drain(child_stderr, stderr_tail);
+
     let last_stdout_line: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let agent = build_agent(&launch.cmd, stderr_tail, Arc::clone(&last_stdout_line))?;
+    let outgoing = make_outgoing_sink(child_stdin);
+    let incoming = make_incoming_lines(child_stdout, Arc::clone(&last_stdout_line));
+    let transport = Lines::new(outgoing, incoming);
+
     let cwd = launch
         .cwd
         .clone()
@@ -465,7 +597,7 @@ async fn run_connection(
             },
             agent_client_protocol::on_receive_request!(),
         )
-        .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
+        .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             let init = connection
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
@@ -596,6 +728,145 @@ async fn run_connection(
                 });
             let session = connection.attach_session(created, Default::default())?;
             drive_session(session, cmd_rx, event_tx, ReadyKind::Fresh, supports_image, model_cfg).await
+        })
+        .await
+}
+
+/// smeltd 无缝升级续接：不 spawn 新子进程，直接接上继承来的 fd（`exec()` 前
+/// 清了 CLOEXEC、活过整个交接）继续跑，起一条跟 `spawn_acp` 同款的专用线程，
+/// 立即返回句柄。`AcpHandle.stdio` 一开始就是 `Some`——这几个 fd 本来就是
+/// 调用方（smeltd）传进来的，不用等 spawn。
+pub fn resume_acp_from_fds(
+    sid: String,
+    stdin_fd: RawFd,
+    stdout_fd: RawFd,
+    pid: i32,
+    acp_session_id: String,
+    supports_image: bool,
+    pending_raw_line: Option<String>,
+) -> AcpHandle {
+    let (cmd_tx, cmd_rx) = smol::channel::unbounded::<AcpCommand>();
+    let (event_tx, event_rx) = smol::channel::unbounded::<AcpEvent>();
+    let stdio = Arc::new(Mutex::new(Some(AcpStdio { pid, stdin_fd, stdout_fd })));
+    let thread_name = format!("smelt-acp-r-{}", &sid[..sid.len().min(10)]);
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let result = smol::block_on(run_resumed_connection(
+                stdin_fd,
+                stdout_fd,
+                pid,
+                acp_session_id,
+                supports_image,
+                pending_raw_line,
+                cmd_rx,
+                event_tx.clone(),
+            ));
+            if let Err(e) = result {
+                let _ = event_tx.try_send(AcpEvent::Fatal(format!("{e}")));
+            }
+            // Ok 结束（Shutdown）不发 Fatal——跟 run_connection 一致。
+        })
+        .expect("spawn smelt-acp resume thread");
+    AcpHandle { cmd_tx, event_rx, stdio }
+}
+
+/// `resume_acp_from_fds` 的连接主体：接上继承来的 fd → 跳过握手直接
+/// attach_session（agent 早跟上一个进程做过 initialize/newSession 了）→
+/// 双源 loop。`.on_receive_request` 那两段处理逻辑跟 `run_connection`里的
+/// 完全一样——本想抽成共用，但 `Client.builder()` 链式调用之后的类型是个
+/// 展开不动的匿名泛型，硬拆共用函数会把签名搞得比这点重复代码还难读，
+/// protocol 这层的粘合代码本来就不常变，可以接受这份重复。
+async fn run_resumed_connection(
+    stdin_fd: RawFd,
+    stdout_fd: RawFd,
+    pid: i32,
+    acp_session_id: String,
+    supports_image: bool,
+    pending_raw_line: Option<String>,
+    cmd_rx: smol::channel::Receiver<AcpCommand>,
+    event_tx: smol::channel::Sender<AcpEvent>,
+) -> Result<(), agent_client_protocol::Error> {
+    // `unsafe`：这两个 fd 是 smeltd 从上一代进程 dup 过来、清了 CLOEXEC 活过
+    // exec() 的，调用方保证此刻整个进程里没有别的代码持有/关闭过它们
+    // （smeltd 那边交接完立刻转手，见 resume_handoff 的用法）。
+    let stdin_file = unsafe { std::fs::File::from_raw_fd(stdin_fd) };
+    let stdout_file = unsafe { std::fs::File::from_raw_fd(stdout_fd) };
+    let stdin_async = smol::Async::new(stdin_file)
+        .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
+    let stdout_async = smol::Async::new(stdout_file)
+        .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
+
+    let _guard = KillProcessGroupOnDrop(pid);
+
+    let outgoing = make_outgoing_sink(stdin_async);
+    let incoming = make_resume_incoming_lines(stdout_async, pending_raw_line);
+    let transport = Lines::new(outgoing, incoming);
+
+    let session_id = SessionId::new(acp_session_id);
+
+    let perm_tx = event_tx.clone();
+    let elicit_tx = event_tx.clone();
+    let last_stdout_line: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let perm_last_line = Arc::clone(&last_stdout_line);
+    let elicit_last_line = Arc::clone(&last_stdout_line);
+    Client
+        .builder()
+        .name("smelt")
+        .on_receive_request(
+            move |request: RequestPermissionRequest, responder, _connection| {
+                let perm_tx = perm_tx.clone();
+                let raw_request_line = perm_last_line.lock().unwrap().clone();
+                async move {
+                    let question = permission_question(&request);
+                    let _ = perm_tx.try_send(AcpEvent::Permission {
+                        question,
+                        tool_call_id: request.tool_call.tool_call_id.clone(),
+                        pub_options: request.options,
+                        responder: PermissionResponder(Some(responder)),
+                        raw_request_line,
+                    });
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            move |request: CreateElicitationRequest, responder, _connection| {
+                let elicit_tx = elicit_tx.clone();
+                let raw_request_line = elicit_last_line.lock().unwrap().clone();
+                async move {
+                    let fields = match &request.mode {
+                        ElicitationMode::Form(form) => parse_elicit_fields(&form.requested_schema),
+                        _ => None,
+                    };
+                    match fields {
+                        Some(fields) => {
+                            let _ = elicit_tx.try_send(AcpEvent::Elicitation {
+                                message: request.message,
+                                fields,
+                                responder: ElicitationResponder(Some(responder)),
+                                raw_request_line,
+                            });
+                            Ok(())
+                        }
+                        None => responder.respond(CreateElicitationResponse::new(
+                            ElicitationAction::Decline,
+                        )),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
+            // 跳过 initialize/newSession/resume/load：agent 早就跟上一个进程
+            // 完成过握手了，这里只是换了个"读它输出的人"。modes/config_options
+            // /meta 留空——只影响"切模型"下拉暂时是空的，下次 agent 发 Model
+            // 更新（ConfigOptionUpdate）会自动补上，不影响对话本身。
+            let resp = NewSessionResponse::new(session_id.clone());
+            let session = connection.attach_session(resp, Default::default())?;
+            drive_session(session, cmd_rx, event_tx, ReadyKind::ResumedKeepHistory, supports_image, None)
+                .await
         })
         .await
 }
@@ -764,13 +1035,15 @@ async fn translate_update(
     Ok(())
 }
 
-/// 组装 AcpAgent：命令按空白分词，注入 login shell 的 PATH（Finder 启动的 GUI
-/// 进程 PATH 不含 nvm/homebrew，直接 spawn `npx` 会 ENOENT），stderr 逐行收进尾巴。
-fn build_agent(
-    cmd: &str,
-    stderr_tail: Arc<Mutex<Vec<String>>>,
-    last_stdout_line: Arc<Mutex<Option<String>>>,
-) -> Result<AcpAgent, agent_client_protocol::Error> {
+/// 组装 AcpAgent 配置（不 spawn）：命令按空白分词，注入 login shell 的 PATH
+/// （Finder 启动的 GUI 进程 PATH 不含 nvm/homebrew，直接 spawn `npx` 会
+/// ENOENT）。真正的 spawn 由调用方通过 `AcpAgent::spawn_process()`（SDK 公开
+/// 的"低层逃生口"，见其文档）自己发起——这样才能拿到子进程 pid + 原始
+/// stdin/stdout fd（smeltd 无缝升级要用），不能再走 `connect_with(agent, ..)`
+/// 那条把 spawn 过程整个封在 SDK 内部、什么都拿不到的路。stderr 尾巴 / 原始
+/// 行捕获也因此改成调用方（`run_connection`）自己接管，不再挂在这个 AcpAgent
+/// 对象上的 `with_debug` 钩子。
+fn build_agent(cmd: &str) -> Result<AcpAgent, agent_client_protocol::Error> {
     // 查找命令用 login PATH + 一批常见 CLI 安装目录兜底。为什么要兜底：
     // login_shell_path 走的是 `zsh -lc`（非交互 login），只读 ~/.zprofile；很多
     // CLI 的安装脚本把 PATH 加在 ~/.zshrc（交互式）里，非交互读不到 → 明明装了
@@ -825,28 +1098,7 @@ fn build_agent(
     let args = std::iter::once(path_env.as_str())
         .chain(user_env.iter().map(String::as_str))
         .chain(resolved.iter().map(String::as_str));
-    let agent = AcpAgent::from_args(args)?.with_debug(move |line, direction| {
-        match direction {
-            LineDirection::Stderr => {
-                let mut tail = stderr_tail.lock().unwrap();
-                if tail.len() >= 30 {
-                    tail.remove(0);
-                }
-                tail.push(line.to_string());
-            }
-            // 只需要"最近一行"：agent 主动发来的请求（权限/选择题）到达时，
-            // 这一行必然就是那个请求本身——JSON-RPC 一行一条消息，请求内容
-            // 解析出来、分发进 on_receive_request 回调之前，这里已经先记下了
-            // 原文（`with_debug` 的回调在 SDK 内部按行 `.inspect()` 派生，早于
-            // 下游把这行反序列化成具体类型），见 `resume_acp_from_fds`
-            // 无缝升级重放要用它。
-            LineDirection::Stdout => {
-                *last_stdout_line.lock().unwrap() = Some(line.to_string());
-            }
-            LineDirection::Stdin => {}
-        }
-    });
-    Ok(agent)
+    Ok(AcpAgent::from_args(args)?)
 }
 
 /// Claude Code 适配器专用 meta：要它把原始 SDK 消息也发过来（里面带 usage /
