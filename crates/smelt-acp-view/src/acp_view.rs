@@ -132,6 +132,29 @@ pub struct AcpView {
     _input_sub: Option<gpui::Subscription>,
 }
 
+pub(crate) fn resolve_restart_launch(
+    current_launch: &AcpLaunchSpec,
+    profile_id: Option<&str>,
+    config: &smelt_ui::agent_ui_config::AgentUiConfig,
+    agent: AcpAgentKind,
+    refresh_launch_from_settings: bool,
+) -> AcpLaunchSpec {
+    if let Some(profile_id) = profile_id {
+        return config
+            .find_profile(profile_id)
+            .map(|profile| {
+                let mut launch = profile.launch_spec();
+                launch.command = config.acp_cmd_for(profile.kind());
+                launch
+            })
+            .unwrap_or_else(|| current_launch.clone());
+    }
+    if refresh_launch_from_settings {
+        return AcpLaunchSpec::from_command(config.acp_cmd_for(agent));
+    }
+    current_launch.clone()
+}
+
 impl AcpView {
     /// 建视图并立即向 smeltd 发起 `acp_open`（非阻塞，握手结果以快照回来）。
     pub fn start(
@@ -239,12 +262,14 @@ impl AcpView {
     /// 服务端已经清空 entries 让 replay 重建，`Fresh` 且本地有历史时服务端
     /// 已经插好分割线——这层拿到的快照就是最终结果，不用再猜）。
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 普通会话沿用当前全局配置刷新命令；workspace profile 先保留持久化下来的
-        // 结构化 launch，后续任务再把「按 profile_id 解析最新配置」补齐。
-        if self.refresh_launch_from_settings {
-            if let Some(cfg) = cx.try_global::<smelt_ui::agent_ui_config::AgentUiConfig>() {
-                self.launch = AcpLaunchSpec::from_command(cfg.acp_cmd_for(self.agent));
-            }
+        if let Some(cfg) = cx.try_global::<smelt_ui::agent_ui_config::AgentUiConfig>() {
+            self.launch = resolve_restart_launch(
+                &self.launch,
+                self.profile_id.as_deref(),
+                cfg,
+                self.agent,
+                self.refresh_launch_from_settings,
+            );
         }
         self.permission = None;
         self.elicitation = None;
@@ -2136,3 +2161,83 @@ fn render_diff_lines(
 
 // strip_code_fence / is_interrupt_marker 的单测随实现一起搬进了
 // smelt_core::acp_chat（见该模块的 #[cfg(test)]），这里不再重复。
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_restart_launch;
+    use smelt_core::agent_kind::{AcpAgentKind, AcpLaunchSpec, AcpProfile};
+    use smelt_ui::agent_ui_config::AgentUiConfig;
+
+    #[test]
+    fn restart_uses_updated_profile_launch_spec_when_profile_still_exists() {
+        let current = AcpLaunchSpec::from_command("claude --old")
+            .with_env("CLAUDE_CONFIG_DIR", "~/Claude Workspaces/old");
+        let config = AgentUiConfig {
+            acp_cmd: "claude --current".into(),
+            profiles: vec![AcpProfile {
+                id: "quant".into(),
+                kind_id: "claude".into(),
+                label: "Quant".into(),
+                workspace_dir: "~/Claude Workspaces/new quant".into(),
+            }],
+            ..AgentUiConfig::default()
+        };
+
+        let resolved =
+            resolve_restart_launch(&current, Some("quant"), &config, AcpAgentKind::Claude, false);
+
+        assert_eq!(
+            resolved.command, "claude --current",
+            "profile 会话重启时应沿用该 agent 当前配置的命令"
+        );
+        assert_eq!(
+            resolved.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("~/Claude Workspaces/new quant"),
+            "profile 会话重启时应重新读取 profile 的当前 workspace 配置"
+        );
+    }
+
+    #[test]
+    fn restart_keeps_persisted_launch_when_profile_was_deleted() {
+        let current = AcpLaunchSpec::from_command("claude --persisted")
+            .with_env("CLAUDE_CONFIG_DIR", "~/Claude Workspaces/quant");
+
+        let resolved = resolve_restart_launch(
+            &current,
+            Some("quant"),
+            &AgentUiConfig::default(),
+            AcpAgentKind::Claude,
+            false,
+        );
+
+        assert_eq!(resolved, current);
+    }
+
+    #[test]
+    fn restart_refreshes_ordinary_session_from_current_agent_command() {
+        let current = AcpLaunchSpec::from_command("claude --stale");
+        let config = AgentUiConfig {
+            acp_cmd: "claude --current".into(),
+            ..AgentUiConfig::default()
+        };
+
+        let resolved =
+            resolve_restart_launch(&current, None, &config, AcpAgentKind::Claude, true);
+
+        assert_eq!(resolved, AcpLaunchSpec::from_command("claude --current"));
+    }
+
+    #[test]
+    fn restart_keeps_legacy_launch_when_refresh_is_disabled() {
+        let current = AcpLaunchSpec::from_command("CLAUDE_CONFIG_DIR=~/Claude Workspaces/quant claude");
+        let config = AgentUiConfig {
+            acp_cmd: "claude --current".into(),
+            ..AgentUiConfig::default()
+        };
+
+        let resolved =
+            resolve_restart_launch(&current, None, &config, AcpAgentKind::Claude, false);
+
+        assert_eq!(resolved, current);
+    }
+}

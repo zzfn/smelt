@@ -1067,7 +1067,7 @@ pub fn history_view(
     let launch_override = profile_id.as_deref().and_then(|id| {
         cx.global::<crate::settings::AgentUiConfig>()
             .find_profile(id)
-            .map(|p| p.launch_spec())
+            .map(|p| current_profile_launch(cx.global::<crate::settings::AgentUiConfig>(), p))
     });
 
     let list_body: AnyElement = match (&list, &sessions) {
@@ -1535,6 +1535,24 @@ pub(crate) fn session_list_key(agent: AcpAgentKind, profile_id: Option<&str>, cw
     format!("{}:{}:{cwd}", agent.id(), profile_id.unwrap_or("default"))
 }
 
+pub(crate) fn normalized_profile_override_dir(
+    profile: &smelt_core::agent_kind::AcpProfile,
+) -> Option<String> {
+    smelt_core::workspace_override::env_override_from_launch(
+        &profile.launch_spec(),
+        profile.env_var(),
+    )
+}
+
+fn current_profile_launch(
+    config: &crate::settings::AgentUiConfig,
+    profile: &smelt_core::agent_kind::AcpProfile,
+) -> smelt_core::agent_kind::AcpLaunchSpec {
+    let mut launch = profile.launch_spec();
+    launch.command = config.acp_cmd_for(profile.kind());
+    launch
+}
+
 fn list_sessions_for(
     agent: AcpAgentKind,
     override_dir: Option<&str>,
@@ -1572,7 +1590,7 @@ impl Workspace {
         let override_dir = profile_id.as_deref().and_then(|id| {
             cx.global::<crate::settings::AgentUiConfig>()
                 .find_profile(id)
-                .map(|p| p.workspace_dir.clone())
+                .and_then(normalized_profile_override_dir)
         });
         let key = session_list_key(agent, profile_id.as_deref(), &cwd);
         let fresh = self
@@ -1639,15 +1657,27 @@ mod tests {
     // 带进这个测试模块会让 trait 解析图爆炸式增长，`cargo test` 编译期直接撞
     // rustc 的递归限制崩溃（甚至 SIGBUS）——只导入测试真正用到的几个名字就够了。
     use super::{
-        list_codex_sessions, list_copilot_sessions, list_grok_sessions, list_sessions,
-        load_codex_session_detail, load_copilot_session_detail, load_grok_session_detail,
-        load_session_detail, project_dir,
+        current_profile_launch, list_codex_sessions, list_copilot_sessions, list_grok_sessions,
+        list_sessions, list_sessions_for, load_codex_session_detail,
+        load_copilot_session_detail, load_grok_session_detail, load_session_detail,
+        normalized_profile_override_dir, project_dir,
     };
+    use crate::settings::AgentUiConfig;
+    use smelt_core::agent_kind::{AcpAgentKind, AcpProfile};
     use std::path::Path;
     use std::sync::Mutex;
 
     fn write(dir: &Path, name: &str, lines: &[&str]) {
         std::fs::write(dir.join(name), lines.join("\n")).unwrap();
+    }
+
+    fn test_sandbox(name: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-artifacts")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     /// 好几个测试都要临时改 `HOME` 指向沙盒目录再复原——`cargo test` 默认多线程
@@ -1702,6 +1732,81 @@ mod tests {
         assert_eq!(
             project_dir("/Users/c.chen/dev/smelt"),
             "-Users-c-chen-dev-smelt"
+        );
+    }
+
+    #[test]
+    fn history_profile_override_dir_expands_tilde_and_preserves_spaces() {
+        let home = test_sandbox("session-history-override-helper");
+        let profile = AcpProfile {
+            id: "quant".into(),
+            kind_id: "claude".into(),
+            label: "Quant".into(),
+            workspace_dir: "~/Claude Workspaces/quant".into(),
+        };
+
+        let override_dir = with_home(&home, || normalized_profile_override_dir(&profile).unwrap());
+
+        assert_eq!(
+            override_dir,
+            home.join("Claude Workspaces")
+                .join("quant")
+                .display()
+                .to_string()
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn history_reader_finds_workspace_override_with_tilde_and_spaces() {
+        let home = test_sandbox("session-history-override-reader");
+        let profile = AcpProfile {
+            id: "quant".into(),
+            kind_id: "claude".into(),
+            label: "Quant".into(),
+            workspace_dir: "~/Claude Workspaces/quant".into(),
+        };
+        let project_root = home
+            .join("Claude Workspaces")
+            .join("quant")
+            .join("projects")
+            .join(project_dir("/x/y"));
+        std::fs::create_dir_all(&project_root).unwrap();
+        write(
+            &project_root,
+            "quant.jsonl",
+            &[r#"{"type":"user","timestamp":"2026-07-05T00:00:00Z","message":{"content":"with spaces in override path"}}"#],
+        );
+
+        let sessions = with_home(&home, || {
+            let override_dir = normalized_profile_override_dir(&profile).unwrap();
+            list_sessions_for(AcpAgentKind::Claude, Some(&override_dir), "/x/y")
+        });
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "with spaces in override path");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn history_resume_profile_launch_uses_current_agent_command() {
+        let profile = AcpProfile {
+            id: "quant".into(),
+            kind_id: "claude".into(),
+            label: "Quant".into(),
+            workspace_dir: "~/Claude Workspaces/quant".into(),
+        };
+        let config = AgentUiConfig {
+            acp_cmd: "claude --current".into(),
+            ..AgentUiConfig::default()
+        };
+
+        let launch = current_profile_launch(&config, &profile);
+
+        assert_eq!(launch.command, "claude --current");
+        assert_eq!(
+            launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("~/Claude Workspaces/quant")
         );
     }
 
